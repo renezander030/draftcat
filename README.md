@@ -28,6 +28,46 @@ go build -o fixclaw . && ./fixclaw
 
 Define your pipelines in `config.yaml`, your prompts in `skills/`, and FixClaw handles the rest.
 
+## Commands
+
+```bash
+fixclaw                            # run the engine (default)
+fixclaw validate [--strict]        # lint config + skills, exit non-zero on errors
+fixclaw test <pipeline>            # dry-run a pipeline using fixtures/<pipeline>/
+```
+
+### `fixclaw validate`
+
+Static check before deploy. Catches typos, dangling skill refs, unknown actions, invalid durations, missing security config, broken role/model wiring, orphan skills, and `secrets.yaml` not gitignored.
+
+```bash
+fixclaw validate             # warnings allowed, errors fail
+fixclaw validate --strict    # any finding fails
+fixclaw validate --json      # machine-readable output for CI
+```
+
+Wire into `.lefthook.yml` as a pre-commit hook to catch misconfigurations before they hit the engine.
+
+### `fixclaw test <pipeline>`
+
+Local dry-run. Walks the pipeline using fixtures from `fixtures/<pipeline>/` — never touches real Gmail / GoHighLevel / OpenRouter / the operator channel. AI step output is taken from a fixture and validated against the skill's output schema; approval steps auto-approve.
+
+```bash
+fixclaw test test-screener                       # auto-approve
+fixclaw test test-screener --reject              # skip on approval steps
+fixclaw test test-screener --fixtures my-fix/    # custom fixture root
+```
+
+Fixture layout per pipeline:
+
+| Step type       | File                                   | Shape                                                    |
+| --------------- | -------------------------------------- | -------------------------------------------------------- |
+| `deterministic` | `fixtures/<pipeline>/<step>.json`      | `{"data": {key: value, ...}}` merged into the data map   |
+| `ai`            | `fixtures/<pipeline>/<step>.json`      | `{"text": "<verbatim model response>"}`                  |
+| `approval`      | `fixtures/<pipeline>/<step>.json`      | `{"action": "approve\|skip\|adjust", "text": "..."}`     |
+
+See `fixtures/README.md` and `fixtures/test-screener/` for a working example.
+
 ## Why FixClaw
 
 Service businesses run on communication -- emails, CRM follow-ups, lead qualification. AI can handle the volume, but when AI output touches real customers, you need guardrails.
@@ -194,12 +234,16 @@ fixclaw/
   gohighlevel.go   # GoHighLevel CRM integration (contacts, opportunities, conversations)
   config.yaml      # Pipelines, models, budgets, timeouts
   secrets.yaml     # Private config (operator IDs) -- gitignored
+  validate.go      # `fixclaw validate` — config + skill linter
+  test_cmd.go      # `fixclaw test <pipeline>` — fixture-driven dry-run
   skills/          # Prompt templates with schema validation
     email-digest.yaml
     classify-job.yaml
     draft-followup.yaml
     triage-lead.yaml
     draft-ghl-followup.yaml
+  fixtures/        # Test fixtures for `fixclaw test`
+    test-screener/
 ```
 
 ## Star History

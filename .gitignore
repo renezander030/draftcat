@@ -1,4 +1,5 @@
 aiops
+fixclaw
 *.env
 *.key
 *.secret
