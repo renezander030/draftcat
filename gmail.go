@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
-	"sort"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,7 +21,7 @@ import (
 
 type GmailConfig struct {
 	TokenPath  string `yaml:"token_path"`
-	Scopes     string `yaml:"scopes"` // enforced: gmail.readonly unless explicitly changed
+	Scopes     string `yaml:"scopes"`     // enforced: gmail.readonly unless explicitly changed
 	Permission string `yaml:"permission"` // read | draft | send
 }
 
@@ -36,8 +36,8 @@ type GmailToken struct {
 }
 
 type GmailConnector struct {
-	token     GmailToken
-	tokenPath string
+	token       GmailToken
+	tokenPath   string
 	accessToken string
 	expiresAt   time.Time
 }

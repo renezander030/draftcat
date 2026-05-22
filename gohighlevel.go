@@ -57,15 +57,15 @@ type GHLConnector struct {
 // --- Data Types ---
 
 type GHLContact struct {
-	ID          string            `json:"id"`
-	FirstName   string            `json:"firstName"`
-	LastName    string            `json:"lastName"`
-	Email       string            `json:"email"`
-	Phone       string            `json:"phone"`
-	Source      string            `json:"source"`
-	Tags        []string          `json:"tags"`
-	DateAdded   string            `json:"dateAdded"`
-	CustomField []GHLCustomField  `json:"customFields,omitempty"`
+	ID          string           `json:"id"`
+	FirstName   string           `json:"firstName"`
+	LastName    string           `json:"lastName"`
+	Email       string           `json:"email"`
+	Phone       string           `json:"phone"`
+	Source      string           `json:"source"`
+	Tags        []string         `json:"tags"`
+	DateAdded   string           `json:"dateAdded"`
+	CustomField []GHLCustomField `json:"customFields,omitempty"`
 }
 
 type GHLCustomField struct {
@@ -89,21 +89,21 @@ type GHLOpportunity struct {
 }
 
 type GHLConversation struct {
-	ID           string `json:"id"`
-	ContactID    string `json:"contactId"`
-	LastMessage  string `json:"lastMessageBody"`
-	LastDate     string `json:"lastMessageDate"`
-	LastType     string `json:"lastMessageType"` // SMS, Email, WhatsApp, etc.
-	Unread       bool   `json:"unreadCount,omitempty"`
+	ID          string `json:"id"`
+	ContactID   string `json:"contactId"`
+	LastMessage string `json:"lastMessageBody"`
+	LastDate    string `json:"lastMessageDate"`
+	LastType    string `json:"lastMessageType"` // SMS, Email, WhatsApp, etc.
+	Unread      bool   `json:"unreadCount,omitempty"`
 }
 
 type GHLMessage struct {
-	ID          string `json:"id"`
-	Type        int    `json:"type"` // 1=SMS, 2=Email, 3=WhatsApp, etc.
-	Direction   string `json:"direction"` // inbound | outbound
-	Body        string `json:"body"`
-	ContactID   string `json:"contactId"`
-	DateAdded   string `json:"dateAdded"`
+	ID        string `json:"id"`
+	Type      int    `json:"type"`      // 1=SMS, 2=Email, 3=WhatsApp, etc.
+	Direction string `json:"direction"` // inbound | outbound
+	Body      string `json:"body"`
+	ContactID string `json:"contactId"`
+	DateAdded string `json:"dateAdded"`
 }
 
 type GHLPipeline struct {

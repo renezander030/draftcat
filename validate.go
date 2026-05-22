@@ -22,6 +22,8 @@ var validKnownActions = map[string]string{
 	"ghl_new_contacts":         "fetch new GoHighLevel contacts",
 	"ghl_stale_opportunities":  "fetch stale GHL opportunities (requires vars.pipeline_id)",
 	"ghl_unread_conversations": "fetch unread GHL conversations",
+	"pdf_extract":              "parse a PDF into text + per-fragment bounding boxes (requires vars.path or data.pdf_path)",
+	"pdf_verify_cite":          "resolve <cite> tags in ai_raw against the parsed PDF (optional vars.fail_on_unresolved)",
 }
 
 var validStepTypes = map[string]bool{

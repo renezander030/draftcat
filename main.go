@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,15 +24,15 @@ import (
 // --- Config ---
 
 type Config struct {
-	Telegram    TelegramConfig         `yaml:"telegram"`
-	Gmail       GmailConfig            `yaml:"gmail"`
-	GHL         GHLConfig              `yaml:"gohighlevel"`
-	Provider    ProviderConfig         `yaml:"provider"`
-	Models      map[string]ModelConfig `yaml:"models"`
-	Roles       map[string]string      `yaml:"roles"`
-	Budgets     BudgetConfig           `yaml:"budgets"`
-	Timeouts    TimeoutConfig          `yaml:"timeouts"`
-	Pipelines   []PipelineConfig       `yaml:"pipelines"`
+	Telegram  TelegramConfig         `yaml:"telegram"`
+	Gmail     GmailConfig            `yaml:"gmail"`
+	GHL       GHLConfig              `yaml:"gohighlevel"`
+	Provider  ProviderConfig         `yaml:"provider"`
+	Models    map[string]ModelConfig `yaml:"models"`
+	Roles     map[string]string      `yaml:"roles"`
+	Budgets   BudgetConfig           `yaml:"budgets"`
+	Timeouts  TimeoutConfig          `yaml:"timeouts"`
+	Pipelines []PipelineConfig       `yaml:"pipelines"`
 }
 
 type TelegramConfig struct {
@@ -43,9 +45,9 @@ type TelegramConfig struct {
 // ChannelSecurity is REQUIRED per operator channel. Engine refuses to start without it.
 type ChannelSecurity struct {
 	AllowedUsers   []int64 `yaml:"allowed_users"`    // TG user IDs / Slack user IDs that may interact
-	MaxInputLength int     `yaml:"max_input_length"`  // max chars per operator message (default 500)
-	RateLimit      int     `yaml:"rate_limit"`         // max messages per minute per user (default 10)
-	StripMarkdown  bool    `yaml:"strip_markdown"`     // strip formatting that could break prompt boundaries
+	MaxInputLength int     `yaml:"max_input_length"` // max chars per operator message (default 500)
+	RateLimit      int     `yaml:"rate_limit"`       // max messages per minute per user (default 10)
+	StripMarkdown  bool    `yaml:"strip_markdown"`   // strip formatting that could break prompt boundaries
 }
 
 type ProviderConfig struct {
@@ -63,9 +65,9 @@ type ModelConfig struct {
 }
 
 type BudgetConfig struct {
-	PerStepTokens    int `yaml:"per_step_tokens"`
+	PerStepTokens     int `yaml:"per_step_tokens"`
 	PerPipelineTokens int `yaml:"per_pipeline_tokens"`
-	PerDayTokens     int `yaml:"per_day_tokens"`
+	PerDayTokens      int `yaml:"per_day_tokens"`
 }
 
 type TimeoutConfig struct {
@@ -85,9 +87,9 @@ type StepConfig struct {
 	Type         string                 `yaml:"type"`   // deterministic, ai, approval
 	Action       string                 `yaml:"action"` // deterministic action name
 	Role         string                 `yaml:"role"`
-	Skill        string                 `yaml:"skill"`  // reference to skills/<name>.yaml
+	Skill        string                 `yaml:"skill"` // reference to skills/<name>.yaml
 	Prompt       string                 `yaml:"prompt"`
-	Vars         map[string]string      `yaml:"vars"`   // variables injected into skill prompt
+	Vars         map[string]string      `yaml:"vars"` // variables injected into skill prompt
 	Mode         string                 `yaml:"mode"`
 	Channel      string                 `yaml:"channel"`
 	OutputSchema map[string]interface{} `yaml:"output_schema"`
@@ -321,9 +323,9 @@ var injectionPatterns = []string{
 }
 
 type InputValidationResult struct {
-	Clean   bool
-	Text    string
-	Reason  string
+	Clean  bool
+	Text   string
+	Reason string
 }
 
 func validateOperatorInput(text string, sec ChannelSecurity) InputValidationResult {
@@ -856,9 +858,9 @@ func (t *TGBot) isAllowedUser(userID int64) bool {
 }
 
 type TGUpdate struct {
-	UpdateID      int            `json:"update_id"`
-	Message       *TGMessage     `json:"message"`
-	CallbackQuery *TGCallback    `json:"callback_query"`
+	UpdateID      int         `json:"update_id"`
+	Message       *TGMessage  `json:"message"`
+	CallbackQuery *TGCallback `json:"callback_query"`
 }
 
 type TGMessage struct {
@@ -1052,6 +1054,65 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				data["conversation_count"] = fmt.Sprintf("%d", len(convos))
 				log.Printf("[pipeline:%s][step:%s] fetched %d unread conversations", pipeline.Name, step.Name, len(convos))
 
+			case "pdf_extract":
+				path := step.Vars["path"]
+				if path == "" {
+					if v, ok := data["pdf_path"].(string); ok {
+						path = v
+					}
+				}
+				if path == "" {
+					return fmt.Errorf("[step:%s] pdf_extract requires path var or data[pdf_path]", step.Name)
+				}
+				doc, err := pdfParser.Extract(path)
+				if err != nil {
+					return fmt.Errorf("[step:%s] pdf extract failed: %w", step.Name, err)
+				}
+				data["pdf_doc"] = doc
+				data["pdf_filename"] = doc.Filename
+				data["pdf_text"] = FormatPDFForPrompt(doc)
+				data["pdf_page_count"] = fmt.Sprintf("%d", len(doc.Pages))
+				log.Printf("[pipeline:%s][step:%s] parsed %s: %d pages", pipeline.Name, step.Name, doc.Filename, len(doc.Pages))
+
+			case "pdf_verify_cite":
+				doc, ok := data["pdf_doc"].(*PDFDoc)
+				if !ok {
+					return fmt.Errorf("[step:%s] pdf_verify_cite needs an earlier pdf_extract step", step.Name)
+				}
+				raw, _ := data["ai_raw"].(string)
+				cites := citeTagRe.FindAllStringSubmatch(raw, -1)
+				results := make([]map[string]interface{}, 0, len(cites))
+				var unresolved []string
+				for _, m := range cites {
+					file, pageStr, text := m[1], m[2], m[3]
+					page, _ := strconv.Atoi(pageStr)
+					entry := map[string]interface{}{
+						"file": file, "page": page, "text": text, "resolved": false,
+					}
+					if file != doc.Filename {
+						unresolved = append(unresolved, fmt.Sprintf("%s p%d (wrong file, expected %s)", file, page, doc.Filename))
+						results = append(results, entry)
+						continue
+					}
+					if span, found := pdfParser.FindSpan(doc, page, text); found {
+						entry["resolved"] = true
+						entry["span"] = span
+					} else {
+						snippet := text
+						if len(snippet) > 60 {
+							snippet = snippet[:60] + "…"
+						}
+						unresolved = append(unresolved, fmt.Sprintf("%s p%d: %q", file, page, snippet))
+					}
+					results = append(results, entry)
+				}
+				data["citations"] = results
+				data["citations_ok"] = len(unresolved) == 0
+				log.Printf("[pipeline:%s][step:%s] %d citations, %d unresolved", pipeline.Name, step.Name, len(results), len(unresolved))
+				if len(unresolved) > 0 && step.Vars["fail_on_unresolved"] == "true" {
+					return fmt.Errorf("[step:%s] unresolved citations: %s", step.Name, strings.Join(unresolved, "; "))
+				}
+
 			default:
 				// No action — pass-through
 			}
@@ -1211,10 +1272,15 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 // --- Command Handler ---
 // Handles operator commands like /cron, /skills, /run, /status
 
-var gmail *GmailConnector       // initialized in main if configured
-var ghl   *GHLConnector         // initialized in main if configured
-var lastEmails []Email          // last fetched emails for /reply reference
+var gmail *GmailConnector // initialized in main if configured
+var ghl *GHLConnector     // initialized in main if configured
+var pdfParser *PDFParser  // initialized unconditionally in main (no config required)
+var lastEmails []Email    // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
+
+// citeTagRe captures <cite file="X" page="N">verbatim text</cite> emitted by
+// AI steps that quote a parsed PDF. The verifier resolves each to a span.
+var citeTagRe = regexp.MustCompile(`<cite file="([^"]+)" page="(\d+)">([^<]+)</cite>`)
 
 // --- Chat History ---
 // Per-chat conversation buffer. Keeps last N turns for context.
@@ -1865,6 +1931,9 @@ func main() {
 		}
 	}
 
+	// PDF connector — stateless, always available
+	pdfParser = NewPDFParser()
+
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)
 
@@ -2145,4 +2214,3 @@ func resolveEnv(names ...string) string {
 	}
 	return ""
 }
-

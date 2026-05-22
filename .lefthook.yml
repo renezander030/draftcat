@@ -1,4 +1,24 @@
 pre-commit:
+  parallel: true
   commands:
-    check:
-      run: make check
+    fmt:
+      glob: "*.go"
+      run: gofmt -l {staged_files}
+      fail_text: |
+        gofmt found unformatted files above. Run:
+            go fmt ./...
+        then re-stage and commit.
+    vet:
+      glob: "*.go"
+      run: /usr/local/go/bin/go vet ./...
+    build:
+      glob: "*.go"
+      run: /usr/local/go/bin/go build ./...
+    test:
+      glob: "*.go"
+      run: /usr/local/go/bin/go test -count=1 -short -timeout 30s ./...
+
+pre-push:
+  commands:
+    validate:
+      run: /usr/local/go/bin/go run . validate --strict
