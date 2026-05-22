@@ -27,12 +27,19 @@ type Config struct {
 	Telegram  TelegramConfig         `yaml:"telegram"`
 	Gmail     GmailConfig            `yaml:"gmail"`
 	GHL       GHLConfig              `yaml:"gohighlevel"`
+	State     StateConfig            `yaml:"state"`
 	Provider  ProviderConfig         `yaml:"provider"`
 	Models    map[string]ModelConfig `yaml:"models"`
 	Roles     map[string]string      `yaml:"roles"`
 	Budgets   BudgetConfig           `yaml:"budgets"`
 	Timeouts  TimeoutConfig          `yaml:"timeouts"`
 	Pipelines []PipelineConfig       `yaml:"pipelines"`
+}
+
+// StateConfig points at the SQLite file used for cross-run state (dedup +
+// run history). Empty Path defaults to "./state.db".
+type StateConfig struct {
+	Path string `yaml:"path"`
 }
 
 type TelegramConfig struct {
@@ -966,13 +973,19 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					log.Printf("[pipeline:%s][step:%s] no unread emails, skipping pipeline", pipeline.Name, step.Name)
 					return nil // nothing to report
 				}
+				emails = dedupByID(pipeline.Name, "gmail", emails,
+					func(e Email) string { return e.ID })
+				if len(emails) == 0 {
+					log.Printf("[pipeline:%s][step:%s] all unread emails already processed, skipping pipeline", pipeline.Name, step.Name)
+					return nil
+				}
 				data["emails"] = FormatEmailsForPrompt(emails)
 				data["email_count"] = fmt.Sprintf("%d", len(emails))
 				// Store for /reply reference
 				lastEmailsMu.Lock()
 				lastEmails = emails
 				lastEmailsMu.Unlock()
-				log.Printf("[pipeline:%s][step:%s] fetched %d unread emails", pipeline.Name, step.Name, len(emails))
+				log.Printf("[pipeline:%s][step:%s] fetched %d unread emails (new)", pipeline.Name, step.Name, len(emails))
 
 			case "notify":
 				// Send ai_output or ai_raw to operator channel
@@ -1013,6 +1026,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					log.Printf("[pipeline:%s][step:%s] no new contacts, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
+				contacts = dedupByID(pipeline.Name, "ghl_contacts", contacts,
+					func(c GHLContact) string { return c.ID })
+				if len(contacts) == 0 {
+					log.Printf("[pipeline:%s][step:%s] all recent contacts already processed, skipping pipeline", pipeline.Name, step.Name)
+					return nil
+				}
 				data["contacts"] = FormatContactsForPrompt(contacts)
 				data["contact_count"] = fmt.Sprintf("%d", len(contacts))
 				log.Printf("[pipeline:%s][step:%s] fetched %d new contacts", pipeline.Name, step.Name, len(contacts))
@@ -1048,6 +1067,14 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				}
 				if len(convos) == 0 {
 					log.Printf("[pipeline:%s][step:%s] no unread conversations, skipping pipeline", pipeline.Name, step.Name)
+					return nil
+				}
+				// Composite key id|lastDate so a new message on an already-seen
+				// conversation is treated as a fresh item.
+				convos = dedupByID(pipeline.Name, "ghl_conversations", convos,
+					func(c GHLConversation) string { return c.ID + "|" + c.LastDate })
+				if len(convos) == 0 {
+					log.Printf("[pipeline:%s][step:%s] all unread conversations already processed, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
 				data["conversations"] = FormatConversationsForPrompt(convos)
@@ -1275,6 +1302,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 var gmail *GmailConnector // initialized in main if configured
 var ghl *GHLConnector     // initialized in main if configured
 var pdfParser *PDFParser  // initialized unconditionally in main (no config required)
+var state *StateStore     // SQLite-backed state store; opened in main, closed on shutdown
 var lastEmails []Email    // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
 
@@ -1933,6 +1961,21 @@ func main() {
 
 	// PDF connector — stateless, always available
 	pdfParser = NewPDFParser()
+
+	// State store — SQLite-backed dedup + run history
+	statePath := cfg.State.Path
+	if statePath == "" {
+		statePath = "./state.db"
+	}
+	{
+		var err error
+		state, err = OpenStateStore(statePath)
+		if err != nil {
+			log.Fatalf("[state] failed to open %s: %v", statePath, err)
+		}
+		defer state.Close()
+		log.Printf("[state] opened %s", statePath)
+	}
 
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)

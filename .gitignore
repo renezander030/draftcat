@@ -4,4 +4,7 @@ fixclaw
 *.key
 *.secret
 secrets.yaml
+state.db
+state.db-shm
+state.db-wal
 aiops-architecture-diagram.py
