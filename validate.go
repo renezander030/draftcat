@@ -65,7 +65,7 @@ func (r *validateReport) errors() int {
 	return n
 }
 
-// runValidate is the entry point for `fixclaw validate`.
+// runValidate is the entry point for `draftyard validate`.
 func runValidate(args []string) int {
 	configPath := "config.yaml"
 	skillsDir := "skills"
@@ -94,7 +94,7 @@ func runValidate(args []string) int {
 			skillsDir = args[i+1]
 			i++
 		case "-h", "--help", "help":
-			fmt.Println("Usage: fixclaw validate [--config path] [--skills dir] [--strict] [--json]")
+			fmt.Println("Usage: draftyard validate [--config path] [--skills dir] [--strict] [--json]")
 			fmt.Println("\nLints config.yaml + skills/*.yaml. Exits 1 on errors, or on any finding under --strict.")
 			return 0
 		default:

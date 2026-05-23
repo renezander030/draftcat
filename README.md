@@ -1,25 +1,25 @@
 <p align="center">
-  <img src="logo.svg" alt="FixClaw" width="200">
+  <img src="logo.svg" alt="Draftyard" width="200">
 </p>
 
-<h1 align="center">FixClaw</h1>
+<h1 align="center">Draftyard</h1>
 <p align="center">Governed AI pipelines for service businesses — written in Go.</p>
 
 <p align="center">
-  <a href="https://github.com/renezander030/fixclaw/stargazers"><img src="https://img.shields.io/github/stars/renezander030/fixclaw?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/renezander030/fixclaw/blob/master/LICENSE"><img src="https://img.shields.io/github/license/renezander030/fixclaw?style=flat-square" alt="License"></a>
+  <a href="https://github.com/renezander030/draftyard/stargazers"><img src="https://img.shields.io/github/stars/renezander030/draftyard?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/renezander030/draftyard/blob/master/LICENSE"><img src="https://img.shields.io/github/license/renezander030/draftyard?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go" alt="Go 1.24">
   <img src="https://img.shields.io/badge/release-v0.1-blueviolet?style=flat-square" alt="v0.1">
   <img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" alt="Build">
 </p>
 
-FixClaw runs YAML-defined pipelines that triage email, qualify leads, draft replies, and extract data from PDFs. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
+Draftyard runs YAML-defined pipelines that triage email, qualify leads, draft replies, and extract data from PDFs. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
 
 **AI suggests. Deterministic code decides. The operator signs off.**
 
-## Why FixClaw vs the alternatives
+## Why Draftyard vs the alternatives
 
-|                              | **FixClaw**                                    | **n8n**                                    | **LangChain agents**                |
+|                              | **Draftyard**                                    | **n8n**                                    | **LangChain agents**                |
 | ---------------------------- | ---------------------------------------------- | ------------------------------------------ | ----------------------------------- |
 | **Built for**                | AI-augmented business ops with governance      | General workflow automation                | Open-ended agent loops              |
 | **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes inside visual workflows  | Agent decides next action freely    |
@@ -31,22 +31,22 @@ FixClaw runs YAML-defined pipelines that triage email, qualify leads, draft repl
 | **Runtime**                  | Single Go binary                               | Node.js + Postgres                         | Python + dependency tree            |
 | **Approval channels**        | Telegram, Slack (WIP)                          | Webhook / email                            | None built-in                       |
 
-**Versus n8n**, FixClaw treats AI as the gated minority, not the default. n8n is a powerful no-code workflow tool with AI nodes bolted on; FixClaw is a code-first engine where every AI suggestion must pass schema validation and operator approval before it touches a customer. If you want drag-drop integrations across 400+ services, use n8n. If you want deterministic governance on a focused set of business ops, use FixClaw.
+**Versus n8n**, Draftyard treats AI as the gated minority, not the default. n8n is a powerful no-code workflow tool with AI nodes bolted on; Draftyard is a code-first engine where every AI suggestion must pass schema validation and operator approval before it touches a customer. If you want drag-drop integrations across 400+ services, use n8n. If you want deterministic governance on a focused set of business ops, use Draftyard.
 
-**Versus LangChain agents**, FixClaw refuses to let the LLM choose the next action. There is no agent loop — pipelines are fixed sequences of `deterministic` / `ai` / `approval` steps defined in YAML. The LLM produces structured output; the engine validates it against a schema; the operator approves it. LangChain is for research and open-ended exploration. FixClaw is for production systems where a wrong LLM choice means a real customer gets emailed.
+**Versus LangChain agents**, Draftyard refuses to let the LLM choose the next action. There is no agent loop — pipelines are fixed sequences of `deterministic` / `ai` / `approval` steps defined in YAML. The LLM produces structured output; the engine validates it against a schema; the operator approves it. LangChain is for research and open-ended exploration. Draftyard is for production systems where a wrong LLM choice means a real customer gets emailed.
 
 ## Why this exists
 
-Service businesses run on volume communication — replying to leads, qualifying inbound, chasing stale deals, parsing invoices. AI handles the volume easily but is wrong often enough that you can't let it touch a customer without a human in the path. FixClaw is the smallest engine that makes that pattern routine: deterministic Go code does the fetching, routing, and dedup; AI does the drafting and classification under a token budget; an operator approves on Telegram or Slack before anything goes out. One business per instance, self-hosted, auditable.
+Service businesses run on volume communication — replying to leads, qualifying inbound, chasing stale deals, parsing invoices. AI handles the volume easily but is wrong often enough that you can't let it touch a customer without a human in the path. Draftyard is the smallest engine that makes that pattern routine: deterministic Go code does the fetching, routing, and dedup; AI does the drafting and classification under a token budget; an operator approves on Telegram or Slack before anything goes out. One business per instance, self-hosted, auditable.
 
 ![Demo](demo.gif)
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/renezander030/fixclaw.git && cd fixclaw
+git clone https://github.com/renezander030/draftyard.git && cd draftyard
 cp secrets.yaml.example secrets.yaml   # operator IDs + API keys
-go build -o fixclaw . && ./fixclaw
+go build -o draftyard . && ./draftyard
 ```
 
 Define pipelines in `config.yaml`, prompts in `skills/`. The engine opens a SQLite state store at `./state.db` on first boot.
@@ -102,7 +102,7 @@ Add a new action by appending a `case` to the deterministic switch in `main.go` 
 
 ## State & idempotency
 
-FixClaw persists cross-run state to SQLite at the path set in `config.yaml`:
+Draftyard persists cross-run state to SQLite at the path set in `config.yaml`:
 
 ```yaml
 state:
@@ -161,16 +161,16 @@ output_schema:
 ## Commands
 
 ```bash
-fixclaw                       # run the engine
-fixclaw validate [--strict]   # lint config + skills
-fixclaw test <pipeline>       # dry-run against fixtures/<pipeline>/
+draftyard                       # run the engine
+draftyard validate [--strict]   # lint config + skills
+draftyard test <pipeline>       # dry-run against fixtures/<pipeline>/
 ```
 
-`fixclaw test` walks the pipeline using JSON fixtures — never touches real APIs. AI steps return fixture text; approval steps auto-approve. See `fixtures/README.md`.
+`draftyard test` walks the pipeline using JSON fixtures — never touches real APIs. AI steps return fixture text; approval steps auto-approve. See `fixtures/README.md`.
 
 ## Development
 
-Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -short` in parallel on every staged Go file. Pre-push runs `fixclaw validate --strict`.
+Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -short` in parallel on every staged Go file. Pre-push runs `draftyard validate --strict`.
 
 ```bash
 make check       # fmt-check + vet + test-fast + build
@@ -185,7 +185,7 @@ Roadmap signals: webhook triggers, generic HTTP actions, per-step retry & circui
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=renezander030/fixclaw&type=Date)](https://star-history.com/#renezander030/fixclaw&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=renezander030/draftyard&type=Date)](https://star-history.com/#renezander030/draftyard&Date)
 
 ## License
 

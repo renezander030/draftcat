@@ -1885,7 +1885,7 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler) {
 // --- Main ---
 
 func main() {
-	// Subcommand dispatch. The bare form `fixclaw [config.yaml] [skills/]` still runs the engine.
+	// Subcommand dispatch. The bare form `draftyard [config.yaml] [skills/]` still runs the engine.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "validate":
@@ -1893,12 +1893,12 @@ func main() {
 		case "test":
 			os.Exit(runTestCmd(os.Args[2:]))
 		case "-h", "--help", "help":
-			fmt.Println("FixClaw — AI communication management for service businesses.")
+			fmt.Println("Draftyard — AI communication management for service businesses.")
 			fmt.Println()
 			fmt.Println("Usage:")
-			fmt.Println("  fixclaw [config.yaml] [skills/]   run the engine (default)")
-			fmt.Println("  fixclaw validate [--strict]       lint config + skills, exit non-zero on errors")
-			fmt.Println("  fixclaw test <pipeline>           dry-run a pipeline using fixtures/<pipeline>/")
+			fmt.Println("  draftyard [config.yaml] [skills/]   run the engine (default)")
+			fmt.Println("  draftyard validate [--strict]       lint config + skills, exit non-zero on errors")
+			fmt.Println("  draftyard test <pipeline>           dry-run a pipeline using fixtures/<pipeline>/")
 			return
 		}
 	}

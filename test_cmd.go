@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// stubChannel is the in-memory OperatorChannel used by `fixclaw test`.
+// stubChannel is the in-memory OperatorChannel used by `draftyard test`.
 // It records all messages and returns approval decisions from a fixture queue
 // or auto-approve, never making a network call.
 type stubChannel struct {
@@ -95,7 +95,7 @@ func runTestCmd(args []string) int {
 		case "-reject", "--reject":
 			autoApprove = false
 		case "-h", "--help", "help":
-			fmt.Println("Usage: fixclaw test <pipeline> [--config path] [--skills dir] [--fixtures dir] [--reject]")
+			fmt.Println("Usage: draftyard test <pipeline> [--config path] [--skills dir] [--fixtures dir] [--reject]")
 			fmt.Println("\nDry-runs a pipeline using fixtures/<pipeline>/<step-name>.json.")
 			fmt.Println("Deterministic steps load their data map; ai steps load {\"text\": \"...\"};")
 			fmt.Println("approval steps load {\"action\": \"approve|skip|adjust\", \"text\": \"...\"}.")
@@ -116,7 +116,7 @@ func runTestCmd(args []string) int {
 
 	if pipelineName == "" {
 		fmt.Fprintln(os.Stderr, "test: pipeline name required")
-		fmt.Fprintln(os.Stderr, "Usage: fixclaw test <pipeline> [--fixtures dir]")
+		fmt.Fprintln(os.Stderr, "Usage: draftyard test <pipeline> [--fixtures dir]")
 		return 2
 	}
 
