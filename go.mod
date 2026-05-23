@@ -1,4 +1,4 @@
-module github.com/ramaris/aiops
+module github.com/renezander030/draftyard
 
 go 1.25.0
 
