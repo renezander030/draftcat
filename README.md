@@ -177,6 +177,21 @@ make check       # fmt-check + vet + test-fast + build
 make test-fast   # short test pass
 ```
 
+
+## Patterns explained
+
+The deterministic-boundary architecture is documented in the **Production AI Automation Notes** gist series. Each entry maps to specific draftyard code:
+
+- [#1 Agent Approval Gates](https://gist.github.com/renezander030/9069db775e494ffd2cdd5a09adf83add) — proposed actions, schema validation, audit log
+- [#2 Token Budgets](https://gist.github.com/renezander030/a7d99ad94b97f7943a9a04016d62faaa) — per-step, per-pipeline, per-day enforcement (`BudgetTracker` in `main.go`)
+- [#5 SQLite Dedup + Crash Safety](https://gist.github.com/renezander030/8a23e32cde0c882a5aa069c4bfdf697f) — WAL mode, `seen_items`, run audit (`state.go`)
+- [#6 Prompt-Injection Defense](https://gist.github.com/renezander030/213ffdf1ab1bdb169881927bc7080270) — input sanitization + output schema validation (`ChannelSecurity` + `skills/*.yaml`)
+- [#7 PDF Cite Verification](https://gist.github.com/renezander030/7780cbc0b3ad4e802e8fba8bfc1c3a66) — auditable LLM extraction with per-fragment bounding boxes (`pdf.go`)
+
+## Related projects
+
+- [capcut-cli](https://github.com/renezander030/capcut-cli) — CLI to edit CapCut and JianYing video drafts. Same design DNA: single binary, no API needed, structured JSON boundary between agent and tool.
+
 ## Status
 
 **v0.1** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
