@@ -13,9 +13,27 @@
   <img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" alt="Build">
 </p>
 
-Draftyard runs YAML-defined pipelines that triage email, qualify leads, draft replies, and extract data from PDFs. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
+Draftyard runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted **voice AI** deployments. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
 
 **AI suggests. Deterministic code decides. The operator signs off.**
+
+### Self-hosted voice AI for DACH (EU data residency, GDPR / NIS2)
+
+Build with `-tags voice` to add the **EU-resident writeback layer** for self-hosted voice agents (Dograh, Pipecat, or any orchestrator that posts JSON webhooks). Use cases: AI calling, inbound qualification, sales screening, support deflection in DE / AT / CH, with audio + transcripts never leaving the chosen EU region (STACKIT Frankfurt, PlusServer, IONOS, Hetzner, OVHcloud, Open Telekom Cloud, or a client-owned VPC).
+
+- **5 lifecycle webhook receivers** matching the published writeback contract: `session_start`, `event`, `session_end`, `handoff`, `learning`
+- **Pre-call context lookup** (sub-300ms p95) enriches the greeting from GHL / custom CRM HTTP before the agent speaks
+- **3 harvest pipeline actions** feed completed calls, pending handoffs, and Learning-Items into the standard approval > extract > write flow
+- **7-step Learning-Item review** before any prompt / workflow / knowledge-base change reaches production
+- **Per-day call + minute budgets** enforced at the engine level, parallel to the existing per-token caps
+- **Bearer-token webhook auth** with constant-time compare
+- **SQLite-backed audit** in the same state DB as the rest of draftyard
+
+```sh
+go build -tags voice -o draftyard
+```
+
+Reference orchestrator: [Dograh](https://github.com/dograh-hq/dograh). The 5-endpoint writeback contract is intentionally orchestrator-agnostic, so Pipecat-direct or any future alternative drops in without rewriting the writeback layer. See [`docs/voice.md`](docs/voice.md) for the wiring recipe and [`fixtures/voice-dach-screener/pipeline.yaml`](fixtures/voice-dach-screener/pipeline.yaml) for a runnable DACH screening pipeline.
 
 ## Why Draftyard vs the alternatives
 
