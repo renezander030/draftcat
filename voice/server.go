@@ -16,7 +16,7 @@ import (
 type Server struct {
 	cfg     Config
 	store   *Store
-	lookups LookupRunner
+	lookups *LookupRunner
 	token   string
 	srv     *http.Server
 }
@@ -71,7 +71,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-func (s *Server) Store() *Store { return s.store }
+func (s *Server) Store() *Store          { return s.store }
+func (s *Server) Lookups() *LookupRunner { return s.lookups }
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 	if s.cfg.Auth.Method != "bearer" {

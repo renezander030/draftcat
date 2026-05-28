@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -65,9 +66,58 @@ func tryVoiceAction(action, pipelineName string, vars map[string]string, data ma
 		data["voice_learnings"] = formatLearningsForPrompt(items)
 		data["voice_learning_count"] = fmt.Sprintf("%d", len(items))
 		return true, false, nil
+
+	case "voice_handoffs_resolve":
+		resolutions, parseErr := extractResolutions(data)
+		if parseErr != nil {
+			return true, false, fmt.Errorf("voice_handoffs_resolve: %w", parseErr)
+		}
+		if len(resolutions) == 0 {
+			return true, true, nil
+		}
+		now := time.Now().UnixMilli()
+		var resolved int
+		for _, r := range resolutions {
+			if r.HandoffID == 0 || r.Target == "" {
+				continue
+			}
+			if err := store.ResolveHandoff(r.HandoffID, r.Target, now); err != nil {
+				return true, false, fmt.Errorf("resolve handoff %d: %w", r.HandoffID, err)
+			}
+			resolved++
+		}
+		data["voice_handoffs_resolved_count"] = fmt.Sprintf("%d", resolved)
+		return true, false, nil
 	}
 
 	return false, false, nil
+}
+
+type handoffResolution struct {
+	HandoffID int64  `json:"handoff_id"`
+	Target    string `json:"target"`
+}
+
+// extractResolutions pulls handoff resolutions out of data["ai_output"]. The
+// AI step's output schema must expose a "resolutions" array of {handoff_id,
+// target}. Returns an empty slice (no error) when ai_output is missing or has
+// no resolutions, so the action can early-exit cleanly.
+func extractResolutions(data map[string]interface{}) ([]handoffResolution, error) {
+	raw, ok := data["ai_output"]
+	if !ok {
+		return nil, nil
+	}
+	var holder struct {
+		Resolutions []handoffResolution `json:"resolutions"`
+	}
+	buf, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("ai_output not JSON-serializable: %w", err)
+	}
+	if err := json.Unmarshal(buf, &holder); err != nil {
+		return nil, fmt.Errorf("ai_output.resolutions: %w", err)
+	}
+	return holder.Resolutions, nil
 }
 
 func formatCallsForPrompt(items []voice.CompletedSession) string {

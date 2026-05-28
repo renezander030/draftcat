@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/renezander030/draftyard/voice"
@@ -33,11 +34,43 @@ func bootVoice(cfg *Config, st *StateStore) {
 		return
 	}
 	voiceServer = srv
+	registerVoiceLookups(srv)
 	go func() {
 		if err := srv.Start(); err != nil && err.Error() != "http: Server closed" {
 			log.Printf("[voice] server stopped: %v", err)
 		}
 	}()
+}
+
+// registerVoiceLookups wires draftyard's existing connectors into the voice
+// plugin's pre-call lookup runner. Each backend is opt-in: when the underlying
+// connector isn't configured, the source is simply not registered and the
+// lookup runner emits a warning if a pipeline tries to use it.
+func registerVoiceLookups(srv *voice.Server) {
+	if ghl == nil {
+		return
+	}
+	srv.Lookups().Register("ghl", func(ctx context.Context, phone string) (map[string]any, error) {
+		c, err := ghl.FetchContactByPhone(phone)
+		if err != nil {
+			return nil, err
+		}
+		if c == nil {
+			return nil, nil
+		}
+		out := map[string]any{
+			"account_name": strings.TrimSpace(c.FirstName + " " + c.LastName),
+			"email":        c.Email,
+			"contact_id":   c.ID,
+			"source":       c.Source,
+		}
+		for _, cf := range c.CustomField {
+			if cf.ID != "" && cf.Value != "" {
+				out["cf_"+cf.ID] = cf.Value
+			}
+		}
+		return out, nil
+	})
 }
 
 func shutdownVoice() {

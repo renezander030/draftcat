@@ -287,6 +287,34 @@ func (c *GHLConnector) FetchRecentContacts(hours int, limit int) ([]GHLContact, 
 	return result.Contacts, nil
 }
 
+// FetchContactByPhone returns the first contact whose phone matches, or nil
+// if none. Used by the voice plugin's pre-call lookup adapter.
+func (c *GHLConnector) FetchContactByPhone(phone string) (*GHLContact, error) {
+	locationID := c.locationID()
+	if locationID == "" {
+		return nil, fmt.Errorf("ghl: location_id not configured")
+	}
+	if phone == "" {
+		return nil, nil
+	}
+	path := fmt.Sprintf("/contacts/?locationId=%s&query=%s&limit=1",
+		locationID, url.QueryEscape(phone))
+	data, err := c.request("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Contacts []GHLContact `json:"contacts"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("ghl: failed to parse contacts: %w", err)
+	}
+	if len(result.Contacts) == 0 {
+		return nil, nil
+	}
+	return &result.Contacts[0], nil
+}
+
 // GetContact returns a single contact by ID.
 func (c *GHLConnector) GetContact(contactID string) (*GHLContact, error) {
 	data, err := c.request("GET", "/contacts/"+contactID, nil)
