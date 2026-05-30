@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/renezander030/draftcat/internal/config"
 	skillsapi "github.com/renezander030/draftcat/internal/skills"
+	"github.com/renezander030/draftcat/internal/validate"
 	"io"
 	"log"
 	"net/http"
@@ -1805,7 +1806,7 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "validate":
-			os.Exit(runValidate(os.Args[2:]))
+			os.Exit(validate.Run(os.Args[2:]))
 		case "test":
 			os.Exit(runTestCmd(os.Args[2:]))
 		case "-h", "--help", "help":

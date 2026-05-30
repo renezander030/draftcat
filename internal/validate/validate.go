@@ -1,4 +1,4 @@
-package main
+package validate
 
 import (
 	"encoding/json"
@@ -67,8 +67,8 @@ func (r *validateReport) errors() int {
 	return n
 }
 
-// runValidate is the entry point for `draftcat validate`.
-func runValidate(args []string) int {
+// Run is the entry point for `draftcat validate`.
+func Run(args []string) int {
 	configPath := "config.yaml"
 	skillsDir := "skills"
 	strict := false

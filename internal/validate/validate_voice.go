@@ -1,6 +1,6 @@
 //go:build voice
 
-package main
+package validate
 
 func init() {
 	validKnownActions["voice_calls_completed"] = "harvest completed voice calls from Dograh writeback (deduped per pipeline)"
