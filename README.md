@@ -76,7 +76,7 @@ Use n8n for drag-drop integrations across 400+ services. Use LangChain for resea
 | `notify`                     | Send AI output to the operator channel                                  |
 | `voice_*` / `dograh_*`       | Harvest calls, handoffs, Learning-Items + drive Dograh's REST API (`-tags voice`) |
 
-Add an action by appending a `case` to the deterministic switch in `main.go` and registering its name in `validate.go`. See `internal/ghl/ghl.go` and `internal/dograh/dograh.go` for connector patterns, `internal/voicebridge/` for the build-tag-gated voice action dispatch.
+Add an action by appending a `case` to the deterministic switch in `main.go` and registering its name in `internal/validate/`. See `internal/ghl/ghl.go` and `internal/dograh/dograh.go` for connector patterns, `internal/voicebridge/` for the build-tag-gated voice action dispatch.
 
 ## Governance
 
