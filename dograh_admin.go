@@ -59,7 +59,7 @@ func gitCommitWorkflow(vars map[string]string, data map[string]interface{}) (str
 		}
 	}
 	if msg == "" {
-		msg = "voice workflow update via draftyard guardrail"
+		msg = "voice workflow update via draftcat guardrail"
 	}
 
 	if out, err := runGit(repoDir, "add", path); err != nil {

@@ -1,8 +1,8 @@
-# draftyard configuration
+# draftcat configuration
 # Operator channel, LLM provider, guardrails, pipelines
 
 telegram:
-  token_env: DRAFTYARD_TG_TOKEN
+  token_env: DRAFTCAT_TG_TOKEN
   secrets_file: secrets.yaml      # chat_id + allowed_users (gitignored)
   # REQUIRED — engine refuses to start without this
   security:

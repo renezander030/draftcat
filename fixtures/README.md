@@ -1,6 +1,6 @@
 # Fixtures
 
-`draftyard test <pipeline>` reads files from `fixtures/<pipeline>/` to dry-run a pipeline without touching real connectors, the LLM, or the operator channel.
+`draftcat test <pipeline>` reads files from `fixtures/<pipeline>/` to dry-run a pipeline without touching real connectors, the LLM, or the operator channel.
 
 ## Layout
 
@@ -29,5 +29,5 @@ The `test-screener` pipeline in `config.yaml` has steps `mock-input`, `classify`
 Run:
 
 ```bash
-draftyard test test-screener
+draftcat test test-screener
 ```

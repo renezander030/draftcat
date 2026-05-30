@@ -1,4 +1,4 @@
-module github.com/renezander030/draftyard
+module github.com/renezander030/draftcat
 
 go 1.25.0
 

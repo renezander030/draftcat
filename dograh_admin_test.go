@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/renezander030/draftyard/voice"
+	"github.com/renezander030/draftcat/voice"
 )
 
 func newTempGitRepo(t *testing.T) string {

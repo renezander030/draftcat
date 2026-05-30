@@ -1,20 +1,20 @@
 <p align="center">
-  <img src="logo.svg" alt="Draftyard" width="200">
+  <img src="logo.svg" alt="Draftcat" width="200">
 </p>
 
-<h1 align="center">Draftyard</h1>
+<h1 align="center">Draftcat</h1>
 <p align="center">Governed AI pipelines for service businesses — written in Go.</p>
 
 <p align="center">
-  <a href="https://github.com/renezander030/draftyard/stargazers"><img src="https://img.shields.io/github/stars/renezander030/draftyard?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/renezander030/draftyard/blob/master/LICENSE"><img src="https://img.shields.io/github/license/renezander030/draftyard?style=flat-square" alt="License"></a>
+  <a href="https://github.com/renezander030/draftcat/stargazers"><img src="https://img.shields.io/github/stars/renezander030/draftcat?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/renezander030/draftcat/blob/master/LICENSE"><img src="https://img.shields.io/github/license/renezander030/draftcat?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go" alt="Go 1.24">
   <img src="https://img.shields.io/badge/release-v0.1-blueviolet?style=flat-square" alt="v0.1">
   <img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" alt="Build">
   <a href="docs/voice.md"><img src="https://img.shields.io/badge/voice%20AI-EU%20residency%20%C2%B7%20Dograh-00D4AA?style=flat-square" alt="Voice AI plugin (EU residency, Dograh)"></a>
 </p>
 
-Draftyard runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted **voice AI** deployments. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
+Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted **voice AI** deployments. Every outbound action passes through an operator approval gate; every LLM call is budget-checked; every fetched item is deduped against a SQLite state store. Single Go binary.
 
 **AI suggests. Deterministic code decides. The operator signs off.**
 
@@ -29,17 +29,17 @@ Build with `-tags voice` to add the **EU-resident writeback + governance layer**
 - **7-step Learning-Item review pipeline** ([`fixtures/voice-dach-screener/guardrail.yaml`](fixtures/voice-dach-screener/guardrail.yaml)) before any prompt / workflow / knowledge-base change reaches production
 - **Per-day call + minute budgets** enforced at the engine level, parallel to the existing per-token caps
 - **Bearer-token webhook auth** with constant-time compare
-- **SQLite-backed audit** in the same state DB as the rest of draftyard
+- **SQLite-backed audit** in the same state DB as the rest of draftcat
 
 ```sh
-go build -tags voice -o draftyard
+go build -tags voice -o draftcat
 ```
 
 Reference orchestrator: [Dograh](https://github.com/dograh-hq/dograh). The 5-endpoint writeback contract is intentionally orchestrator-agnostic, so Pipecat-direct or any future alternative drops in without rewriting the writeback layer. Full wiring recipe + Dograh-side webhook node templates: [`docs/voice.md`](docs/voice.md). Runnable fixtures: [DACH screening](fixtures/voice-dach-screener/pipeline.yaml), [7-step guardrail](fixtures/voice-dach-screener/guardrail.yaml).
 
 ## Contents
 
-- [Why Draftyard vs the alternatives](#why-draftyard-vs-the-alternatives)
+- [Why Draftcat vs the alternatives](#why-draftcat-vs-the-alternatives)
 - [Why this exists](#why-this-exists)
 - [Quickstart](#quickstart) — lean + voice builds
 - [How it works](#how-it-works)
@@ -49,9 +49,9 @@ Reference orchestrator: [Dograh](https://github.com/dograh-hq/dograh). The 5-end
 - [Configuration](#configuration) — with `voice:` block example
 - [Commands](#commands)
 
-## Why Draftyard vs the alternatives
+## Why Draftcat vs the alternatives
 
-|                              | **Draftyard**                                    | **n8n**                                    | **LangChain agents**                |
+|                              | **Draftcat**                                    | **n8n**                                    | **LangChain agents**                |
 | ---------------------------- | ---------------------------------------------- | ------------------------------------------ | ----------------------------------- |
 | **Built for**                | AI-augmented business ops with governance      | General workflow automation                | Open-ended agent loops              |
 | **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes inside visual workflows  | Agent decides next action freely    |
@@ -65,22 +65,22 @@ Reference orchestrator: [Dograh](https://github.com/dograh-hq/dograh). The 5-end
 | **Voice AI integration**     | Built-in `voice` plugin: Dograh webhooks, pre-call lookup, 7-step Learning-Item guardrail | None                                       | None                                |
 | **EU data residency**        | Self-hosted Go binary, deploys on STACKIT / PlusServer / IONOS / Hetzner / OVHcloud / Open Telekom Cloud / client VPC | Self-host possible                         | Self-host possible                  |
 
-**Versus n8n**, Draftyard treats AI as the gated minority, not the default. n8n is a powerful no-code workflow tool with AI nodes bolted on; Draftyard is a code-first engine where every AI suggestion must pass schema validation and operator approval before it touches a customer. If you want drag-drop integrations across 400+ services, use n8n. If you want deterministic governance on a focused set of business ops, use Draftyard.
+**Versus n8n**, Draftcat treats AI as the gated minority, not the default. n8n is a powerful no-code workflow tool with AI nodes bolted on; Draftcat is a code-first engine where every AI suggestion must pass schema validation and operator approval before it touches a customer. If you want drag-drop integrations across 400+ services, use n8n. If you want deterministic governance on a focused set of business ops, use Draftcat.
 
-**Versus LangChain agents**, Draftyard refuses to let the LLM choose the next action. There is no agent loop — pipelines are fixed sequences of `deterministic` / `ai` / `approval` steps defined in YAML. The LLM produces structured output; the engine validates it against a schema; the operator approves it. LangChain is for research and open-ended exploration. Draftyard is for production systems where a wrong LLM choice means a real customer gets emailed.
+**Versus LangChain agents**, Draftcat refuses to let the LLM choose the next action. There is no agent loop — pipelines are fixed sequences of `deterministic` / `ai` / `approval` steps defined in YAML. The LLM produces structured output; the engine validates it against a schema; the operator approves it. LangChain is for research and open-ended exploration. Draftcat is for production systems where a wrong LLM choice means a real customer gets emailed.
 
 ## Why this exists
 
-Service businesses run on volume communication — replying to leads, qualifying inbound, chasing stale deals, parsing invoices. AI handles the volume easily but is wrong often enough that you can't let it touch a customer without a human in the path. Draftyard is the smallest engine that makes that pattern routine: deterministic Go code does the fetching, routing, and dedup; AI does the drafting and classification under a token budget; an operator approves on Telegram or Slack before anything goes out. One business per instance, self-hosted, auditable.
+Service businesses run on volume communication — replying to leads, qualifying inbound, chasing stale deals, parsing invoices. AI handles the volume easily but is wrong often enough that you can't let it touch a customer without a human in the path. Draftcat is the smallest engine that makes that pattern routine: deterministic Go code does the fetching, routing, and dedup; AI does the drafting and classification under a token budget; an operator approves on Telegram or Slack before anything goes out. One business per instance, self-hosted, auditable.
 
 ![Demo](demo.gif)
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/renezander030/draftyard.git && cd draftyard
+git clone https://github.com/renezander030/draftcat.git && cd draftcat
 cp secrets.yaml.example secrets.yaml   # operator IDs + API keys
-go build -o draftyard . && ./draftyard
+go build -o draftcat . && ./draftcat
 ```
 
 Define pipelines in `config.yaml`, prompts in `skills/`. The engine opens a SQLite state store at `./state.db` on first boot.
@@ -88,7 +88,7 @@ Define pipelines in `config.yaml`, prompts in `skills/`. The engine opens a SQLi
 **To enable the voice AI plugin** (Dograh webhook receivers, pre-call lookup, 7-step Learning-Item guardrail, EU residency wiring):
 
 ```bash
-go build -tags voice -o draftyard . && ./draftyard
+go build -tags voice -o draftcat . && ./draftcat
 ```
 
 The lean binary is unchanged when the tag is off. See [`docs/voice.md`](docs/voice.md) for the full setup.
@@ -151,7 +151,7 @@ Add a new action by appending a `case` to the deterministic switch in `main.go` 
 
 ## State & idempotency
 
-Draftyard persists cross-run state to SQLite at the path set in `config.yaml`:
+Draftcat persists cross-run state to SQLite at the path set in `config.yaml`:
 
 ```yaml
 state:
@@ -201,10 +201,10 @@ When built with `-tags voice`, an additional `voice:` block configures the webho
 voice:
   enabled: true
   listen_addr: 127.0.0.1:8080
-  public_base_url: https://draftyard.client.eu          # Dograh hits this
+  public_base_url: https://draftcat.client.eu          # Dograh hits this
   auth:
     method: bearer
-    token_env: DRAFTYARD_VOICE_TOKEN
+    token_env: DRAFTCAT_VOICE_TOKEN
   dograh:
     base_url: https://dograh.client.internal            # prod
     staging_url: https://dograh-staging.client.internal # for dograh_staging_smoke
@@ -238,16 +238,16 @@ output_schema:
 ## Commands
 
 ```bash
-draftyard                       # run the engine
-draftyard validate [--strict]   # lint config + skills
-draftyard test <pipeline>       # dry-run against fixtures/<pipeline>/
+draftcat                       # run the engine
+draftcat validate [--strict]   # lint config + skills
+draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/
 ```
 
-`draftyard test` walks the pipeline using JSON fixtures — never touches real APIs. AI steps return fixture text; approval steps auto-approve. See `fixtures/README.md`.
+`draftcat test` walks the pipeline using JSON fixtures — never touches real APIs. AI steps return fixture text; approval steps auto-approve. See `fixtures/README.md`.
 
 ## Development
 
-Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -short` in parallel on every staged Go file. Pre-push runs `draftyard validate --strict`.
+Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -short` in parallel on every staged Go file. Pre-push runs `draftcat validate --strict`.
 
 ```bash
 make check       # fmt-check + vet + test-fast + build
@@ -257,7 +257,7 @@ make test-fast   # short test pass
 
 ## Patterns explained
 
-The deterministic-boundary architecture is documented in the **Production AI Automation Notes** gist series. Each entry maps to specific draftyard code:
+The deterministic-boundary architecture is documented in the **Production AI Automation Notes** gist series. Each entry maps to specific draftcat code:
 
 - [#1 Agent Approval Gates](https://gist.github.com/renezander030/9069db775e494ffd2cdd5a09adf83add) — proposed actions, schema validation, audit log
 - [#2 Token Budgets](https://gist.github.com/renezander030/a7d99ad94b97f7943a9a04016d62faaa) — per-step, per-pipeline, per-day enforcement (`BudgetTracker` in `main.go`)
@@ -286,15 +286,15 @@ Core engine:
 Voice plugin v0.2 (planned):
 - **Outbound calling campaigns** with consent gating (TCPA-aware in the US, DSGVO + UWG-aware in DE/AT/CH)
 - **Recording redaction** (PII masking before audio + transcript hit persistent storage)
-- **MCP bridge** so Dograh agents can call draftyard tools mid-conversation (parity with Dograh's recent MCP server release)
+- **MCP bridge** so Dograh agents can call draftcat tools mid-conversation (parity with Dograh's recent MCP server release)
 - **Real-Dograh integration verification** against a live instance once a paying deployment lands
 
-Operational deliverables (separate repos, not in draftyard):
-- `dograh-stackit` — Terraform + Ansible for reproducible STACKIT / PlusServer / IONOS / Hetzner / OVHcloud / Open Telekom Cloud deployment of the full voice stack (CPU VM for draftyard, GPU VM for Dograh + Whisper + vLLM + XTTS, 300 GB persistent model volume, Caddy TLS, smoke + warm-benchmark + attestation scripts)
+Operational deliverables (separate repos, not in draftcat):
+- `dograh-stackit` — Terraform + Ansible for reproducible STACKIT / PlusServer / IONOS / Hetzner / OVHcloud / Open Telekom Cloud deployment of the full voice stack (CPU VM for draftcat, GPU VM for Dograh + Whisper + vLLM + XTTS, 300 GB persistent model volume, Caddy TLS, smoke + warm-benchmark + attestation scripts)
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=renezander030/draftyard&type=Date)](https://star-history.com/#renezander030/draftyard&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=renezander030/draftcat&type=Date)](https://star-history.com/#renezander030/draftcat&Date)
 
 ## License
 

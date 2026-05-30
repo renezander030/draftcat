@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/renezander030/draftyard/voice"
+	"github.com/renezander030/draftcat/voice"
 )
 
 var (
@@ -46,7 +46,7 @@ func bootVoice(cfg *Config, st *StateStore) {
 	}()
 }
 
-// registerVoiceLookups wires draftyard's existing connectors into the voice
+// registerVoiceLookups wires draftcat's existing connectors into the voice
 // plugin's pre-call lookup runner. Each backend is opt-in: when the underlying
 // connector isn't configured, the source is simply not registered and the
 // lookup runner emits a warning if a pipeline tries to use it.

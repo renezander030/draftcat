@@ -46,7 +46,7 @@ func NewLookupRunner(cfg PreCallConfig) *LookupRunner {
 
 // Register attaches a named backend (e.g. "ghl") to the runner. The main
 // package wires its connectors in via this hook so the voice package stays
-// independent of draftyard's internal connectors.
+// independent of draftcat's internal connectors.
 func (l *LookupRunner) Register(name string, fn LookupFunc) {
 	l.backends[name] = fn
 }

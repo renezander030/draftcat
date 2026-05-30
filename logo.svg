@@ -1,19 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 180" fill="none" role="img" aria-label="Draftyard logo">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 180" fill="none" role="img" aria-label="Draftcat logo">
   <!-- Light card: legible on any GitHub README theme (light or dark). -->
   <rect width="640" height="180" rx="18" fill="#FFFFFF" stroke="#0D1117" stroke-width="2"/>
 
-  <!-- Icon: a yard (square) bisected by a gate (vertical bar). A filled draft sits on the staging side, awaiting approval before passing through. -->
-  <g transform="translate(40 50)">
-    <rect width="80" height="80" stroke="#0D1117" stroke-width="4"/>
-    <rect x="12" y="24" width="22" height="32" fill="#0D1117"/>
-    <line x1="52" y1="0" x2="52" y2="80" stroke="#0D1117" stroke-width="4"/>
+  <!-- Cat: line-art head peeking over a dashed draft line, pencil drawing it. -->
+  <g stroke="#0D1117" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- head outline with integrated pointy ears, single continuous stroke -->
+    <path d="M82 84 L92 40 L120 74 L148 40 L158 84
+             C162 104 150 132 120 132
+             C90 132 78 104 82 84 Z" />
+    <!-- whiskers -->
+    <path d="M58 104 L86 108 M58 118 L86 116 M182 104 L154 108 M182 118 L154 116" />
+    <!-- dashed draft line the cat rests on -->
+    <path d="M44 150 L190 150" stroke-dasharray="14 12" />
+    <!-- pencil drawing the line: body + graphite tip touching the line -->
+    <path d="M205 145 L231 119 L243 131 L217 157 Z" />
+    <path d="M205 145 L196 152 L217 157" />
+    <path d="M231 119 L243 131" />
+  </g>
+  <!-- eyes + nose (filled) -->
+  <g fill="#0D1117">
+    <circle cx="104" cy="100" r="7" />
+    <circle cx="136" cy="100" r="7" />
+    <path d="M114 112 L126 112 L120 120 Z" />
   </g>
 
   <!-- Wordmark -->
-  <text x="160" y="125"
-        font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"
-        font-size="72" font-weight="700"
-        letter-spacing="-1">
-    <tspan fill="#0D1117">draft</tspan><tspan fill="#00D4AA">yard</tspan>
-  </text>
+  <text x="280" y="112" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="74" font-weight="500" letter-spacing="-1" fill="#0D1117">draftcat</text>
 </svg>

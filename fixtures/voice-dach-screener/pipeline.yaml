@@ -1,6 +1,6 @@
-# Example DACH voice screening pipeline. Requires draftyard built with -tags voice.
+# Example DACH voice screening pipeline. Requires draftcat built with -tags voice.
 #
-# Flow: Dograh posts session_end webhooks to draftyard's /voice/session_end endpoint
+# Flow: Dograh posts session_end webhooks to draftcat's /voice/session_end endpoint
 # while calls are running. This pipeline runs on a 5-minute cadence, harvests any
 # new completed sessions, runs AI extraction, and pings the operator for approval
 # before any downstream write.

@@ -1,8 +1,8 @@
 # Voice plugin
 
-Draftyard's `voice` build tag adds an HTTP receiver for voice-AI session events
+Draftcat's `voice` build tag adds an HTTP receiver for voice-AI session events
 and three pipeline harvest actions that consume them. The orchestrator (Dograh,
-Pipecat-direct, or any other) calls draftyard over webhooks. Draftyard owns
+Pipecat-direct, or any other) calls draftcat over webhooks. Draftcat owns
 governance: per-day call budgets, schema-validated outcomes, operator approval
 before any downstream write, and a 7-step Learning-Item review flow.
 
@@ -13,7 +13,7 @@ JSON-posting caller. The reference integration target is Dograh
 ## Building
 
 ```sh
-go build -tags voice -o draftyard
+go build -tags voice -o draftcat
 go test  -tags voice ./...
 ```
 
@@ -29,10 +29,10 @@ sends in the `Authorization: Bearer <token>` header (configured in Dograh as a
 voice:
   enabled: true
   listen_addr: 127.0.0.1:8080
-  public_base_url: https://draftyard.client.eu
+  public_base_url: https://draftcat.client.eu
   auth:
     method: bearer
-    token_env: DRAFTYARD_VOICE_TOKEN
+    token_env: DRAFTCAT_VOICE_TOKEN
   dograh:
     base_url: https://dograh.client.internal
     api_key_env: DOGRAH_API_KEY
@@ -59,20 +59,20 @@ success.
 
 | Endpoint                       | Direction | Purpose                                                           |
 | ------------------------------ | --------- | ----------------------------------------------------------------- |
-| `POST /voice/session_start`    | Dograh → draftyard | Call connected. Persists to `voice_sessions`.            |
-| `POST /voice/event`            | Dograh → draftyard | Mid-call event (utterance, intent, tool call). `voice_events`. |
-| `POST /voice/session_end`      | Dograh → draftyard | Call ended with outcome, transcript, cost. `voice_outcomes`. |
-| `POST /voice/handoff`          | Dograh → draftyard | Transfer-to-human request. `voice_handoffs`. Response carries routing target. |
-| `POST /voice/learning`         | Dograh → draftyard | Agent-flagged Learning-Item. `voice_learnings`.          |
-| `POST /voice/pre_call_context` | Dograh → draftyard | Enrich greeting with account context. Sub-300ms p95 budget. |
+| `POST /voice/session_start`    | Dograh → draftcat | Call connected. Persists to `voice_sessions`.            |
+| `POST /voice/event`            | Dograh → draftcat | Mid-call event (utterance, intent, tool call). `voice_events`. |
+| `POST /voice/session_end`      | Dograh → draftcat | Call ended with outcome, transcript, cost. `voice_outcomes`. |
+| `POST /voice/handoff`          | Dograh → draftcat | Transfer-to-human request. `voice_handoffs`. Response carries routing target. |
+| `POST /voice/learning`         | Dograh → draftcat | Agent-flagged Learning-Item. `voice_learnings`.          |
+| `POST /voice/pre_call_context` | Dograh → draftcat | Enrich greeting with account context. Sub-300ms p95 budget. |
 
 ## Wiring Dograh
 
 Dograh's `webhook` nodes execute asynchronously after a workflow run completes.
 Place separate webhook nodes on different paths in your workflow so they reach
-the right draftyard endpoint with the right payload.
+the right draftcat endpoint with the right payload.
 
-Minimal workflow wiring (one node per draftyard endpoint that path needs):
+Minimal workflow wiring (one node per draftcat endpoint that path needs):
 
 | Workflow position           | Webhook target                              | Payload template includes                              |
 | --------------------------- | ------------------------------------------- | ------------------------------------------------------ |
@@ -97,7 +97,7 @@ Example payload for `/voice/session_end` (Dograh template):
 
 ## Pipeline actions
 
-Seven new actions are available once draftyard is built with `-tags voice`.
+Seven new actions are available once draftcat is built with `-tags voice`.
 
 ### Harvest (deduped by record ID per `(pipeline, scope)`)
 
@@ -124,21 +124,21 @@ Seven new actions are available once draftyard is built with `-tags voice`.
 ## Example pipelines
 
 - [`fixtures/voice-dach-screener/pipeline.yaml`](../fixtures/voice-dach-screener/pipeline.yaml) — DACH screening (harvest > extract > approve > notify).
-- [`fixtures/voice-dach-screener/guardrail.yaml`](../fixtures/voice-dach-screener/guardrail.yaml) — full 7-step Learning-Item review (harvest > group > approve > propose > approve-diff > commit > smoke > approve-deploy > publish > notify). Maps the case-study Guardrail flow onto draftyard's deterministic / ai / approval primitives plus the three admin actions above.
+- [`fixtures/voice-dach-screener/guardrail.yaml`](../fixtures/voice-dach-screener/guardrail.yaml) — full 7-step Learning-Item review (harvest > group > approve > propose > approve-diff > commit > smoke > approve-deploy > publish > notify). Maps the case-study Guardrail flow onto draftcat's deterministic / ai / approval primitives plus the three admin actions above.
 
 ## State
 
-The plugin reuses draftyard's existing SQLite state database (`state.db` by
+The plugin reuses draftcat's existing SQLite state database (`state.db` by
 default). On first start with `-tags voice`, five new tables are created:
 `voice_sessions`, `voice_events`, `voice_outcomes`, `voice_handoffs`,
 `voice_learnings`.
 
 ## Smoke test
 
-With draftyard running and a bearer token set:
+With draftcat running and a bearer token set:
 
 ```sh
-export TOKEN="$DRAFTYARD_VOICE_TOKEN"
+export TOKEN="$DRAFTCAT_VOICE_TOKEN"
 SID="smoke-$(date +%s)"
 
 curl -sS -X POST http://127.0.0.1:8080/voice/session_start \

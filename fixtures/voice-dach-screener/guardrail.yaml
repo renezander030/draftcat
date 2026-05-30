@@ -6,8 +6,8 @@
 # against Dograh staging, gates the deploy behind a second approval, then
 # publishes via Dograh's PUT /api/v1/workflow/{id} (auto-versioned).
 #
-# Requires draftyard built with -tags voice. Set:
-#   DRAFTYARD_VOICE_TOKEN  (webhook auth, shared with Dograh)
+# Requires draftcat built with -tags voice. Set:
+#   DRAFTCAT_VOICE_TOKEN  (webhook auth, shared with Dograh)
 #   DOGRAH_API_KEY         (auth for Dograh REST API)
 #   voice.dograh.base_url + voice.dograh.staging_url in config.yaml
 

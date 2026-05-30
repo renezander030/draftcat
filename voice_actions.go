@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/renezander030/draftyard/voice"
+	"github.com/renezander030/draftcat/voice"
 )
 
 func tryVoiceAction(action, pipelineName string, vars map[string]string, data map[string]interface{}) (handled bool, skipPipeline bool, err error) {

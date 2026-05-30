@@ -35,7 +35,7 @@ type Config struct {
 	Timeouts  TimeoutConfig          `yaml:"timeouts"`
 	Pipelines []PipelineConfig       `yaml:"pipelines"`
 	// Voice is parsed unconditionally as raw YAML. Decoded into voice.Config
-	// only when draftyard is built with -tags voice. Lean builds ignore it.
+	// only when draftcat is built with -tags voice. Lean builds ignore it.
 	Voice yaml.Node `yaml:"voice"`
 }
 
@@ -1271,10 +1271,10 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				if reject {
 					status = "REJECT"
 				}
-				draftMsg = fmt.Sprintf("[draftyard] %s - Score: %d/5\n\n%s\n\n%v",
+				draftMsg = fmt.Sprintf("[draftcat] %s - Score: %d/5\n\n%s\n\n%v",
 					status, int(score), reason, data["input"])
 			default:
-				draftMsg = fmt.Sprintf("[draftyard] Draft for review:\n\n%v", v)
+				draftMsg = fmt.Sprintf("[draftcat] Draft for review:\n\n%v", v)
 			}
 
 			// Send for approval via operator channel (TG buttons, Slack reactions, etc.)
@@ -1321,7 +1321,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				budget.record(resp.InputTokens + resp.OutputTokens)
 
 				// Show revised output and ask for final approval
-				revisedDraft := fmt.Sprintf("[draftyard] Revised:\n\n%s", resp.Text)
+				revisedDraft := fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
 				approvalCtx2, approvalCancel2 := context.WithTimeout(ctx, approvalTimeout)
 				decision2, err := ch.SendForApproval(approvalCtx2, revisedDraft)
 				approvalCancel2()
@@ -1930,7 +1930,7 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler) {
 // --- Main ---
 
 func main() {
-	// Subcommand dispatch. The bare form `draftyard [config.yaml] [skills/]` still runs the engine.
+	// Subcommand dispatch. The bare form `draftcat [config.yaml] [skills/]` still runs the engine.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "validate":
@@ -1938,12 +1938,12 @@ func main() {
 		case "test":
 			os.Exit(runTestCmd(os.Args[2:]))
 		case "-h", "--help", "help":
-			fmt.Println("Draftyard — AI communication management for service businesses.")
+			fmt.Println("Draftcat — AI communication management for service businesses.")
 			fmt.Println()
 			fmt.Println("Usage:")
-			fmt.Println("  draftyard [config.yaml] [skills/]   run the engine (default)")
-			fmt.Println("  draftyard validate [--strict]       lint config + skills, exit non-zero on errors")
-			fmt.Println("  draftyard test <pipeline>           dry-run a pipeline using fixtures/<pipeline>/")
+			fmt.Println("  draftcat [config.yaml] [skills/]   run the engine (default)")
+			fmt.Println("  draftcat validate [--strict]       lint config + skills, exit non-zero on errors")
+			fmt.Println("  draftcat test <pipeline>           dry-run a pipeline using fixtures/<pipeline>/")
 			return
 		}
 	}
@@ -1964,11 +1964,11 @@ func main() {
 	}
 
 	// Resolve env vars
-	cfg.Telegram.token = resolveEnv(cfg.Telegram.TokenEnv, "DRAFTYARD_TG_TOKEN")
+	cfg.Telegram.token = resolveEnv(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN")
 	cfg.Provider.apiKey = resolveEnv(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY")
 
 	if cfg.Telegram.token == "" {
-		log.Fatal("Telegram token not set. Set DRAFTYARD_TG_TOKEN env var.")
+		log.Fatal("Telegram token not set. Set DRAFTCAT_TG_TOKEN env var.")
 	}
 	if cfg.Provider.apiKey == "" {
 		log.Fatal("OpenRouter API key not set. Set OPENROUTER_API_KEY env var.")
@@ -2029,7 +2029,7 @@ func main() {
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)
 
-	log.Printf("draftyard starting — %d pipeline(s), %d skill(s), provider=%s, operator=telegram:%d",
+	log.Printf("draftcat starting — %d pipeline(s), %d skill(s), provider=%s, operator=telegram:%d",
 		len(cfg.Pipelines), len(skillReg.skills), cfg.Provider.Type, cfg.Telegram.ChatID)
 
 	bot := &TGBot{
@@ -2055,7 +2055,7 @@ func main() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	log.Printf("draftyard running. Waiting for commands and scheduled pipelines...")
+	log.Printf("draftcat running. Waiting for commands and scheduled pipelines...")
 
 	for {
 		select {
@@ -2208,7 +2208,7 @@ Rules:
 								gmailStatus = fmt.Sprintf("connected (permission: %s) — can read inbox, sent, search, and reply to emails", cfg.Gmail.Permission)
 							}
 							history := chatHistory.FormatForPrompt()
-							sysPrompt := fmt.Sprintf(`You are draftyard, an AI operations assistant running as a Telegram bot.
+							sysPrompt := fmt.Sprintf(`You are draftcat, an AI operations assistant running as a Telegram bot.
 You manage automated pipelines and can help the operator with tasks.
 
 Available pipelines:%s
@@ -2286,7 +2286,7 @@ Conversation so far:
 							defer sched.SetRunning(p.Name, false)
 							if err := runPipeline(&cfg, p, budget, bot, skillReg); err != nil {
 								log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
-								bot.Send(fmt.Sprintf("[draftyard] ERROR in %s: %s", p.Name, err))
+								bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
 							}
 							sched.MarkRun(p.Name)
 						}(cfg.Pipelines[i])

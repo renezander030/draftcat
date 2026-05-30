@@ -21,4 +21,4 @@ test-fast:
 	$(GO) test -count=1 -short -timeout 30s ./...
 
 build:
-	$(GO) build -o draftyard .
+	$(GO) build -o draftcat .
