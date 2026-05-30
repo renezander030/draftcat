@@ -24,6 +24,7 @@ import (
 	gmailapi "github.com/renezander030/draftcat/internal/gmail"
 	"github.com/renezander030/draftcat/internal/pdf"
 	statestore "github.com/renezander030/draftcat/internal/state"
+	"github.com/renezander030/draftcat/internal/voicebridge"
 )
 
 // --- Config ---
@@ -1182,7 +1183,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 			default:
 				// Voice plugin actions (no-op in lean builds)
-				if handled, skip, err := tryVoiceAction(step.Action, pipeline.Name, step.Vars, data); handled {
+				if handled, skip, err := vbridge.TryAction(step.Action, pipeline.Name, step.Vars, data); handled {
 					if err != nil {
 						return fmt.Errorf("[step:%s] %w", step.Name, err)
 					}
@@ -1353,6 +1354,7 @@ var gmail *gmailapi.GmailConnector // initialized in main if configured
 var ghl *ghlapi.GHLConnector       // initialized in main if configured
 var pdfParser *pdf.PDFParser       // initialized unconditionally in main (no config required)
 var state *statestore.StateStore   // SQLite-backed state store; opened in main, closed on shutdown
+var vbridge *voicebridge.Bridge    // voice plugin (nil when disabled or built lean)
 var lastEmails []gmailapi.Email    // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
 
@@ -2028,8 +2030,8 @@ func main() {
 	}
 
 	// Voice plugin (build-tag voice). No-op in lean builds.
-	bootVoice(&cfg, state)
-	defer shutdownVoice()
+	vbridge = voicebridge.Boot(cfg.Voice, state, ghl)
+	defer vbridge.Shutdown()
 
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)
