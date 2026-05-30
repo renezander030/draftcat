@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	statestore "github.com/renezander030/draftcat/internal/state"
 	"github.com/renezander030/draftcat/voice"
 )
 
@@ -16,7 +17,7 @@ var (
 	voiceCfg    voice.Config
 )
 
-func bootVoice(cfg *Config, st *StateStore) {
+func bootVoice(cfg *Config, st *statestore.StateStore) {
 	if st == nil {
 		return
 	}

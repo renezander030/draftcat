@@ -1,4 +1,4 @@
-package main
+package gmail
 
 import (
 	"bytes"
@@ -646,3 +646,5 @@ func StartAuthCallback(port int) chan string {
 
 	return codeCh
 }
+
+func (g *GmailConnector) ClientID() string { return g.token.ClientID }

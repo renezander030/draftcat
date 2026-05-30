@@ -1,4 +1,4 @@
-package main
+package gmail
 
 import (
 	"encoding/base64"

@@ -19,14 +19,19 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	ghlapi "github.com/renezander030/draftcat/internal/ghl"
+	gmailapi "github.com/renezander030/draftcat/internal/gmail"
+	"github.com/renezander030/draftcat/internal/pdf"
+	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
 // --- Config ---
 
 type Config struct {
 	Telegram  TelegramConfig         `yaml:"telegram"`
-	Gmail     GmailConfig            `yaml:"gmail"`
-	GHL       GHLConfig              `yaml:"gohighlevel"`
+	Gmail     gmailapi.GmailConfig   `yaml:"gmail"`
+	GHL       ghlapi.GHLConfig       `yaml:"gohighlevel"`
 	State     StateConfig            `yaml:"state"`
 	Provider  ProviderConfig         `yaml:"provider"`
 	Models    map[string]ModelConfig `yaml:"models"`
@@ -1009,12 +1014,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					return nil // nothing to report
 				}
 				emails = dedupByID(pipeline.Name, "gmail", emails,
-					func(e Email) string { return e.ID })
+					func(e gmailapi.Email) string { return e.ID })
 				if len(emails) == 0 {
 					log.Printf("[pipeline:%s][step:%s] all unread emails already processed, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
-				data["emails"] = FormatEmailsForPrompt(emails)
+				data["emails"] = gmailapi.FormatEmailsForPrompt(emails)
 				data["email_count"] = fmt.Sprintf("%d", len(emails))
 				// Store for /reply reference
 				lastEmailsMu.Lock()
@@ -1062,12 +1067,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					return nil
 				}
 				contacts = dedupByID(pipeline.Name, "ghl_contacts", contacts,
-					func(c GHLContact) string { return c.ID })
+					func(c ghlapi.GHLContact) string { return c.ID })
 				if len(contacts) == 0 {
 					log.Printf("[pipeline:%s][step:%s] all recent contacts already processed, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
-				data["contacts"] = FormatContactsForPrompt(contacts)
+				data["contacts"] = ghlapi.FormatContactsForPrompt(contacts)
 				data["contact_count"] = fmt.Sprintf("%d", len(contacts))
 				log.Printf("[pipeline:%s][step:%s] fetched %d new contacts", pipeline.Name, step.Name, len(contacts))
 
@@ -1088,7 +1093,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					log.Printf("[pipeline:%s][step:%s] no stale opportunities, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
-				data["opportunities"] = FormatOpportunitiesForPrompt(opps)
+				data["opportunities"] = ghlapi.FormatOpportunitiesForPrompt(opps)
 				data["opportunity_count"] = fmt.Sprintf("%d", len(opps))
 				log.Printf("[pipeline:%s][step:%s] fetched %d stale opportunities", pipeline.Name, step.Name, len(opps))
 
@@ -1107,12 +1112,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				// Composite key id|lastDate so a new message on an already-seen
 				// conversation is treated as a fresh item.
 				convos = dedupByID(pipeline.Name, "ghl_conversations", convos,
-					func(c GHLConversation) string { return c.ID + "|" + c.LastDate })
+					func(c ghlapi.GHLConversation) string { return c.ID + "|" + c.LastDate })
 				if len(convos) == 0 {
 					log.Printf("[pipeline:%s][step:%s] all unread conversations already processed, skipping pipeline", pipeline.Name, step.Name)
 					return nil
 				}
-				data["conversations"] = FormatConversationsForPrompt(convos)
+				data["conversations"] = ghlapi.FormatConversationsForPrompt(convos)
 				data["conversation_count"] = fmt.Sprintf("%d", len(convos))
 				log.Printf("[pipeline:%s][step:%s] fetched %d unread conversations", pipeline.Name, step.Name, len(convos))
 
@@ -1132,12 +1137,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				}
 				data["pdf_doc"] = doc
 				data["pdf_filename"] = doc.Filename
-				data["pdf_text"] = FormatPDFForPrompt(doc)
+				data["pdf_text"] = pdf.FormatPDFForPrompt(doc)
 				data["pdf_page_count"] = fmt.Sprintf("%d", len(doc.Pages))
 				log.Printf("[pipeline:%s][step:%s] parsed %s: %d pages", pipeline.Name, step.Name, doc.Filename, len(doc.Pages))
 
 			case "pdf_verify_cite":
-				doc, ok := data["pdf_doc"].(*PDFDoc)
+				doc, ok := data["pdf_doc"].(*pdf.PDFDoc)
 				if !ok {
 					return fmt.Errorf("[step:%s] pdf_verify_cite needs an earlier pdf_extract step", step.Name)
 				}
@@ -1344,11 +1349,11 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 // --- Command Handler ---
 // Handles operator commands like /cron, /skills, /run, /status
 
-var gmail *GmailConnector // initialized in main if configured
-var ghl *GHLConnector     // initialized in main if configured
-var pdfParser *PDFParser  // initialized unconditionally in main (no config required)
-var state *StateStore     // SQLite-backed state store; opened in main, closed on shutdown
-var lastEmails []Email    // last fetched emails for /reply reference
+var gmail *gmailapi.GmailConnector // initialized in main if configured
+var ghl *ghlapi.GHLConnector       // initialized in main if configured
+var pdfParser *pdf.PDFParser       // initialized unconditionally in main (no config required)
+var state *statestore.StateStore   // SQLite-backed state store; opened in main, closed on shutdown
+var lastEmails []gmailapi.Email    // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
 
 // citeTagRe captures <cite file="X" page="N">verbatim text</cite> emitted by
@@ -1474,7 +1479,7 @@ func handleEmails(args string, bot *TGBot, cfg *Config, budget *BudgetTracker) {
 		if err == nil && filterTerm != "" {
 			// Client-side filter by name in From/To/Subject
 			ft := strings.ToLower(filterTerm)
-			var filtered []Email
+			var filtered []gmailapi.Email
 			for _, e := range broader {
 				if strings.Contains(strings.ToLower(e.From), ft) ||
 					strings.Contains(strings.ToLower(e.To), ft) ||
@@ -1499,7 +1504,7 @@ func handleEmails(args string, bot *TGBot, cfg *Config, budget *BudgetTracker) {
 	}
 
 	// Format and send
-	formatted := FormatEmailsForPrompt(emails)
+	formatted := gmailapi.FormatEmailsForPrompt(emails)
 	header := fmt.Sprintf("[emails] %d result(s) for: %s\n\n", len(emails), query)
 
 	// If short enough, send directly. Otherwise summarize with LLM.
@@ -1584,7 +1589,7 @@ func handleReply(args string, bot *TGBot, cfg *Config, budget *BudgetTracker) {
 		return
 	}
 
-	replyTo := ExtractEmailAddress(fullEmail.From)
+	replyTo := gmailapi.ExtractEmailAddress(fullEmail.From)
 	subject := fullEmail.Subject
 
 	var replyBody string
@@ -1728,7 +1733,7 @@ func handleThread(args string, bot *TGBot, cfg *Config, budget *BudgetTracker) {
 		return
 	}
 
-	threadText := FormatThreadForPrompt(threadEmails, "rio@ramaris.app")
+	threadText := gmailapi.FormatThreadForPrompt(threadEmails, "rio@ramaris.app")
 
 	// Summarize with LLM
 	if err := budget.check(cfg.Budgets.PerDayTokens, 2048); err != nil {
@@ -1762,7 +1767,7 @@ func handleReauth(bot *TGBot) {
 		"https://www.googleapis.com/auth/gmail.send",
 		"https://www.googleapis.com/auth/gmail.compose",
 	}
-	authURL := GenerateAuthURL(gmail.token.ClientID, scopes, authRedirectPort)
+	authURL := gmailapi.GenerateAuthURL(gmail.ClientID(), scopes, authRedirectPort)
 	bot.Send(fmt.Sprintf("[reauth] Open this URL:\n\n%s\n\nAfter authorizing, the page will fail to load. Copy the 'code' parameter from the URL bar and send:\n/authcode <the-code>", authURL))
 }
 
@@ -1989,7 +1994,7 @@ func main() {
 	// Init Gmail connector if configured
 	if cfg.Gmail.TokenPath != "" {
 		var err error
-		gmail, err = NewGmailConnector(cfg.Gmail.TokenPath)
+		gmail, err = gmailapi.NewGmailConnector(cfg.Gmail.TokenPath)
 		if err != nil {
 			log.Printf("[gmail] WARNING: failed to initialize: %v", err)
 		}
@@ -1998,14 +2003,14 @@ func main() {
 	// Init GoHighLevel connector if configured
 	if cfg.GHL.TokenPath != "" || cfg.GHL.APIKeyEnv != "" {
 		var err error
-		ghl, err = NewGHLConnector(cfg.GHL)
+		ghl, err = ghlapi.NewGHLConnector(cfg.GHL)
 		if err != nil {
 			log.Printf("[ghl] WARNING: failed to initialize: %v", err)
 		}
 	}
 
 	// PDF connector — stateless, always available
-	pdfParser = NewPDFParser()
+	pdfParser = pdf.NewPDFParser()
 
 	// State store — SQLite-backed dedup + run history
 	statePath := cfg.State.Path
@@ -2014,7 +2019,7 @@ func main() {
 	}
 	{
 		var err error
-		state, err = OpenStateStore(statePath)
+		state, err = statestore.OpenStateStore(statePath)
 		if err != nil {
 			log.Fatalf("[state] failed to open %s: %v", statePath, err)
 		}

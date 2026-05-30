@@ -2,5 +2,7 @@
 
 package main
 
-func bootVoice(cfg *Config, st *StateStore) {}
-func shutdownVoice()                        {}
+import statestore "github.com/renezander030/draftcat/internal/state"
+
+func bootVoice(cfg *Config, st *statestore.StateStore) {}
+func shutdownVoice()                                   {}
