@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.svg" alt="Draftcat" width="400">
+  <img src="logo.png" alt="Draftcat" width="440">
 </p>
 
 <h1 align="center">Draftcat</h1>
