@@ -48,20 +48,24 @@ pipelines:
       - {name: review,    type: approval,      mode: hitl, channel: telegram}
 ```
 
+A pipeline's `schedule` decides when it runs: an interval (`30m`, `1h`), `manual` (operator `/run` only), or `webhook` (an authenticated HTTP trigger — see [Triggers](#triggers)). Whichever fires it, the steps and the approval gate are identical.
+
 ## Why Draftcat
 
-|                              | **Draftcat**                                   | **n8n**                                   | **LangChain agents**             |
-| ---------------------------- | ---------------------------------------------- | ----------------------------------------- | -------------------------------- |
-| **Built for**                | AI-augmented business ops with governance      | General workflow automation               | Open-ended agent loops           |
-| **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes in visual workflows     | Agent decides next action freely |
-| **Human-in-the-loop**        | Required on every outbound step                | Optional manual nodes                     | Optional; not the default        |
-| **Token budgets**            | Per-step / pipeline / day, enforced            | None                                      | None                             |
-| **Prompt-injection defense** | Input sanitization + output schema validation  | None                                      | None                             |
-| **State & dedup**            | SQLite-backed; items processed at most once    | DB-backed                                 | In-memory                        |
-| **Runtime**                  | Single Go binary                               | Node.js + Postgres                        | Python + dependency tree         |
-| **Voice AI**                 | Built-in `voice` plugin (Dograh, EU residency) | None                                      | None                             |
+|                              | **Draftcat**                                   | **n8n**                               | **LangChain agents**             | **Agent harnesses** (Flue, Claude Code) |
+| ---------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------- | --------------------------------------- |
+| **Built for**                | AI-augmented business ops with governance      | General workflow automation           | Open-ended agent loops           | Programmable autonomous agents          |
+| **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes in visual workflows | Agent decides next action freely | Agent acts autonomously in a sandbox    |
+| **Human-in-the-loop**        | Required on every outbound step                | Optional manual nodes                 | Optional; not the default        | Optional (dispatch a message mid-run)   |
+| **Token budgets**            | Per-step / pipeline / day, enforced            | None                                  | None                             | App-managed, not built in               |
+| **Prompt-injection defense** | Input sanitization + output schema validation  | None                                  | None                             | Sandbox isolation; app-managed          |
+| **State & dedup**            | SQLite-backed; items processed at most once    | DB-backed                             | In-memory                        | Session store / Durable Objects         |
+| **Runtime**                  | Single Go binary                               | Node.js + Postgres                    | Python + dependency tree         | TypeScript, runtime-agnostic            |
+| **Voice AI**                 | Built-in `voice` plugin (Dograh, EU residency) | None                                  | None                             | None                                    |
 
-Use n8n for drag-drop integrations across 400+ services. Use LangChain for research and open-ended exploration. Use Draftcat when a wrong LLM choice means a real customer gets emailed.
+Use n8n for drag-drop integrations across 400+ services. Use LangChain for research and open-ended exploration. Use an agent harness like [Flue](https://github.com/withastro/flue) when you want an agent to roam a sandbox and choose its own steps. Use Draftcat when a wrong LLM choice means a real customer gets emailed.
+
+Draftcat and agent harnesses sit at opposite ends of the same axis. A harness hands the model a sandbox and lets it decide what to do; Draftcat fixes the sequence in YAML and lets the model only fill in structured output that deterministic Go then validates and an operator approves. Both converge on the same authoring style — most logic lives in Markdown/YAML skills, not code — which is why Draftcat keeps its prompts in `skills/` and reads `AGENTS.md`-style context. The difference is purely where the decision boundary sits: for outbound business actions, Draftcat keeps it on the deterministic side.
 
 ## Built-in actions
 
@@ -83,9 +87,10 @@ Add an action by appending a `case` to the deterministic switch in `main.go` and
 - **Token budgets** — per-step / per-pipeline / per-day caps. Exceeding any budget halts the pipeline immediately.
 - **Human-in-the-loop** — every outbound action requires explicit operator approval.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before reaching the LLM.
-- **Output validation** — AI output is validated against the skill's JSON schema; invalid output is rejected.
+- **Output validation** — AI output is validated against the skill's `output_schema` — field types, numeric `min`/`max`, and `enum` membership — and rejected before it can reach a downstream step.
 - **Rate limiting** — per-user, per-minute limits on operator interactions.
 - **Channel security** — allowed-user lists and input-length limits enforced at startup; the engine refuses to start without them.
+- **Observability** — opt-in structured JSON spans, one per pipeline and one per step (duration, status, tokens, cost). Off by default; enable with `observability.spans: true` or `DRAFTCAT_TRACE=1`. One line per span, ready to pipe into a log collector or a future OpenTelemetry exporter.
 
 ## State & idempotency
 
@@ -94,6 +99,27 @@ State persists to SQLite at the path set in `config.yaml` (`./state.db` by defau
 - **Dedup** — fetched item IDs are recorded per `(pipeline, scope)`; subsequent runs skip already-processed items. Marked seen at fetch time, so a downstream failure won't cause reprocessing. Replay via the `/run <pipeline>` operator command.
 - **Run history** — every run records `pipeline / started_at / ended_at / status / error_text`.
 - **Crash safety** — WAL mode + `synchronous=NORMAL` for durable writes without per-write fsync.
+
+## Triggers
+
+Besides interval and `manual` schedules, a pipeline can be triggered by an authenticated HTTP request. Set its `schedule: webhook` and enable the opt-in server:
+
+```yaml
+webhook:
+  enabled: true
+  addr: 127.0.0.1:8088     # bind locally; front with your reverse proxy
+  secret_env: DRAFTCAT_WEBHOOK_SECRET   # required — bearer token
+```
+
+```bash
+curl -X POST http://127.0.0.1:8088/hooks/invoice-due-diligence \
+  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" \
+  -d '{"path": "/inbox/invoice.pdf"}'
+```
+
+The request body is passed to the pipeline as `{{webhook_body}}` / `{{input}}`. The trigger is rejected with `409` if that pipeline is already running, so a noisy caller can't start overlapping runs. The server opens no port unless `enabled`, refuses to start without a secret, and compares the bearer token in constant time.
+
+This is a *trigger*, not an agent surface: a webhook can start a pipeline, but the pipeline still runs its own approval gate, so an inbound request can never make the LLM fire an outbound action on its own.
 
 ## Configuration
 
@@ -112,6 +138,9 @@ budgets:
 
 state:
   path: ./state.db
+
+observability:
+  spans: false           # structured JSON spans per pipeline/step (or DRAFTCAT_TRACE=1)
 ```
 
 Skills are YAML prompt templates in `skills/` with an `output_schema` the engine enforces. With `-tags voice`, an additional `voice:` block configures the webhook receivers, Dograh endpoints, and pre-call lookup — full reference in [docs/voice.md](docs/voice.md).
@@ -154,9 +183,11 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 
 ## Status
 
-**v0.1** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
+**v0.2** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
 
-Planned: webhook triggers, a generic HTTP action, per-step retry + circuit breaker, Slack approval channel, and Prometheus metrics. Voice v0.2: outbound campaigns with consent gating, recording redaction, and an MCP bridge. See [docs/voice.md](docs/voice.md) for the voice roadmap.
+New in v0.2: webhook triggers (`schedule: webhook`), structured observability spans, and `enum` / `number` enforcement in output schemas.
+
+Planned: a generic HTTP action, per-step retry + circuit breaker, Slack approval channel, and an OpenTelemetry/Prometheus span exporter. Voice v0.2: outbound campaigns with consent gating, recording redaction, and an MCP bridge. See [docs/voice.md](docs/voice.md) for the voice roadmap.
 
 ## License
 

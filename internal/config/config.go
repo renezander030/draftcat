@@ -22,6 +22,8 @@ type Config struct {
 	Roles     map[string]string      `yaml:"roles"`
 	Budgets   BudgetConfig           `yaml:"budgets"`
 	Timeouts  TimeoutConfig          `yaml:"timeouts"`
+	Webhook   WebhookConfig          `yaml:"webhook"`
+	Observ    ObservabilityConfig    `yaml:"observability"`
 	Pipelines []PipelineConfig       `yaml:"pipelines"`
 	// Voice is parsed unconditionally as raw YAML. Decoded into voice.Config
 	// only when draftcat is built with -tags voice. Lean builds ignore it.
@@ -83,6 +85,34 @@ type TimeoutConfig struct {
 	AICall           string `yaml:"ai_call"`
 	OperatorApproval string `yaml:"operator_approval"`
 	PipelineTotal    string `yaml:"pipeline_total"`
+}
+
+// WebhookConfig enables the opt-in HTTP trigger server. A pipeline with
+// `schedule: webhook` runs only when an authenticated POST hits
+// /hooks/<pipeline>. Default (disabled) opens no port — lean behavior is
+// unchanged. The webhook only TRIGGERS a pipeline; the pipeline still runs its
+// own approval gates, so the deterministic boundary is preserved.
+type WebhookConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Addr is the listen address, e.g. "127.0.0.1:8088". Default "127.0.0.1:8088".
+	Addr string `yaml:"addr"`
+	// SecretEnv names the env var holding the bearer token required on every
+	// request (Authorization: Bearer <token>). REQUIRED when enabled.
+	SecretEnv string `yaml:"secret_env"`
+	// MaxBodyBytes caps the request body read into data["webhook_body"].
+	// Default 65536.
+	MaxBodyBytes int64 `yaml:"max_body_bytes"`
+	secret       string
+}
+
+// Secret / SetSecret access the runtime-resolved webhook token (never parsed from YAML).
+func (w WebhookConfig) Secret() string      { return w.secret }
+func (w *WebhookConfig) SetSecret(s string) { w.secret = s }
+
+// ObservabilityConfig toggles structured span emission (see internal/obs).
+// Off by default. The DRAFTCAT_TRACE env var also enables it.
+type ObservabilityConfig struct {
+	Spans bool `yaml:"spans"`
 }
 
 type PipelineConfig struct {

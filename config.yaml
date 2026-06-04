@@ -55,6 +55,19 @@ timeouts:
   operator_approval: 4h
   pipeline_total: 5m
 
+# Structured span emission for auditing/observability. Off by default; the
+# DRAFTCAT_TRACE env var also enables it. One JSON line per pipeline + per step.
+observability:
+  spans: false
+
+# Opt-in HTTP trigger. When enabled, a pipeline with `schedule: webhook` runs on
+# an authenticated POST /hooks/<pipeline>. Disabled here = no port is opened.
+# webhook:
+#   enabled: true
+#   addr: 127.0.0.1:8088
+#   secret_env: DRAFTCAT_WEBHOOK_SECRET   # required when enabled (bearer token)
+#   max_body_bytes: 65536
+
 pipelines:
   # Uses skill reference instead of inline prompt
   - name: test-screener

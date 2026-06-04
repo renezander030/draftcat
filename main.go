@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"github.com/renezander030/draftcat/internal/config"
@@ -24,6 +25,7 @@ import (
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
 	gmailapi "github.com/renezander030/draftcat/internal/gmail"
+	"github.com/renezander030/draftcat/internal/obs"
 	"github.com/renezander030/draftcat/internal/pdf"
 	statestore "github.com/renezander030/draftcat/internal/state"
 	"github.com/renezander030/draftcat/internal/voicebridge"
@@ -45,6 +47,13 @@ type Scheduler struct {
 	pipelines map[string]*PipelineState
 }
 
+// isAutoSchedule reports whether a schedule string drives automatic timer runs.
+// "manual" (operator /run only), "webhook" (HTTP trigger only), and "" are not
+// timer-driven.
+func isAutoSchedule(schedule string) bool {
+	return schedule != "" && schedule != "manual" && schedule != "webhook"
+}
+
 func newScheduler(pipelines []config.PipelineConfig) *Scheduler {
 	s := &Scheduler{pipelines: make(map[string]*PipelineState)}
 	for _, p := range pipelines {
@@ -52,7 +61,7 @@ func newScheduler(pipelines []config.PipelineConfig) *Scheduler {
 			Name:     p.Name,
 			Schedule: p.Schedule,
 		}
-		if p.Schedule != "manual" && p.Schedule != "" {
+		if isAutoSchedule(p.Schedule) {
 			ps.NextRun = calcNextRun(p.Schedule)
 		}
 		s.pipelines[p.Name] = ps
@@ -94,12 +103,32 @@ func (s *Scheduler) Resume(name string) bool {
 	defer s.mu.Unlock()
 	if ps, ok := s.pipelines[name]; ok {
 		ps.Paused = false
-		if ps.Schedule != "manual" && ps.Schedule != "" {
+		if isAutoSchedule(ps.Schedule) {
 			ps.NextRun = calcNextRun(ps.Schedule)
 		}
 		return true
 	}
 	return false
+}
+
+// TryStart atomically claims a pipeline for execution. It returns false (with a
+// reason) if the pipeline is unknown, paused, or already running. Used by the
+// webhook trigger to avoid overlapping runs of the same pipeline.
+func (s *Scheduler) TryStart(name string) (bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ps, ok := s.pipelines[name]
+	if !ok {
+		return false, "unknown pipeline"
+	}
+	if ps.Paused {
+		return false, "pipeline is paused"
+	}
+	if ps.Running {
+		return false, "pipeline is already running"
+	}
+	ps.Running = true
+	return true, ""
 }
 
 func (s *Scheduler) Reschedule(name string, schedule string) bool {
@@ -118,7 +147,7 @@ func (s *Scheduler) MarkRun(name string) {
 	defer s.mu.Unlock()
 	if ps, ok := s.pipelines[name]; ok {
 		ps.LastRun = time.Now()
-		if ps.Schedule != "manual" && ps.Schedule != "" {
+		if isAutoSchedule(ps.Schedule) {
 			ps.NextRun = calcNextRun(ps.Schedule)
 		}
 	}
@@ -138,7 +167,7 @@ func (s *Scheduler) GetDue() []string {
 	var due []string
 	now := time.Now()
 	for name, ps := range s.pipelines {
-		if ps.Paused || ps.Running || ps.Schedule == "manual" || ps.Schedule == "" {
+		if ps.Paused || ps.Running || !isAutoSchedule(ps.Schedule) {
 			continue
 		}
 		if !ps.NextRun.IsZero() && now.After(ps.NextRun) {
@@ -492,6 +521,25 @@ func toFloat64(v interface{}) *float64 {
 	}
 }
 
+// enumContains reports whether val is a member of the allowed set. Numbers are
+// compared by value (YAML decodes enum ints as int, JSON decodes the field as
+// float64), everything else by interface equality.
+func enumContains(allowed []interface{}, val interface{}) bool {
+	vNum := toFloat64(val)
+	for _, a := range allowed {
+		if vNum != nil {
+			if aNum := toFloat64(a); aNum != nil && *aNum == *vNum {
+				return true
+			}
+			continue
+		}
+		if a == val {
+			return true
+		}
+	}
+	return false
+}
+
 func validateOutput(text string, schema map[string]interface{}) (map[string]interface{}, error) {
 	if len(schema) == 0 {
 		return nil, nil
@@ -520,7 +568,7 @@ func validateOutput(text string, schema map[string]interface{}) (map[string]inte
 		if defMap, ok := schemaDef.(map[string]interface{}); ok {
 			if typeName, ok := defMap["type"].(string); ok {
 				switch typeName {
-				case "int":
+				case "int", "number":
 					num := toFloat64(val)
 					if num == nil {
 						return nil, fmt.Errorf("field %s: expected number, got %T", key, val)
@@ -543,6 +591,18 @@ func validateOutput(text string, schema map[string]interface{}) (map[string]inte
 					if _, ok := val.(string); !ok {
 						return nil, fmt.Errorf("field %s: expected string, got %T", key, val)
 					}
+				}
+			}
+
+			// enum: value must be one of the allowed members (works for any type).
+			// Compared after JSON decode, so numbers are float64 on both sides.
+			if rawEnum, ok := defMap["enum"]; ok {
+				allowed, ok := rawEnum.([]interface{})
+				if !ok {
+					return nil, fmt.Errorf("field %s: schema 'enum' must be a list", key)
+				}
+				if !enumContains(allowed, val) {
+					return nil, fmt.Errorf("field %s: value %v not in allowed set %v", key, val, allowed)
 				}
 			}
 		}
@@ -831,9 +891,44 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 
 // --- Pipeline Engine ---
 
-func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *BudgetTracker, ch OperatorChannel, skills *skillsapi.SkillRegistry) error {
+func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *BudgetTracker, ch OperatorChannel, skills *skillsapi.SkillRegistry, seed map[string]interface{}) (err error) {
 	log.Printf("[pipeline:%s] starting", pipeline.Name)
 	budget.tokensUsedPipeline = 0
+
+	// Observability: one pipeline span (always) + one span per step. Steps that
+	// run to completion emit at the bottom of the loop; a step that halts the
+	// pipeline (skip or error) never reaches there, so the deferred block emits
+	// its terminal span. No-op unless tracing is enabled. See internal/obs.
+	pipeSpan := obs.Pipeline(pipeline.Name)
+	var (
+		stepsCompleted int
+		lastStep       string
+		lastKind       string
+		lastStepStart  time.Time
+		allDone        bool
+	)
+	defer func() {
+		status := "ok"
+		fields := map[string]interface{}{
+			"steps_completed": stepsCompleted,
+			"tokens":          budget.tokensUsedPipeline,
+		}
+		if err != nil {
+			status = "error"
+			fields["error"] = err.Error()
+		}
+		if !allDone && lastStep != "" {
+			stStatus := "skip"
+			stFields := map[string]interface{}{}
+			if err != nil {
+				stStatus = "error"
+				stFields["error"] = err.Error()
+			}
+			obs.EmitStep(pipeline.Name, lastStep, lastKind, lastStepStart, stStatus, stFields)
+			fields["halted_at"] = lastStep
+		}
+		pipeSpan.End(status, fields)
+	}()
 
 	// Parse pipeline timeout
 	pipelineTimeout, _ := time.ParseDuration(cfg.Timeouts.PipelineTotal)
@@ -854,7 +949,18 @@ Client: $45K spent, 4.92 stars, United States
 Skills: RAG, Vector Databases, Claude API, TypeScript
 Description: We need an experienced LLM engineer to build a retrieval-augmented generation pipeline for searching and summarizing legal documents. Must have production RAG experience.`
 
+	// Seed values (e.g. a webhook request body) override/extend the defaults so
+	// the first step can reference {{webhook_body}} or {{input}}.
+	for k, v := range seed {
+		data[k] = v
+	}
+
 	for _, step := range pipeline.Steps {
+		lastStep = step.Name
+		lastKind = step.Type
+		lastStepStart = time.Now()
+		stepFields := map[string]interface{}{}
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("pipeline timeout after %s", pipelineTimeout)
@@ -1113,6 +1219,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
 				pipeline.Name, step.Name, resp.Model,
 				resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
+			stepFields["model"] = resp.Model
+			stepFields["tokens"] = resp.InputTokens + resp.OutputTokens
+			stepFields["cost_usd"] = resp.CostUSD
 
 			// Validate output
 			if len(schema) > 0 {
@@ -1206,7 +1315,15 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				}
 			}
 		}
+
+		// Step ran to completion (did not halt the pipeline).
+		if step.Type == "deterministic" && step.Action != "" {
+			stepFields["action"] = step.Action
+		}
+		obs.EmitStep(pipeline.Name, step.Name, step.Type, lastStepStart, "ok", stepFields)
+		stepsCompleted++
 	}
+	allDone = true
 
 	log.Printf("[pipeline:%s] completed. tokens_used=%d", pipeline.Name, budget.tokensUsedPipeline)
 	return nil
@@ -1775,7 +1892,7 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 	sched.SetRunning(name, true)
 	go func() {
 		defer sched.SetRunning(name, false)
-		if err := runPipeline(cfg, *pipeline, budget, bot, skills); err != nil {
+		if err := runPipeline(cfg, *pipeline, budget, bot, skills, nil); err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
 			bot.Send(fmt.Sprintf("[run] ERROR in %s: %s", name, err))
 		}
@@ -1912,6 +2029,21 @@ func main() {
 	}
 	budget := &BudgetTracker{dayStart: time.Now()}
 	chatHistory := newChatHistory(20) // keep last 20 turns
+
+	// Observability — structured span emission (off unless opted in).
+	if cfg.Observ.Spans || os.Getenv("DRAFTCAT_TRACE") != "" {
+		obs.Enable(nil)
+		log.Printf("[obs] span tracing enabled")
+	}
+
+	// Webhook trigger server — opt-in; opens no port unless enabled.
+	if cfg.Webhook.Enabled {
+		cfg.Webhook.SetSecret(resolveEnv(cfg.Webhook.SecretEnv))
+		if cfg.Webhook.Secret() == "" {
+			log.Fatalf("webhook.enabled is true but secret env %q is empty — refusing to start an unauthenticated trigger", cfg.Webhook.SecretEnv)
+		}
+		startWebhookServer(&cfg, sched, budget, bot, skillReg)
+	}
 
 	// Drain pending updates
 	bot.getUpdates()
@@ -2156,7 +2288,7 @@ Conversation so far:
 						sched.SetRunning(name, true)
 						go func(p config.PipelineConfig) {
 							defer sched.SetRunning(p.Name, false)
-							if err := runPipeline(&cfg, p, budget, bot, skillReg); err != nil {
+							if err := runPipeline(&cfg, p, budget, bot, skillReg, nil); err != nil {
 								log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
 								bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
 							}
@@ -2168,6 +2300,106 @@ Conversation so far:
 			}
 		}
 	}
+}
+
+// startWebhookServer launches the opt-in HTTP trigger. POST /hooks/<pipeline>
+// with `Authorization: Bearer <secret>` runs a pipeline whose schedule is
+// "webhook". This mirrors the dispatch-style async trigger seen in agent
+// harnesses, but it ONLY triggers — the pipeline still runs its own approval
+// gates, so an inbound request can never make the LLM fire an action. The
+// request body is passed to the pipeline as data["webhook_body"] / {{input}}.
+//
+// The server runs in a background goroutine. A trigger is rejected (409) if the
+// pipeline is already running, preserving the at-most-once-concurrent guarantee.
+func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTracker, bot *TGBot, skills *skillsapi.SkillRegistry) {
+	addr := cfg.Webhook.Addr
+	if addr == "" {
+		addr = "127.0.0.1:8088"
+	}
+	hookable := webhookPipelines(cfg)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           newWebhookHandler(cfg, sched, budget, bot, skills),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("[webhook] listening on %s (%d pipeline(s) triggerable)", addr, len(hookable))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[webhook] server stopped: %v", err)
+		}
+	}()
+}
+
+// webhookPipelines indexes the pipelines that opted into HTTP triggering.
+func webhookPipelines(cfg *config.Config) map[string]config.PipelineConfig {
+	hookable := map[string]config.PipelineConfig{}
+	for _, p := range cfg.Pipelines {
+		if p.Schedule == "webhook" {
+			hookable[p.Name] = p
+		}
+	}
+	return hookable
+}
+
+// newWebhookHandler builds the /hooks/ handler. Split out from startWebhookServer
+// so the auth, routing, and concurrency guards are unit-testable without binding
+// a port.
+func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTracker, bot *TGBot, skills *skillsapi.SkillRegistry) http.Handler {
+	maxBody := cfg.Webhook.MaxBodyBytes
+	if maxBody <= 0 {
+		maxBody = 65536
+	}
+	secret := []byte(cfg.Webhook.Secret())
+	hookable := webhookPipelines(cfg)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hooks/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Constant-time bearer auth.
+		const prefix = "Bearer "
+		got := r.Header.Get("Authorization")
+		if !strings.HasPrefix(got, prefix) ||
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		name := strings.TrimPrefix(r.URL.Path, "/hooks/")
+		p, ok := hookable[name]
+		if !ok {
+			http.Error(w, "no webhook-triggerable pipeline named "+name, http.StatusNotFound)
+			return
+		}
+
+		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+
+		ok, reason := sched.TryStart(name)
+		if !ok {
+			http.Error(w, reason, http.StatusConflict)
+			return
+		}
+
+		log.Printf("[webhook] triggering pipeline %s (%d body bytes)", name, len(body))
+		go func(p config.PipelineConfig, body []byte) {
+			defer sched.SetRunning(p.Name, false)
+			seed := map[string]interface{}{"webhook_body": string(body)}
+			if strings.TrimSpace(string(body)) != "" {
+				seed["input"] = string(body)
+			}
+			if err := runPipeline(cfg, p, budget, bot, skills, seed); err != nil {
+				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
+				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))
+			}
+			sched.MarkRun(p.Name)
+		}(p, body)
+
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("accepted\n"))
+	})
+	return mux
 }
 
 func resolveEnv(names ...string) string {

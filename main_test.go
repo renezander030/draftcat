@@ -600,6 +600,70 @@ func TestValidateOutputWrongType(t *testing.T) {
 	}
 }
 
+func TestValidateOutputNumberType(t *testing.T) {
+	schema := map[string]interface{}{
+		"score": map[string]interface{}{"type": "number", "min": 0, "max": 100},
+	}
+	parsed, err := validateOutput(`{"score": 73}`, schema)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed == nil {
+		t.Fatal("expected parsed output")
+	}
+	if _, err := validateOutput(`{"score": 150}`, schema); err == nil {
+		t.Error("expected error for number above max")
+	}
+	if _, err := validateOutput(`{"score": "high"}`, schema); err == nil {
+		t.Error("expected error for non-numeric number field")
+	}
+}
+
+func TestValidateOutputEnumStringValid(t *testing.T) {
+	schema := map[string]interface{}{
+		"intent": map[string]interface{}{
+			"type": "string",
+			"enum": []interface{}{"buying", "inquiry", "support", "spam"},
+		},
+	}
+	if _, err := validateOutput(`{"intent": "buying"}`, schema); err != nil {
+		t.Fatalf("unexpected error for valid enum member: %v", err)
+	}
+}
+
+func TestValidateOutputEnumStringRejected(t *testing.T) {
+	schema := map[string]interface{}{
+		"intent": map[string]interface{}{
+			"type": "string",
+			"enum": []interface{}{"buying", "inquiry", "support", "spam"},
+		},
+	}
+	_, err := validateOutput(`{"intent": "maybe"}`, schema)
+	if err == nil {
+		t.Fatal("expected error for value outside enum")
+	}
+	if !contains(err.Error(), "not in allowed set") {
+		t.Errorf("expected 'not in allowed set' error, got: %v", err)
+	}
+}
+
+func TestValidateOutputEnumNumeric(t *testing.T) {
+	// YAML decodes enum ints as int; JSON decodes the field as float64.
+	// enumContains must match across the two.
+	schema := map[string]interface{}{
+		"tier": map[string]interface{}{
+			"type": "int",
+			"enum": []interface{}{1, 2, 3},
+		},
+	}
+	if _, err := validateOutput(`{"tier": 2}`, schema); err != nil {
+		t.Fatalf("unexpected error for valid numeric enum member: %v", err)
+	}
+	if _, err := validateOutput(`{"tier": 4}`, schema); err == nil {
+		t.Error("expected error for numeric value outside enum")
+	}
+}
+
 // --- Scheduler ---
 
 func TestSchedulerGetDue(t *testing.T) {

@@ -162,13 +162,21 @@ func loadSkillsForValidate(skillsDir string, rep *validateReport) map[string]*sk
 				rep.warnf("skills/"+s.Name, "output_schema.%s: definition is not a map", field)
 				continue
 			}
+			_, hasEnum := dm["enum"]
 			t, _ := dm["type"].(string)
 			switch t {
-			case "int", "bool", "string":
+			case "int", "number", "bool", "string":
 			case "":
-				rep.warnf("skills/"+s.Name, "output_schema.%s: missing 'type'", field)
+				if !hasEnum {
+					rep.warnf("skills/"+s.Name, "output_schema.%s: missing 'type'", field)
+				}
 			default:
-				rep.warnf("skills/"+s.Name, "output_schema.%s: unsupported type %q (validator handles int|bool|string)", field, t)
+				rep.warnf("skills/"+s.Name, "output_schema.%s: unsupported type %q (validator handles int|number|bool|string)", field, t)
+			}
+			if hasEnum {
+				if _, ok := dm["enum"].([]interface{}); !ok {
+					rep.warnf("skills/"+s.Name, "output_schema.%s: 'enum' must be a list", field)
+				}
 			}
 		}
 		if _, dup := skills[s.Name]; dup {
@@ -188,6 +196,13 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	}
 	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
 		rep.warnf("telegram.security.allowed_users", "empty — channel will accept no operator")
+	}
+	if cfg.Webhook.Enabled {
+		if cfg.Webhook.SecretEnv == "" {
+			rep.errf("webhook.secret_env", "must be set when webhook.enabled (engine refuses to start an unauthenticated trigger)")
+		} else if os.Getenv(cfg.Webhook.SecretEnv) == "" {
+			rep.warnf("webhook.secret_env", "env var %s is empty (engine will refuse to start at runtime)", cfg.Webhook.SecretEnv)
+		}
 	}
 }
 
@@ -238,9 +253,16 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 		}
 		seen[p.Name] = true
 
-		if p.Schedule != "" && p.Schedule != "manual" {
+		switch p.Schedule {
+		case "", "manual":
+			// operator /run only
+		case "webhook":
+			if !cfg.Webhook.Enabled {
+				rep.warnf(path+".schedule", "schedule 'webhook' but webhook.enabled is false — this pipeline can never be triggered")
+			}
+		default:
 			if _, err := time.ParseDuration(p.Schedule); err != nil {
-				rep.errf(path+".schedule", "invalid duration %q (use e.g. '30m', '1h', or 'manual')", p.Schedule)
+				rep.errf(path+".schedule", "invalid duration %q (use e.g. '30m', '1h', 'manual', or 'webhook')", p.Schedule)
 			}
 		}
 
