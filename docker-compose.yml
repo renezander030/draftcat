@@ -1,0 +1,21 @@
+# Run draftcat against this cloned directory: config.yaml, secrets.yaml,
+# skills/ and state.db all live here and persist on the host.
+#
+#   cp secrets.yaml.example secrets.yaml   # then fill in operator IDs
+#   export DRAFTCAT_TG_TOKEN=...           # API tokens come from the environment
+#   export OPENROUTER_API_KEY=...
+#   docker compose up
+services:
+  draftcat:
+    build: .
+    working_dir: /work
+    volumes:
+      - ./:/work
+    environment:
+      - DRAFTCAT_TG_TOKEN
+      - OPENROUTER_API_KEY
+    # The webhook listener is optional; set webhook.addr to 0.0.0.0:8088 in
+    # config.yaml for this published port to be reachable from the host.
+    ports:
+      - "8088:8088"
+    restart: unless-stopped

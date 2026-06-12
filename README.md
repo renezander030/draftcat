@@ -2,12 +2,12 @@
   <img src="logo.png" alt="Draftcat" width="440">
 </p>
 
-<p align="center"><b>Governed AI pipelines for service businesses — one Go binary.</b></p>
+<p align="center"><b>Governed AI pipelines where the LLM can't fire actions — one Go binary, self-hosted, human-in-the-loop.</b></p>
 
 <p align="center">
   <a href="https://github.com/renezander030/draftcat/stargazers"><img src="https://img.shields.io/github/stars/renezander030/draftcat?style=flat-square" alt="Stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/renezander030/draftcat?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go" alt="Go 1.24">
+  <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go" alt="Go 1.25">
   <a href="docs/voice.md"><img src="https://img.shields.io/badge/voice%20AI-EU%20residency%20%C2%B7%20Dograh-00D4AA?style=flat-square" alt="Voice AI plugin"></a>
 </p>
 
@@ -23,6 +23,14 @@ Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft rep
 git clone https://github.com/renezander030/draftcat.git && cd draftcat
 cp secrets.yaml.example secrets.yaml   # operator IDs + API keys
 go build -o draftcat . && ./draftcat
+```
+
+**Or with Docker** (no Go toolchain needed):
+
+```bash
+git clone https://github.com/renezander030/draftcat.git && cd draftcat
+cp secrets.yaml.example secrets.yaml
+docker compose up
 ```
 
 Pipelines live in `config.yaml`, prompts in `skills/`. A SQLite store opens at `./state.db` on first boot. To add the EU-resident **voice AI** plugin: `go build -tags voice -o draftcat .` — the lean binary is unchanged when the tag is off.
