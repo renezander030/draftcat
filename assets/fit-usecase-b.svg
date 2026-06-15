@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 460" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#1a1a1a"/></marker>
+    <marker id="ahg" markerWidth="10" markerHeight="10" refX="7" refY="3.4" orient="auto"><path d="M0,0 L7,3.4 L0,6.8 z" fill="#0a9d86"/></marker>
+    <marker id="ahb" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#2f80c9"/></marker>
+    <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#d64545"/></marker>
+  </defs>
+  <rect width="1280" height="460" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="27" font-weight="bold" fill="#1a1a1a">B · You control the harness</text>
+  <text x="40" y="74" font-size="16" fill="#6b6b6b">Your runtime does the roaming and integrations — it calls draftcat for anything customer-facing.</text>
+  <line x1="40" y1="92" x2="1240" y2="92" stroke="#e6e3dc" stroke-width="1"/>
+
+  <!-- LEFT: your harness -->
+  <rect x="40" y="165" width="250" height="150" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="165" y="203" font-size="19" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Your harness</text>
+  <text x="165" y="229" font-size="14" fill="#6b6b6b" text-anchor="middle">n8n · your agent loop</text>
+  <text x="165" y="248" font-size="14" fill="#6b6b6b" text-anchor="middle">· Dograh</text>
+  <!-- loop glyph -->
+  <path d="M132 270 a16 16 0 1 1 5 11" fill="none" stroke="#2f80c9" stroke-width="2" marker-end="url(#ahb)"/>
+  <text x="178" y="282" font-size="12.5" fill="#6b6b6b" text-anchor="middle">roams · integrates · triggers</text>
+
+  <!-- MIDDLE: draftcat gate -->
+  <rect x="420" y="120" width="520" height="250" rx="12" fill="#fffafa" stroke="#d64545" stroke-width="2.5"/>
+  <text x="445" y="155" font-size="22" font-weight="bold" fill="#1a1a1a">draftcat</text>
+  <path d="M598 132 l22 7 v15 c0 14 -10 23 -22 28 c-12 -5 -22 -14 -22 -28 v-15 z" fill="#fff" stroke="#d64545" stroke-width="2"/>
+  <polyline points="588,160 595,168 609,150" fill="none" stroke="#0a9d86" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="445" y="212" font-size="14" fill="#6b6b6b">the one gate it can't route around</text>
+
+  <!-- operator feeding approve -->
+  <circle cx="838" cy="200" r="13" fill="#fff" stroke="#d64545" stroke-width="2"/>
+  <circle cx="838" cy="195" r="4.5" fill="#d64545"/>
+  <path d="M830 209 c2,-6 14,-6 16,0" fill="none" stroke="#d64545" stroke-width="2"/>
+  <text x="838" y="240" font-size="12.5" fill="#6b6b6b" text-anchor="middle">operator · Telegram</text>
+  <line x1="838" y1="245" x2="838" y2="278" stroke="#d64545" stroke-width="2" marker-end="url(#ahr)"/>
+
+  <!-- 3 step pills -->
+  <g>
+    <rect x="447" y="280" width="140" height="64" rx="9" fill="#f1f8f2" stroke="#3fa34d" stroke-width="2"/>
+    <text x="517" y="308" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">1 · AI drafts</text>
+    <text x="517" y="328" font-size="12" fill="#6b6b6b" text-anchor="middle">structured output</text>
+
+    <rect x="617" y="280" width="140" height="64" rx="9" fill="#fff6e8" stroke="#f0a030" stroke-width="2"/>
+    <text x="687" y="304" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">2 · validate</text>
+    <text x="687" y="322" font-size="12" fill="#6b6b6b" text-anchor="middle">schema + budget</text>
+
+    <rect x="787" y="280" width="140" height="64" rx="9" fill="#fdeeee" stroke="#d64545" stroke-width="2"/>
+    <text x="857" y="304" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">3 · approve</text>
+    <text x="857" y="322" font-size="12" fill="#6b6b6b" text-anchor="middle">operator sign-off</text>
+
+    <line x1="589" y1="312" x2="613" y2="312" stroke="#1a1a1a" stroke-width="1.6" marker-end="url(#ah)"/>
+    <line x1="759" y1="312" x2="783" y2="312" stroke="#1a1a1a" stroke-width="1.6" marker-end="url(#ah)"/>
+  </g>
+
+  <!-- RIGHT: customer -->
+  <rect x="1040" y="165" width="200" height="150" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="1140" y="232" font-size="19" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Customer</text>
+  <text x="1140" y="258" font-size="14" fill="#6b6b6b" text-anchor="middle">email · CRM · voice</text>
+
+  <!-- flow arrows -->
+  <line x1="292" y1="232" x2="416" y2="232" stroke="#1a1a1a" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="354" y="222" font-size="13" fill="#1a1a1a" text-anchor="middle">routes every</text>
+  <text x="354" y="250" font-size="12" fill="#6b6b6b" text-anchor="middle">outbound action</text>
+
+  <line x1="942" y1="232" x2="1036" y2="232" stroke="#0a9d86" stroke-width="3" marker-end="url(#ahg)"/>
+  <text x="989" y="222" font-size="13" font-weight="bold" fill="#0a9d86" text-anchor="middle">approved</text>
+
+  <!-- return: result + audit -->
+  <path d="M1140 317 C 1140 408, 165 408, 165 319" fill="none" stroke="#2f80c9" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#ahb)"/>
+  <text x="652" y="404" font-size="13.5" fill="#2f80c9" font-weight="bold" text-anchor="middle">result + audit log back to your harness</text>
+</svg>

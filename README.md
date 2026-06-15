@@ -17,6 +17,22 @@ Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft rep
 
 ![Demo](demo.gif)
 
+## How draftcat fits
+
+However your agent runs, draftcat sits between it and your customer systems as a **mandatory approval gate** — not a tool the model can route around. The same gate holds in both setups:
+
+<p align="center">
+  <img src="assets/fit-usecase-a.png" alt="Use case A: you only talk to your agent — it hands off to draftcat, which holds the boundary" width="860">
+</p>
+
+**You only talk to your agent.** You don't control its runtime, so it hands work to draftcat over a webhook — but it can only *start* a gated pipeline, never fire a customer-facing action itself.
+
+<p align="center">
+  <img src="assets/fit-usecase-b.png" alt="Use case B: you control the harness — it routes every outbound action through draftcat" width="860">
+</p>
+
+**You control the harness.** Your runtime (n8n, your own agent loop, Dograh) does the roaming and integrations, then routes every outbound action through draftcat — the one gate it can't bypass — and gets the result plus an audit trail back.
+
 ## Quickstart
 
 ```bash
