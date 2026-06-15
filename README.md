@@ -227,6 +227,7 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 - [#5 SQLite Dedup + Crash Safety](https://gist.github.com/renezander030/8a23e32cde0c882a5aa069c4bfdf697f) — WAL mode, `seen_items`, run audit
 - [#6 Prompt-Injection Defense](https://gist.github.com/renezander030/213ffdf1ab1bdb169881927bc7080270) — input sanitization + output schema validation
 - [#7 PDF Cite Verification](https://gist.github.com/renezander030/7780cbc0b3ad4e802e8fba8bfc1c3a66) — auditable LLM extraction with per-fragment bounding boxes
+- [#11 Pipeline Fixture Testing](https://gist.github.com/renezander030/a058fc0d5e7e7fa209d30cfa48e82ebb) — dry-run pipelines from JSON fixtures; zero API calls in CI
 
 ## Related projects
 
