@@ -9,6 +9,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/renezander030/draftcat?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go" alt="Go 1.25">
   <a href="docs/voice.md"><img src="https://img.shields.io/badge/voice%20AI-EU%20residency%20%C2%B7%20Dograh-00D4AA?style=flat-square" alt="Voice AI plugin"></a>
+  <a href="https://render.com/deploy?repo=https://github.com/renezander030/draftcat"><img src="https://img.shields.io/badge/Deploy-Render-46E3B7?style=flat-square&logo=render&logoColor=white" alt="Deploy to Render"></a>
 </p>
 
 > **AI suggests. Deterministic code decides. The operator signs off.**
@@ -229,7 +230,7 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 
 ## Status
 
-**v0.2** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
+**v0.2.2** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
 
 New in v0.2: webhook triggers (`schedule: webhook`), structured observability spans, and `enum` / `number` enforcement in output schemas. Planned: a generic HTTP action, per-step retry + circuit breaker, Slack approval, and an OpenTelemetry/Prometheus span exporter.
 
