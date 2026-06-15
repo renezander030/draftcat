@@ -212,6 +212,10 @@ Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -sho
 
 ## Voice AI plugin
 
+> **Hook up your Dograh to your draftcat instance!**
+
+![Dograh runs the call in realtime; draftcat is the governed back-office that harvests every outcome and holds it at your approval gate before anything writes back](assets/voice-flow.png)
+
 Built with `-tags voice`, Draftcat becomes the **EU-resident writeback + governance layer** for self-hosted voice agents (Dograh, Pipecat, or any orchestrator that posts JSON webhooks): 5 lifecycle webhook receivers, sub-300ms pre-call context lookup, a 7-step Learning-Item review pipeline before any prompt/KB change ships, Dograh REST admin actions, and per-day call/minute budgets with bearer-auth webhooks. Full wiring recipe and runnable [DACH fixtures](fixtures/voice-dach-screener/pipeline.yaml) in [docs/voice.md](docs/voice.md).
 
 ## Patterns explained

@@ -1,9 +1,5 @@
 # Voice plugin
 
-> **Hook up your Dograh to your draftcat instance!**
-
-![Dograh runs the call in realtime; draftcat is the governed back-office that harvests every outcome and holds it at your approval gate before anything writes back](../assets/voice-flow.png)
-
 Draftcat's `voice` build tag adds an HTTP receiver for voice-AI session events
 and three pipeline harvest actions that consume them. The orchestrator (Dograh,
 Pipecat-direct, or any other) calls draftcat over webhooks. Draftcat owns
