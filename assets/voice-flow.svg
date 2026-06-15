@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 560" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#1a1a1a"/></marker>
+    <marker id="ahg" markerWidth="10" markerHeight="10" refX="7" refY="3.4" orient="auto"><path d="M0,0 L7,3.4 L0,6.8 z" fill="#0a9d86"/></marker>
+    <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#d64545"/></marker>
+    <marker id="ahb" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#2f80c9"/></marker>
+  </defs>
+  <rect width="1300" height="560" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="27" font-weight="bold" fill="#1a1a1a">Dograh × draftcat — data flow</text>
+  <text x="40" y="74" font-size="16" fill="#6b6b6b">Dograh runs the call in realtime. draftcat is the governed back-office: nothing leaves it without your sign-off.</text>
+  <line x1="40" y1="92" x2="1260" y2="92" stroke="#e6e3dc" stroke-width="1"/>
+
+  <!-- LEFT: caller + Dograh -->
+  <rect x="40" y="150" width="170" height="74" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="125" y="184" font-size="17" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Caller</text>
+  <text x="125" y="206" font-size="13" fill="#6b6b6b" text-anchor="middle">inbound / outbound</text>
+  <line x1="125" y1="224" x2="125" y2="286" stroke="#1a1a1a" stroke-width="2" marker-end="url(#ah)"/>
+
+  <rect x="40" y="288" width="170" height="120" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="125" y="328" font-size="19" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Dograh</text>
+  <text x="125" y="352" font-size="13" fill="#6b6b6b" text-anchor="middle">realtime voice agent</text>
+  <text x="125" y="372" font-size="13" fill="#6b6b6b" text-anchor="middle">STT · LLM · TTS</text>
+
+  <!-- forward arrow: call events -->
+  <line x1="210" y1="330" x2="416" y2="330" stroke="#1a1a1a" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="313" y="318" font-size="13" font-weight="bold" fill="#1a1a1a" text-anchor="middle">call events</text>
+  <text x="313" y="356" font-size="12" fill="#6b6b6b" text-anchor="middle">5 webhooks · Bearer</text>
+
+  <!-- MIDDLE: draftcat governed core -->
+  <rect x="420" y="150" width="600" height="318" rx="12" fill="#fffafa" stroke="#d64545" stroke-width="2.5"/>
+  <text x="445" y="190" font-size="21" font-weight="bold" fill="#1a1a1a">draftcat</text>
+  <path d="M576 167 l20 6 v13 c0 12 -9 20 -20 25 c-11 -5 -20 -13 -20 -25 v-13 z" fill="#fff" stroke="#d64545" stroke-width="2"/>
+  <polyline points="567,191 573,198 586,182" fill="none" stroke="#0a9d86" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="445" y="214" font-size="13.5" fill="#6b6b6b">governed back-office · budgets · schema validation · approval gate</text>
+
+  <!-- stage 1: receiver + sqlite -->
+  <rect x="445" y="300" width="150" height="84" rx="9" fill="#eef6ff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="520" y="330" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">voice receiver</text>
+  <text x="520" y="350" font-size="12" fill="#6b6b6b" text-anchor="middle">persist to</text>
+  <text x="520" y="367" font-size="12" fill="#48596b" text-anchor="middle">voice_* (SQLite)</text>
+
+  <!-- stage 2: harvest + AI -->
+  <rect x="625" y="300" width="150" height="84" rx="9" fill="#f1f8f2" stroke="#3fa34d" stroke-width="2"/>
+  <text x="700" y="330" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">harvest → AI</text>
+  <text x="700" y="350" font-size="12" fill="#6b6b6b" text-anchor="middle">extract outcome,</text>
+  <text x="700" y="367" font-size="12" fill="#6b6b6b" text-anchor="middle">schema-validated</text>
+
+  <!-- stage 3: approve -->
+  <rect x="805" y="300" width="160" height="84" rx="9" fill="#fdeeee" stroke="#d64545" stroke-width="2"/>
+  <text x="885" y="330" font-size="14" font-weight="bold" fill="#1a1a1a" text-anchor="middle">operator approve</text>
+  <text x="885" y="350" font-size="12" fill="#6b6b6b" text-anchor="middle">approve / edit /</text>
+  <text x="885" y="367" font-size="12" fill="#6b6b6b" text-anchor="middle">reject</text>
+
+  <line x1="597" y1="342" x2="621" y2="342" stroke="#1a1a1a" stroke-width="1.6" marker-end="url(#ah)"/>
+  <line x1="777" y1="342" x2="801" y2="342" stroke="#1a1a1a" stroke-width="1.6" marker-end="url(#ah)"/>
+
+  <!-- operator glyph -->
+  <circle cx="885" cy="250" r="13" fill="#fff" stroke="#d64545" stroke-width="2"/>
+  <circle cx="885" cy="245" r="4.5" fill="#d64545"/>
+  <path d="M877 259 c2,-6 14,-6 16,0" fill="none" stroke="#d64545" stroke-width="2"/>
+  <text x="885" y="285" font-size="12" fill="#6b6b6b" text-anchor="middle">you · Telegram</text>
+  <line x1="885" y1="290" x2="885" y2="297" stroke="#d64545" stroke-width="2" marker-end="url(#ahr)"/>
+
+  <!-- RIGHT: approved outcome -->
+  <rect x="1075" y="295" width="185" height="94" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="1167" y="335" font-size="17" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Outcome</text>
+  <text x="1167" y="358" font-size="13" fill="#6b6b6b" text-anchor="middle">CRM · follow-up</text>
+  <text x="1167" y="375" font-size="13" fill="#6b6b6b" text-anchor="middle">· digest</text>
+  <line x1="1022" y1="342" x2="1071" y2="342" stroke="#0a9d86" stroke-width="3" marker-end="url(#ahg)"/>
+  <text x="1046" y="330" font-size="12" font-weight="bold" fill="#0a9d86" text-anchor="middle">approved</text>
+
+  <!-- return loop: draftcat -> Dograh -->
+  <path d="M620 468 C 620 524, 125 524, 125 412" fill="none" stroke="#2f80c9" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#ahb)"/>
+  <text x="640" y="520" font-size="13.5" font-weight="bold" fill="#2f80c9" text-anchor="middle">pre-call context · publish approved agent updates (Dograh auto-versions)</text>
+</svg>
