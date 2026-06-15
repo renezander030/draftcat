@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <rect width="1000" height="600" fill="#ffffff"/>
+  <rect x="30" y="28" width="940" height="544" rx="14" fill="#f9f8f5" stroke="#e2ded5" stroke-width="2"/>
+  <path d="M30 42 a14 14 0 0 1 14 -14 h912 a14 14 0 0 1 14 14 v40 h-940 z" fill="#f0eee9"/>
+  <circle cx="58" cy="55" r="7" fill="#e0675e"/><circle cx="82" cy="55" r="7" fill="#e6b53f"/><circle cx="106" cy="55" r="7" fill="#5fb56a"/>
+  <text x="500" y="61" font-size="19" font-weight="bold" fill="#5b6470" text-anchor="middle">draftcat — operator</text>
+
+  <text x="70" y="120" font-size="18" font-family="DejaVu Sans Mono, monospace" fill="#8a857b">$ ./draftcat<tspan fill="#c9c4ba">  ·  </tspan>webhook<tspan fill="#c9c4ba"> ▸ </tspan>pipeline: lead-triage<tspan fill="#c9c4ba"> ▸ </tspan><tspan fill="#d68a2f">step: review — awaiting approval</tspan></text>
+
+  <rect x="70" y="142" width="860" height="372" rx="14" fill="#ffffff" stroke="#e6e2d8" stroke-width="2"/>
+
+  <rect x="100" y="170" width="64" height="30" rx="15" fill="#fdeeee"/>
+  <text x="132" y="191" font-size="16" font-weight="bold" fill="#d64545" text-anchor="middle">HOT</text>
+  <rect x="174" y="170" width="146" height="30" rx="15" fill="#eef6ff"/>
+  <text x="247" y="191" font-size="16" font-weight="bold" fill="#2f80c9" text-anchor="middle">score 86 / 100</text>
+
+  <text x="100" y="244" font-size="30" font-weight="bold" fill="#1a1a1a">New lead — RAG project</text>
+  <text x="100" y="274" font-size="19" fill="#6b6b6b">Jamie Rivera · Northwind Studio</text>
+
+  <rect x="100" y="292" width="800" height="52" rx="9" fill="#f6f5f2"/>
+  <text x="120" y="325" font-size="21" fill="#3a3a3a" font-style="italic">"Need a RAG setup over our internal docs. Budget ~$8k."</text>
+
+  <text x="100" y="382" font-size="15" font-weight="bold" fill="#9b958a" letter-spacing="1.5">DRAFT REPLY</text>
+  <text x="100" y="410" font-size="21" fill="#1a1a1a">Hi Jamie — happy to help. A docs RAG at that scope is a good fit; I'd</text>
+  <text x="100" y="438" font-size="21" fill="#1a1a1a">start with a short scoping call this week to map sources and success criteria.</text>
+
+  <!-- approve pressed -->
+  <rect x="100" y="460" width="252" height="48" rx="9" fill="#00917b"/>
+  <text x="226" y="491" font-size="20" font-weight="bold" fill="#ffffff" text-anchor="middle">✓ Approve &amp; send</text>
+  <rect x="366" y="460" width="120" height="48" rx="9" fill="#ffffff" stroke="#cfcabf" stroke-width="2"/>
+  <text x="426" y="491" font-size="20" fill="#3a3a3a" text-anchor="middle">Edit</text>
+  <rect x="500" y="460" width="120" height="48" rx="9" fill="#ffffff" stroke="#cfcabf" stroke-width="2"/>
+  <text x="560" y="491" font-size="20" fill="#d64545" text-anchor="middle">Reject</text>
+
+  <!-- cursor on approve -->
+  <path d="M236 486 l0 26 l7 -7 l5 11 l4 -2 l-5 -11 l10 0 z" fill="#1a1a1a" stroke="#ffffff" stroke-width="1.5"/>
+
+  <text x="500" y="552" font-size="18" fill="#8a857b" text-anchor="middle">AI suggests<tspan fill="#c9c4ba"> · </tspan>deterministic code decides<tspan fill="#c9c4ba"> · </tspan><tspan font-weight="bold" fill="#5b6470">you sign off</tspan></text>
+</svg>
