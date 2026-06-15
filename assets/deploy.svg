@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 460" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#1a1a1a"/></marker>
+    <marker id="ahg" markerWidth="10" markerHeight="10" refX="7" refY="3.4" orient="auto"><path d="M0,0 L7,3.4 L0,6.8 z" fill="#0a9d86"/></marker>
+    <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto"><path d="M0,0 L7,3.2 L0,6.4 z" fill="#d64545"/></marker>
+  </defs>
+  <rect width="1280" height="460" fill="#ffffff"/>
+
+  <text x="40" y="46" font-size="27" font-weight="bold" fill="#1a1a1a">Deploy · where draftcat runs</text>
+  <text x="40" y="74" font-size="16" fill="#6b6b6b">A long-lived service on a box you control. Agents reach it over an authenticated webhook — it's a service, not a plugin.</text>
+  <line x1="40" y1="92" x2="1240" y2="92" stroke="#e6e3dc" stroke-width="1"/>
+
+  <!-- LEFT: agent / harness -->
+  <rect x="40" y="195" width="210" height="115" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="145" y="245" font-size="19" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Agent / harness</text>
+  <text x="145" y="272" font-size="14" fill="#6b6b6b" text-anchor="middle">anywhere</text>
+
+  <!-- VPS boundary -->
+  <rect x="320" y="120" width="650" height="300" rx="14" fill="#fbfaf7" stroke="#a9a499" stroke-width="2" stroke-dasharray="8 6"/>
+  <text x="345" y="150" font-size="16" font-weight="bold" fill="#8a857b">Your VPS / server</text>
+
+  <!-- Caddy -->
+  <rect x="345" y="215" width="150" height="100" rx="10" fill="#fff6e8" stroke="#f0a030" stroke-width="2"/>
+  <text x="420" y="258" font-size="17" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Caddy /</text>
+  <text x="420" y="280" font-size="17" font-weight="bold" fill="#1a1a1a" text-anchor="middle">nginx</text>
+  <text x="420" y="302" font-size="13" fill="#6b6b6b" text-anchor="middle">TLS :443</text>
+
+  <!-- draftcat -->
+  <rect x="545" y="200" width="245" height="130" rx="12" fill="#fffafa" stroke="#d64545" stroke-width="2.5"/>
+  <text x="667" y="240" font-size="20" font-weight="bold" fill="#1a1a1a" text-anchor="middle">draftcat</text>
+  <text x="667" y="266" font-size="14" fill="#6b6b6b" text-anchor="middle">webhook listener :8088</text>
+  <text x="667" y="288" font-size="13" fill="#6b6b6b" text-anchor="middle">single Go binary · distroless</text>
+  <text x="667" y="308" font-size="13" fill="#6b6b6b" text-anchor="middle">restart: unless-stopped</text>
+
+  <!-- SQLite cylinder -->
+  <g>
+    <ellipse cx="888" cy="232" rx="48" ry="13" fill="#eef2f6" stroke="#9bb0c4" stroke-width="2"/>
+    <path d="M840 232 v56 a48 13 0 0 0 96 0 v-56" fill="#eef2f6" stroke="#9bb0c4" stroke-width="2"/>
+    <text x="888" y="270" font-size="14" font-weight="bold" fill="#48596b" text-anchor="middle">SQLite</text>
+    <text x="888" y="288" font-size="12" fill="#6b8197" text-anchor="middle">state.db</text>
+  </g>
+
+  <!-- operator into draftcat -->
+  <circle cx="667" cy="150" r="13" fill="#fff" stroke="#d64545" stroke-width="2"/>
+  <circle cx="667" cy="145" r="4.5" fill="#d64545"/>
+  <path d="M659 159 c2,-6 14,-6 16,0" fill="none" stroke="#d64545" stroke-width="2"/>
+  <text x="730" y="153" font-size="12.5" fill="#6b6b6b">operator · Telegram</text>
+  <line x1="667" y1="166" x2="667" y2="197" stroke="#d64545" stroke-width="2" marker-end="url(#ahr)"/>
+
+  <!-- RIGHT: customer -->
+  <rect x="1045" y="195" width="195" height="115" rx="10" fill="#fff" stroke="#2f80c9" stroke-width="2"/>
+  <text x="1142" y="245" font-size="19" font-weight="bold" fill="#1a1a1a" text-anchor="middle">Customer</text>
+  <text x="1142" y="272" font-size="14" fill="#6b6b6b" text-anchor="middle">email · CRM · voice</text>
+
+  <!-- arrows -->
+  <line x1="252" y1="252" x2="341" y2="252" stroke="#1a1a1a" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="296" y="232" font-size="12.5" font-weight="bold" fill="#1a1a1a" text-anchor="middle">HTTPS POST</text>
+  <text x="296" y="276" font-size="11.5" fill="#6b6b6b" text-anchor="middle">/hooks/&lt;pipeline&gt;</text>
+  <text x="296" y="292" font-size="11.5" fill="#6b6b6b" text-anchor="middle">+ Bearer token</text>
+
+  <line x1="495" y1="262" x2="541" y2="262" stroke="#1a1a1a" stroke-width="1.8" marker-end="url(#ah)"/>
+  <line x1="790" y1="258" x2="836" y2="258" stroke="#1a1a1a" stroke-width="1.8" marker-end="url(#ah)"/>
+
+  <line x1="972" y1="252" x2="1041" y2="252" stroke="#0a9d86" stroke-width="3" marker-end="url(#ahg)"/>
+  <text x="1006" y="232" font-size="12.5" font-weight="bold" fill="#0a9d86" text-anchor="middle">approved</text>
+</svg>

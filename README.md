@@ -51,6 +51,42 @@ docker compose up
 
 Pipelines live in `config.yaml`, prompts in `skills/`. A SQLite store opens at `./state.db` on first boot. To add the EU-resident **voice AI** plugin: `go build -tags voice -o draftcat .` — the lean binary is unchanged when the tag is off.
 
+## Deploy — where it runs
+
+draftcat is a **service you self-host**, not a plugin an agent loads. It runs as a long-lived process on a box you control (a small Linux VPS is plenty) and receives work over an authenticated webhook.
+
+![Deploy: an agent or harness POSTs over HTTPS to draftcat running on your VPS behind Caddy/nginx](assets/deploy.png)
+
+**Fastest start — one container:**
+
+```bash
+docker run -d --restart unless-stopped -p 8088:8088 \
+  -v "$PWD":/work -w /work \
+  -e DRAFTCAT_TG_TOKEN -e OPENROUTER_API_KEY \
+  ghcr.io/renezander030/draftcat
+```
+
+The mounted dir holds `config.yaml`, `secrets.yaml`, `skills/` and `state.db` — copy `secrets.yaml.example` first (or run `docker compose up` from a clone, which builds the same image).
+
+**Receiving inbound from an agent or harness.** Enable the webhook in `config.yaml` and give the pipeline `schedule: webhook`:
+
+```yaml
+webhook:
+  enabled: true
+  addr: 0.0.0.0:8088
+  secret_env: DRAFTCAT_WEBHOOK_SECRET
+```
+
+Put Caddy or nginx in front for TLS, then your agent or harness triggers a pipeline:
+
+```bash
+curl -X POST https://draftcat.yourco.eu/hooks/<pipeline> \
+  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" \
+  -d '{ "lead": "..." }'
+```
+
+The POST only **starts** a gated pipeline — the approval step still runs, so inbound can never make the LLM fire a customer-facing action.
+
 ## How it works
 
 Each pipeline is a fixed sequence of typed steps. The LLM never chooses the next action — it produces structured output, the engine validates it against a schema, and an operator approves before anything reaches a customer.
