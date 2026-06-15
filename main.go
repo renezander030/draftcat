@@ -1963,6 +1963,29 @@ func main() {
 		log.Fatal("OpenRouter API key not set. Set OPENROUTER_API_KEY env var.")
 	}
 
+	// Operator identity from env — lets a container boot from env vars alone
+	// (e.g. a one-click PaaS deploy) with no secrets file on disk. Values set
+	// in config.yaml win; env only fills what is unset.
+	if cfg.Telegram.ChatID == 0 {
+		if v := strings.TrimSpace(os.Getenv("DRAFTCAT_TG_CHAT_ID")); v != "" {
+			id, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				log.Fatalf("DRAFTCAT_TG_CHAT_ID is not a valid integer: %q", v)
+			}
+			cfg.Telegram.ChatID = id
+		}
+	}
+	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
+		if v := os.Getenv("DRAFTCAT_TG_ALLOWED_USERS"); strings.TrimSpace(v) != "" {
+			cfg.Telegram.Security.AllowedUsers = parseUserIDs(v)
+		}
+	}
+	// Single-operator convenience: default the send target to the first allowed
+	// user when chat_id was not given explicitly.
+	if cfg.Telegram.ChatID == 0 && len(cfg.Telegram.Security.AllowedUsers) > 0 {
+		cfg.Telegram.ChatID = cfg.Telegram.Security.AllowedUsers[0]
+	}
+
 	// Validate channel security — refuse to start without it
 	if err := validateChannelSecurity(&cfg); err != nil {
 		log.Fatalf("%v", err)
@@ -2000,6 +2023,11 @@ func main() {
 	statePath := cfg.State.Path
 	if statePath == "" {
 		statePath = "./state.db"
+	}
+	// Env override so a container can point state at a mounted disk (e.g. a
+	// PaaS persistent volume) without shadowing the baked config/skills.
+	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
+		statePath = v
 	}
 	{
 		var err error
@@ -2409,4 +2437,23 @@ func resolveEnv(names ...string) string {
 		}
 	}
 	return ""
+}
+
+// parseUserIDs parses a comma-separated list of integer Telegram user IDs
+// (e.g. "123,456") from an env var. A non-integer entry is fatal — a
+// misconfigured allow-list must not silently fall through to "no one allowed".
+func parseUserIDs(s string) []int64 {
+	var ids []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			log.Fatalf("DRAFTCAT_TG_ALLOWED_USERS contains a non-integer ID: %q", part)
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }

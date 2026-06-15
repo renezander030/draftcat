@@ -53,22 +53,39 @@ Pipelines live in `config.yaml`, prompts in `skills/`. A SQLite store opens at `
 
 ## Deploy — where it runs
 
-draftcat is a **service you self-host**, not a plugin an agent loads. It runs as a long-lived process on a box you control (a small Linux VPS is plenty) and receives work over an authenticated webhook.
+draftcat is a **service you self-host**, not a plugin an agent loads. It runs as a long-lived process and pings you on Telegram to approve each action. Pick the path that fits.
 
-![Deploy: an agent or harness POSTs over HTTPS to draftcat running on your VPS behind Caddy/nginx](assets/deploy.png)
+### No server? One click on Render
 
-**Fastest start — one container:**
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/renezander030/draftcat)
+
+Click, sign in, and paste three values — your Telegram bot token, an OpenRouter key, and your Telegram user ID. Render runs it always-on with a persistent disk: no VPS, no shell, no TLS to configure. (It deploys as a background worker, so it has no public URL — ideal for the "watch my inbox, approve on Telegram" job. For inbound agent webhooks, use a host you control, below.)
+
+### Have a VPS with Docker? One line
 
 ```bash
-docker run -d --restart unless-stopped -p 8088:8088 \
-  -v "$PWD":/work -w /work \
+curl -fsSL https://raw.githubusercontent.com/renezander030/draftcat/master/install.sh | sh
+```
+
+Pulls the image, scaffolds `~/draftcat/.env` + a compose file with a state volume, and prints the two steps left (fill the `.env`, then `docker compose up -d`). Config and skills are baked into the image.
+
+### Run the container yourself
+
+```bash
+docker run -d --restart unless-stopped \
+  -v draftcat-state:/data -e DRAFTCAT_STATE_PATH=/data/state.db \
   -e DRAFTCAT_TG_TOKEN -e OPENROUTER_API_KEY \
+  -e DRAFTCAT_TG_ALLOWED_USERS=<your-telegram-id> \
   ghcr.io/renezander030/draftcat
 ```
 
-The mounted dir holds `config.yaml`, `secrets.yaml`, `skills/` and `state.db` — copy `secrets.yaml.example` first (or run `docker compose up` from a clone, which builds the same image).
+Or `docker compose up` from a clone — builds the same image and mounts your local `config.yaml`/`skills/` so you can edit pipelines.
 
-**Receiving inbound from an agent or harness.** Enable the webhook in `config.yaml` and give the pipeline `schedule: webhook`:
+### Receiving inbound from an agent or harness
+
+The setups above run the always-on operator loop. To let an external agent or harness *trigger* pipelines, enable the webhook in `config.yaml` (`schedule: webhook` on the pipeline), publish the port, and put Caddy/nginx in front for TLS:
+
+![Deploy: an agent or harness POSTs over HTTPS to draftcat behind Caddy/nginx](assets/deploy.png)
 
 ```yaml
 webhook:
@@ -76,8 +93,6 @@ webhook:
   addr: 0.0.0.0:8088
   secret_env: DRAFTCAT_WEBHOOK_SECRET
 ```
-
-Put Caddy or nginx in front for TLS, then your agent or harness triggers a pipeline:
 
 ```bash
 curl -X POST https://draftcat.yourco.eu/hooks/<pipeline> \

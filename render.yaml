@@ -1,0 +1,30 @@
+# One-click deploy on Render — https://render.com/deploy?repo=https://github.com/renezander030/draftcat
+#
+# Background worker: always-on (Telegram polling + scheduled pipelines), no
+# public URL. Perfect for the no-VPS operator who just wants drafts to approve.
+# For inbound agent/harness webhooks, run the container on a host you control
+# (see README "Deploy — where it runs").
+services:
+  - type: worker
+    name: draftcat
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: frankfurt
+    plan: starter
+    autoDeploy: false
+    disk:
+      name: draftcat-state
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DRAFTCAT_STATE_PATH
+        value: /data/state.db
+      - key: DRAFTCAT_TG_TOKEN
+        sync: false   # Telegram bot token from @BotFather
+      - key: OPENROUTER_API_KEY
+        sync: false   # https://openrouter.ai/keys
+      - key: DRAFTCAT_TG_ALLOWED_USERS
+        sync: false   # your Telegram user ID(s), comma-separated
+      - key: DRAFTCAT_TG_CHAT_ID
+        sync: false   # optional — defaults to the first allowed user
