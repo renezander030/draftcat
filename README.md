@@ -229,6 +229,7 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 - [#7 PDF Cite Verification](https://gist.github.com/renezander030/7780cbc0b3ad4e802e8fba8bfc1c3a66) — auditable LLM extraction with per-fragment bounding boxes
 - [#11 Pipeline Fixture Testing](https://gist.github.com/renezander030/a058fc0d5e7e7fa209d30cfa48e82ebb) — dry-run pipelines from JSON fixtures; zero API calls in CI
 - [#12 LLM Skills as YAML](https://gist.github.com/renezander030/a28f118dec07d275ccc825aa833aba92) — prompt + output_schema + role in versioned YAML, validated by a linter
+- [#13 Inbound Agent Webhook Auth](https://gist.github.com/renezander030/26d46d4c7fb9ab1b43fe19bc5bad6d07) — constant-time bearer token, fail-closed on empty secret, async 202 dispatch
 
 ## Related projects
 
