@@ -230,6 +230,7 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 - [#11 Pipeline Fixture Testing](https://gist.github.com/renezander030/a058fc0d5e7e7fa209d30cfa48e82ebb) — dry-run pipelines from JSON fixtures; zero API calls in CI
 - [#12 LLM Skills as YAML](https://gist.github.com/renezander030/a28f118dec07d275ccc825aa833aba92) — prompt + output_schema + role in versioned YAML, validated by a linter
 - [#13 Inbound Agent Webhook Auth](https://gist.github.com/renezander030/26d46d4c7fb9ab1b43fe19bc5bad6d07) — constant-time bearer token, fail-closed on empty secret, async 202 dispatch
+- [#14 Self-Improving Voice Agent](https://gist.github.com/renezander030/262d8b8c44b4cddf51b3b84c40f3f669) — harvest Learning-Items, group, propose a minimal workflow diff, two approval gates, git commit + auto-versioned Dograh publish
 
 ## Related projects
 
