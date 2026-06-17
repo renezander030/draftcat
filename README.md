@@ -231,6 +231,7 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 - [#12 LLM Skills as YAML](https://gist.github.com/renezander030/a28f118dec07d275ccc825aa833aba92) — prompt + output_schema + role in versioned YAML, validated by a linter
 - [#13 Inbound Agent Webhook Auth](https://gist.github.com/renezander030/26d46d4c7fb9ab1b43fe19bc5bad6d07) — constant-time bearer token, fail-closed on empty secret, async 202 dispatch
 - [#14 Self-Improving Voice Agent](https://gist.github.com/renezander030/262d8b8c44b4cddf51b3b84c40f3f669) — harvest Learning-Items, group, propose a minimal workflow diff, two approval gates, git commit + auto-versioned Dograh publish
+- [#15 AI Action Audit Trail](https://gist.github.com/renezander030/ad81c7a805a09a844983f881e2c487e5) — append-only `action_approvals` table + queries: who approved which payload, when; find gated actions that ran with no approval (GDPR Art. 22)
 
 ## Related projects
 
