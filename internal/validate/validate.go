@@ -204,6 +204,9 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 			rep.warnf("webhook.secret_env", "env var %s is empty (engine will refuse to start at runtime)", cfg.Webhook.SecretEnv)
 		}
 	}
+	if cfg.Observ.OTLP.Enabled && cfg.Observ.OTLP.Endpoint == "" {
+		rep.errf("observability.otlp.endpoint", "must be set when observability.otlp.enabled (nothing to export to)")
+	}
 }
 
 func checkTimeouts(cfg *config.Config, rep *validateReport) {
@@ -329,7 +332,18 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				if st.Channel == "" {
 					rep.errf(spath+".channel", "approval step requires 'channel'")
 				} else if !validApprovalChannels[st.Channel] {
-					rep.warnf(spath+".channel", "unknown channel %q (known: telegram, slack)", st.Channel)
+					rep.warnf(spath+".channel", "unknown channel %q (known: %s)", st.Channel, strings.Join(knownApprovalChannels(), ", "))
+				}
+				// Quorum (N-of-M) validation.
+				if st.Quorum < 0 {
+					rep.errf(spath+".quorum", "quorum must be >= 0 (got %d)", st.Quorum)
+				}
+				if st.Quorum > len(cfg.Telegram.Security.AllowedUsers) {
+					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) — unsatisfiable",
+						st.Quorum, len(cfg.Telegram.Security.AllowedUsers))
+				}
+				if st.Quorum >= 2 && st.Channel != "telegram" {
+					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' (only telegram implements multi-operator approval), got %q", st.Channel)
 				}
 			}
 		}
@@ -448,6 +462,15 @@ func knownActionNames() []string {
 		if k != "" {
 			out = append(out, k)
 		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func knownApprovalChannels() []string {
+	var out []string
+	for k := range validApprovalChannels {
+		out = append(out, k)
 	}
 	sort.Strings(out)
 	return out

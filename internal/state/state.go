@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -55,6 +56,18 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     error_text  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON pipeline_runs(pipeline, started_at DESC);
+CREATE TABLE IF NOT EXISTS action_approvals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline     TEXT    NOT NULL,
+    step         TEXT    NOT NULL,
+    decided_at   INTEGER NOT NULL,           -- unix seconds
+    decision     TEXT    NOT NULL,           -- approve|skip|adjust|timeout|quorum_fail
+    operator_id  INTEGER NOT NULL,           -- TG user id; 0 for system/timeout
+    payload_hash TEXT    NOT NULL,           -- sha256 hex of the exact draft shown
+    quorum_n     INTEGER NOT NULL DEFAULT 1, -- approvals required
+    quorum_got   INTEGER NOT NULL DEFAULT 1  -- approvals collected
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
 `
 	_, err := db.Exec(schema)
 	return err
@@ -169,6 +182,97 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 		r.StartedAt = time.Unix(st, 0)
 		r.EndedAt = time.Unix(en, 0)
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// --- Action approval audit (append-only) ---
+//
+// action_approvals is the durable "who approved which payload, when" log that
+// backs the GDPR Art. 22 accountability story. It is append-only BY CONVENTION:
+// only RecordApproval writes to it; no code path issues UPDATE or DELETE. It
+// stores the sha256 of the draft (payload_hash), NEVER the draft itself — the
+// audit log must not become a second copy of customer PII.
+
+// ApprovalRecord is one row of the action_approvals audit table.
+type ApprovalRecord struct {
+	Pipeline    string
+	Step        string
+	DecidedAt   time.Time
+	Decision    string
+	OperatorID  int64
+	PayloadHash string
+	QuorumN     int
+	QuorumGot   int
+}
+
+// RecordApproval appends one approval-decision row. Called on every terminal
+// decision (approve/skip/adjust/timeout/quorum_fail). Best-effort: a failure is
+// surfaced to the caller but must not halt the engine.
+func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
+	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int) error {
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot,
+	)
+	return err
+}
+
+// ApprovalsForPipeline returns the last n approval rows for a pipeline,
+// newest-first.
+func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRecord, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got
+		 FROM action_approvals WHERE pipeline=? ORDER BY decided_at DESC, id DESC LIMIT ?`,
+		pipeline, n,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ApprovalRecord
+	for rows.Next() {
+		var r ApprovalRecord
+		var ts int64
+		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot); err != nil {
+			return nil, err
+		}
+		r.DecidedAt = time.Unix(ts, 0)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UnapprovedActions is a compliance query: it returns the distinct gated steps
+// for a pipeline that were recorded in the audit log but never received an
+// `approve` decision (only skip/timeout/quorum_fail). A non-empty result means a
+// gated action lacks a matching approval — exactly the Art. 5(2)/30
+// accountability check.
+//
+// Implementation note: draftcat has no separate "actions that ran" table — the
+// audit log IS the record of gated decisions — so an unapproved action is a
+// step present in action_approvals with no approve row. This is the defensible
+// reading of the spec given the schema.
+func (s *StateStore) UnapprovedActions(pipeline string) ([]string, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT DISTINCT step FROM action_approvals
+		 WHERE pipeline=? AND step NOT IN (
+		     SELECT step FROM action_approvals WHERE pipeline=? AND decision='approve'
+		 ) ORDER BY step`,
+		pipeline, pipeline,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var step string
+		if err := rows.Scan(&step); err != nil {
+			return nil, err
+		}
+		out = append(out, step)
 	}
 	return out, rows.Err()
 }

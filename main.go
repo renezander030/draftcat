@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/renezander030/draftcat/internal/config"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -620,11 +623,72 @@ type OperatorChannel interface {
 	Send(text string) error
 	// Send a draft for approval with action buttons. Returns the operator's decision.
 	SendForApproval(ctx context.Context, draft string) (OperatorDecision, error)
+	// SendForQuorumApproval blocks until `need` distinct allowed operators
+	// approve, or any operator skips/adjusts, or ctx expires. need<=1 behaves
+	// like SendForApproval (single approver).
+	SendForQuorumApproval(ctx context.Context, draft string, need int) (QuorumDecision, error)
 }
 
 type OperatorDecision struct {
-	Action string // "approve", "skip", "adjust"
-	Text   string // adjustment text (only if Action == "adjust")
+	Action     string // "approve", "skip", "adjust"
+	Text       string // adjustment text (only if Action == "adjust")
+	ApproverID int64  // user id that approved (only if Action == "approve"); 0 if unknown
+}
+
+// QuorumDecision is the outcome of an N-of-M approval gate.
+type QuorumDecision struct {
+	Action    string  // "approve" | "skip" | "adjust" | "timeout"
+	Text      string  // adjustment text (Action == "adjust")
+	Approvers []int64 // distinct user IDs that approved (Action == "approve")
+}
+
+// --- Quorum decision logic (pure, testable without Telegram) ---
+
+// approvalEvent is one operator action in arrival order.
+type approvalEvent struct {
+	userID int64
+	action string // "approve" | "skip" | "adjust"
+}
+
+// quorumReducer replays operator events against an N-of-M gate and returns the
+// terminal decision, or Action=="pending" if the events neither reach quorum
+// nor trip a veto. Rules (mirror the live Telegram poll loop):
+//   - events from users not in `allowed` are ignored;
+//   - any single Skip is an immediate veto (easy to stop, hard to release);
+//   - Adjust takes the floor immediately (the rewrite re-enters the gate at 0/N);
+//   - Approve adds a DISTINCT user; the same user twice counts once;
+//   - reaching `need` distinct approvers finalizes approve. need<=1 = single approver.
+func quorumReducer(events []approvalEvent, need int, allowed map[int64]bool) QuorumDecision {
+	if need < 1 {
+		need = 1
+	}
+	approved := map[int64]bool{}
+	for _, e := range events {
+		if !allowed[e.userID] {
+			continue
+		}
+		switch e.action {
+		case "skip":
+			return QuorumDecision{Action: "skip"}
+		case "adjust":
+			return QuorumDecision{Action: "adjust"}
+		case "approve":
+			approved[e.userID] = true
+			if len(approved) >= need {
+				return QuorumDecision{Action: "approve", Approvers: sortedIDs(approved)}
+			}
+		}
+	}
+	return QuorumDecision{Action: "pending"}
+}
+
+func sortedIDs(m map[int64]bool) []int64 {
+	out := make([]int64, 0, len(m))
+	for id := range m {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // --- Telegram Channel ---
@@ -780,7 +844,7 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDeci
 					case "approve":
 						t.answerCallback(cb.ID, "Approved")
 						t.editButtons(msgID, draft+"\n\n[Approved]", nil)
-						return OperatorDecision{Action: "approve"}, nil
+						return OperatorDecision{Action: "approve", ApproverID: cb.From.ID}, nil
 					case "skip":
 						t.answerCallback(cb.ID, "Skipped")
 						t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
@@ -815,6 +879,104 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDeci
 					}
 
 					return OperatorDecision{Action: "adjust", Text: result.Text}, nil
+				}
+			}
+		}
+	}
+}
+
+// SendForQuorumApproval posts a draft that requires `need` distinct allowed
+// operators to approve. It mirrors SendForApproval's security posture
+// (allowed-user check, rate limiting, message-ID match, input validation) and
+// adds a live tally. Any single Skip vetoes immediately; Adjust takes the floor
+// and returns so the caller can rewrite and re-enter the gate.
+func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need int) (QuorumDecision, error) {
+	if need <= 1 {
+		// Single-approver semantics — delegate so behavior is byte-for-byte today's.
+		d, err := t.SendForApproval(ctx, draft)
+		if err != nil {
+			return QuorumDecision{Action: "timeout"}, err
+		}
+		qd := QuorumDecision{Action: d.Action, Text: d.Text}
+		if d.Action == "approve" && d.ApproverID != 0 {
+			qd.Approvers = []int64{d.ApproverID}
+		}
+		return qd, nil
+	}
+
+	buttons := [][]map[string]string{
+		{
+			{"text": "Approve", "callback_data": "approve"},
+			{"text": "Skip", "callback_data": "skip"},
+			{"text": "Adjust...", "callback_data": "adjust"},
+		},
+	}
+	tally := func(got int) string {
+		return fmt.Sprintf("%s\n\nApprovals: %d/%d", draft, got, need)
+	}
+
+	msgID, err := t.sendWithButtons(tally(0), buttons)
+	if err != nil {
+		return QuorumDecision{Action: "timeout"}, fmt.Errorf("failed to send draft: %w", err)
+	}
+	log.Printf("[telegram] quorum draft posted (msg_id=%d), need=%d distinct approvers...", msgID, need)
+
+	approved := map[int64]bool{}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			t.editButtons(msgID, fmt.Sprintf("%s\n\n[Timed out — %d/%d approvals not reached]", draft, len(approved), need), nil)
+			return QuorumDecision{Action: "timeout"}, fmt.Errorf("approval timeout")
+		case <-ticker.C:
+			updates, err := t.getUpdates()
+			if err != nil {
+				continue
+			}
+			for _, u := range updates {
+				if u.CallbackQuery == nil {
+					continue
+				}
+				cb := u.CallbackQuery
+				if !t.isAllowedUser(cb.From.ID) {
+					t.answerCallback(cb.ID, "") // silent drop
+					log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
+					continue
+				}
+				if !t.rateLimiter.allow(cb.From.ID) {
+					t.answerCallback(cb.ID, "") // silent drop
+					continue
+				}
+				if cb.Message.MessageID != msgID {
+					continue
+				}
+
+				switch cb.Data {
+				case "skip":
+					// A single veto stops the action. Easy to stop, hard to release.
+					t.answerCallback(cb.ID, "Skipped (veto)")
+					t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+					return QuorumDecision{Action: "skip"}, nil
+				case "adjust":
+					t.answerCallback(cb.ID, "Send your adjustment as a text message")
+					t.editButtons(msgID, draft+"\n\n[Adjustment requested — rewrite will re-enter the gate at 0/"+strconv.Itoa(need)+"]", nil)
+					return QuorumDecision{Action: "adjust"}, nil
+				case "approve":
+					if approved[cb.From.ID] {
+						t.answerCallback(cb.ID, "Already counted")
+						continue
+					}
+					approved[cb.From.ID] = true
+					got := len(approved)
+					if got >= need {
+						t.answerCallback(cb.ID, "Approved — quorum reached")
+						t.editButtons(msgID, fmt.Sprintf("%s\n\n[Approved %d/%d]", draft, got, need), nil)
+						return QuorumDecision{Action: "approve", Approvers: sortedIDs(approved)}, nil
+					}
+					t.answerCallback(cb.ID, fmt.Sprintf("Approved (%d/%d)", got, need))
+					t.editButtons(msgID, tally(got), buttons)
 				}
 			}
 		}
@@ -1262,57 +1424,129 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			if approvalTimeout == 0 {
 				approvalTimeout = 4 * time.Hour
 			}
-			approvalCtx, approvalCancel := context.WithTimeout(ctx, approvalTimeout)
-			decision, err := ch.SendForApproval(approvalCtx, draftMsg)
-			approvalCancel()
-			if err != nil {
-				return fmt.Errorf("[step:%s] %w", step.Name, err)
+
+			// quorumN is the required distinct-approver count (>=1).
+			quorumN := step.Quorum
+			if quorumN < 1 {
+				quorumN = 1
 			}
 
-			log.Printf("[pipeline:%s][step:%s] operator decision: %s", pipeline.Name, step.Name, decision.Action)
+			// getApproval dispatches to the quorum gate when quorum >= 2, else the
+			// single-approver gate (byte-for-byte today's behavior). It normalises
+			// both into (action, adjustText, approvers, err).
+			getApproval := func(cctx context.Context, draft string) (string, string, []int64, error) {
+				if step.Quorum >= 2 {
+					qd, qerr := ch.SendForQuorumApproval(cctx, draft, step.Quorum)
+					if qerr != nil {
+						return "timeout", "", nil, qerr
+					}
+					return qd.Action, qd.Text, qd.Approvers, nil
+				}
+				dec, derr := ch.SendForApproval(cctx, draft)
+				if derr != nil {
+					return "timeout", "", nil, derr
+				}
+				var aps []int64
+				if dec.Action == "approve" && dec.ApproverID != 0 {
+					aps = []int64{dec.ApproverID}
+				}
+				return dec.Action, dec.Text, aps, nil
+			}
 
-			switch decision.Action {
-			case "approve":
-				data["approved"] = true
-			case "skip":
-				data["approved"] = false
-				return nil
-			case "adjust":
-				log.Printf("[pipeline:%s][step:%s] adjustment: %q", pipeline.Name, step.Name, decision.Text)
+			// recordAudit appends one append-only approval row (who/what/when) and
+			// bumps the Prometheus approval counter. The audit table is always on
+			// once a state store exists, regardless of exporter settings. It stores
+			// only the sha256 of the exact draft shown — never the draft itself.
+			recordAudit := func(decision, payload string, approvers []int64) {
+				obs.RecordApproval(pipeline.Name, step.Name, decision)
+				if state == nil {
+					return
+				}
+				var opID int64
+				got := 0
+				if len(approvers) > 0 {
+					opID = approvers[0]
+					got = len(approvers)
+				} else if decision == "approve" {
+					got = quorumN
+				}
+				sum := sha256.Sum256([]byte(payload))
+				if e := state.RecordApproval(pipeline.Name, step.Name, time.Now(), decision, opID, hex.EncodeToString(sum[:]), quorumN, got); e != nil {
+					log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
+				}
+			}
+
+			// maxAdjust bounds rewrite cycles: single-approver keeps today's single
+			// rewrite; quorum allows up to 3 (each rewrite re-enters the gate at 0/N).
+			maxAdjust := 1
+			if step.Quorum >= 2 {
+				maxAdjust = 3
+			}
+
+			currentDraft := draftMsg
+			adjustCycles := 0
+			for {
+				approvalCtx, approvalCancel := context.WithTimeout(ctx, approvalTimeout)
+				action, adjustText, approvers, aerr := getApproval(approvalCtx, currentDraft)
+				approvalCancel()
+				if aerr != nil {
+					recordAudit("timeout", currentDraft, nil)
+					return fmt.Errorf("[step:%s] %w", step.Name, aerr)
+				}
+
+				log.Printf("[pipeline:%s][step:%s] operator decision: %s", pipeline.Name, step.Name, action)
+
+				if action == "approve" {
+					recordAudit("approve", currentDraft, approvers)
+					data["approved"] = true
+					break
+				}
+				if action == "skip" {
+					recordAudit("skip", currentDraft, nil)
+					data["approved"] = false
+					return nil
+				}
+				if action != "adjust" {
+					// e.g. a quorum "timeout" returned without an error
+					recordAudit("timeout", currentDraft, nil)
+					return fmt.Errorf("[step:%s] approval not completed (%s)", step.Name, action)
+				}
+
+				// action == "adjust"
+				recordAudit("adjust", currentDraft, nil)
+				adjustCycles++
+				log.Printf("[pipeline:%s][step:%s] adjustment: %q", pipeline.Name, step.Name, adjustText)
+				if adjustCycles > maxAdjust {
+					if step.Quorum >= 2 {
+						_ = ch.Send(fmt.Sprintf("Adjustment limit (%d) reached without quorum approval — halting.", maxAdjust))
+						recordAudit("quorum_fail", currentDraft, nil)
+					}
+					data["approved"] = false
+					return nil
+				}
 
 				if err := budget.check(cfg.Budgets.PerDayTokens, cfg.Budgets.PerStepTokens); err != nil {
 					ch.Send(fmt.Sprintf("Budget exceeded, cannot rewrite: %s", err))
 					return err
 				}
 
-				adjustPrompt := fmt.Sprintf("Original output:\n%s\n\nOperator feedback:\n%s\n\nRewrite incorporating the feedback. Respond with ONLY valid JSON in the same format.", data["ai_raw"], decision.Text)
+				adjustPrompt := fmt.Sprintf("Original output:\n%s\n\nOperator feedback:\n%s\n\nRewrite incorporating the feedback. Respond with ONLY valid JSON in the same format.", data["ai_raw"], adjustText)
 
 				aiTimeout, _ := time.ParseDuration(cfg.Timeouts.AICall)
 				if aiTimeout == 0 {
 					aiTimeout = 30 * time.Second
 				}
 				aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
-				resp, err := callLLM(aiCtx, cfg, "drafter", adjustPrompt)
+				resp, rerr := callLLM(aiCtx, cfg, "drafter", adjustPrompt)
 				aiCancel()
-				if err != nil {
-					ch.Send(fmt.Sprintf("Rewrite failed: %s", err))
-					return err
+				if rerr != nil {
+					_ = ch.Send(fmt.Sprintf("Rewrite failed: %s", rerr))
+					return rerr
 				}
 				budget.record(resp.InputTokens + resp.OutputTokens)
 
-				// Show revised output and ask for final approval
-				revisedDraft := fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
-				approvalCtx2, approvalCancel2 := context.WithTimeout(ctx, approvalTimeout)
-				decision2, err := ch.SendForApproval(approvalCtx2, revisedDraft)
-				approvalCancel2()
-				if err != nil {
-					return err
-				}
-				if decision2.Action == "approve" {
-					data["approved"] = true
-				} else {
-					return nil
-				}
+				// Revised draft re-enters the gate (at 0/N for quorum steps).
+				currentDraft = fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
 			}
 		}
 
@@ -2062,6 +2296,35 @@ func main() {
 	if cfg.Observ.Spans || os.Getenv("DRAFTCAT_TRACE") != "" {
 		obs.Enable(nil)
 		log.Printf("[obs] span tracing enabled")
+	}
+	// Prometheus exporter — pull-based /metrics endpoint. Opens one local port
+	// only when enabled (localhost by default, same posture as the webhook). A
+	// failed metrics server is logged but never fatal — observability must not
+	// take down the engine.
+	if cfg.Observ.Prometheus.Enabled {
+		obs.EnablePrometheus()
+		if closer, perr := obs.ServePrometheus(cfg.Observ.Prometheus.Addr, cfg.Observ.Prometheus.Path); perr != nil {
+			log.Printf("[obs] prometheus exporter failed to start: %v", perr)
+		} else {
+			defer func() { _ = closer.Close() }()
+			addr := cfg.Observ.Prometheus.Addr
+			if addr == "" {
+				addr = "127.0.0.1:9090"
+			}
+			log.Printf("[obs] prometheus exporter listening on %s", addr)
+		}
+	}
+	// OTLP/HTTP trace exporter — push-based, fire-and-forget. Header secrets come
+	// from an env var, never YAML. An empty endpoint disables it (the validator
+	// flags this as a config error at lint time).
+	if cfg.Observ.OTLP.Enabled {
+		if cfg.Observ.OTLP.Endpoint == "" {
+			log.Printf("[obs] observability.otlp.enabled is true but endpoint is empty — OTLP export disabled")
+		} else {
+			headers := obs.ParseHeaderEnv(os.Getenv(cfg.Observ.OTLP.HeaderEnv))
+			obs.EnableOTLP(cfg.Observ.OTLP.Endpoint, headers)
+			log.Printf("[obs] OTLP exporter pushing to %s", cfg.Observ.OTLP.Endpoint)
+		}
 	}
 
 	// Webhook trigger server — opt-in; opens no port unless enabled.

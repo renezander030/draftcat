@@ -19,12 +19,14 @@ import (
 
 var (
 	mu      sync.Mutex
-	enabled bool
+	enabled bool      // JSON span emission (the original behavior)
+	promOn  bool      // Prometheus metric recording
+	otlpOn  bool      // OTLP/HTTP trace export
 	out     io.Writer = os.Stderr
 )
 
-// Enable turns span emission on and (optionally) overrides the output writer.
-// A nil writer keeps the default (stderr). Safe to call once at startup.
+// Enable turns JSON span emission on and (optionally) overrides the output
+// writer. A nil writer keeps the default (stderr). Safe to call once at startup.
 func Enable(w io.Writer) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -34,11 +36,35 @@ func Enable(w io.Writer) {
 	}
 }
 
-// Enabled reports whether span emission is on.
+// Enabled reports whether JSON span emission is on.
 func Enabled() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return enabled
+}
+
+// EnablePrometheus turns on in-process metric recording. Independent of JSON
+// span emission: counters/histograms are updated even when Spans is off.
+func EnablePrometheus() {
+	mu.Lock()
+	defer mu.Unlock()
+	promOn = true
+}
+
+// prometheusOn reports whether metric recording is on.
+func prometheusOn() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return promOn
+}
+
+// active reports whether ANY observability seam needs a live span: JSON spans,
+// Prometheus metrics, or OTLP export. When all are off, span creation is a
+// cheap no-op and the engine needs no guards.
+func active() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return enabled || promOn || otlpOn
 }
 
 // Span is an in-flight pipeline-level timing record. The zero value (returned
@@ -52,7 +78,7 @@ type Span struct {
 // Pipeline starts a pipeline-level span. End it (typically via defer) with the
 // final status and any aggregate fields (steps_completed, tokens, error).
 func Pipeline(name string) *Span {
-	if !Enabled() {
+	if !active() {
 		return &Span{}
 	}
 	return &Span{name: name, start: time.Now(), live: true}
@@ -64,33 +90,53 @@ func (s *Span) End(status string, fields map[string]interface{}) {
 	if s == nil || !s.live {
 		return
 	}
-	rec := map[string]interface{}{
-		"span":        "pipeline",
-		"pipeline":    s.name,
-		"status":      status,
-		"duration_ms": time.Since(s.start).Milliseconds(),
+	durMs := time.Since(s.start).Milliseconds()
+	if Enabled() {
+		rec := map[string]interface{}{
+			"span":        "pipeline",
+			"pipeline":    s.name,
+			"status":      status,
+			"duration_ms": durMs,
+		}
+		merge(rec, fields)
+		write(rec)
 	}
-	merge(rec, fields)
-	write(rec)
+	if prometheusOn() {
+		RecordPipeline(s.name, status, durMs)
+	}
+	if otlpEnabled() {
+		fireOTLP("pipeline", s.name, s.start, durMs, status, fields)
+	}
 }
 
 // EmitStep writes a completed step span. The caller owns the start time so the
 // engine can record a step's span from any exit path (normal, skip, error)
 // without restructuring its control flow. status is "ok" | "skip" | "error".
 func EmitStep(pipeline, name, stepType string, start time.Time, status string, fields map[string]interface{}) {
-	if !Enabled() {
+	if !active() {
 		return
 	}
-	rec := map[string]interface{}{
-		"span":        "step",
-		"pipeline":    pipeline,
-		"name":        name,
-		"step_type":   stepType,
-		"status":      status,
-		"duration_ms": time.Since(start).Milliseconds(),
+	durMs := time.Since(start).Milliseconds()
+	if Enabled() {
+		rec := map[string]interface{}{
+			"span":        "step",
+			"pipeline":    pipeline,
+			"name":        name,
+			"step_type":   stepType,
+			"status":      status,
+			"duration_ms": durMs,
+		}
+		merge(rec, fields)
+		write(rec)
 	}
-	merge(rec, fields)
-	write(rec)
+	if prometheusOn() {
+		tokens, _ := fields["tokens"].(int)
+		cost, _ := fields["cost_usd"].(float64)
+		RecordStep(pipeline, name, stepType, status, durMs, tokens, cost)
+	}
+	if otlpEnabled() {
+		fireOTLP("step", pipeline+"/"+name, start, durMs, status, fields)
+	}
 }
 
 func merge(rec, fields map[string]interface{}) {

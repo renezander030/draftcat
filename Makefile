@@ -1,6 +1,7 @@
 GO := /usr/local/go/bin/go
+GOLANGCI := golangci-lint
 
-.PHONY: check lint fmt-check test test-fast build
+.PHONY: check lint lint-install fmt-check test test-fast build
 
 check: fmt-check lint test-fast build
 
@@ -13,6 +14,10 @@ fmt-check:
 
 lint:
 	$(GO) vet ./...
+	$(GOLANGCI) run
+
+lint-install:
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0
 
 test:
 	$(GO) test ./... -v

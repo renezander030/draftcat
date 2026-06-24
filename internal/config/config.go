@@ -109,10 +109,31 @@ type WebhookConfig struct {
 func (w WebhookConfig) Secret() string      { return w.secret }
 func (w *WebhookConfig) SetSecret(s string) { w.secret = s }
 
-// ObservabilityConfig toggles structured span emission (see internal/obs).
-// Off by default. The DRAFTCAT_TRACE env var also enables it.
+// ObservabilityConfig toggles structured span emission (see internal/obs) and
+// the opt-in exporters. Off by default. The DRAFTCAT_TRACE env var also enables
+// span emission. The Prometheus/OTLP exporters are independent of Spans: either
+// can be on while JSON span emission stays off.
 type ObservabilityConfig struct {
-	Spans bool `yaml:"spans"`
+	Spans      bool             `yaml:"spans"`
+	Prometheus PrometheusConfig `yaml:"prometheus"`
+	OTLP       OTLPConfig       `yaml:"otlp"`
+}
+
+// PrometheusConfig serves a /metrics endpoint when Enabled. Pull-based; opens
+// one local port. Default disabled = no port opened (matches webhook ergonomics).
+type PrometheusConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Addr    string `yaml:"addr"` // default "127.0.0.1:9090"
+	Path    string `yaml:"path"` // default "/metrics"
+}
+
+// OTLPConfig pushes spans to an OTLP/HTTP collector. Default disabled.
+type OTLPConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"` // e.g. "http://127.0.0.1:4318/v1/traces"
+	// HeaderEnv names an env var holding "key=value,key2=value2" headers
+	// (e.g. an auth token). Never put secrets in YAML.
+	HeaderEnv string `yaml:"header_env"`
 }
 
 type PipelineConfig struct {
@@ -132,4 +153,8 @@ type StepConfig struct {
 	Mode         string                 `yaml:"mode"`
 	Channel      string                 `yaml:"channel"`
 	OutputSchema map[string]interface{} `yaml:"output_schema"`
+	// Quorum is the number of distinct human operators that must approve this
+	// approval step before the action is released. 0 or 1 = single approver
+	// (default, unchanged behavior). Only the telegram channel implements N>=2.
+	Quorum int `yaml:"quorum"`
 }

@@ -1,0 +1,50 @@
+# golangci-lint v2 — draftcat lint policy.
+# v1.61 cannot target go 1.25 (its binary predates 1.25 and refuses the version),
+# so this is the v2-schema config. The Go version is read from go.mod.
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck      # every returned error is handled (audit writes must not be dropped silently)
+    - govet         # already in use via `go vet`
+    - staticcheck   # correctness + simplification (absorbs gosimple/stylecheck in v2)
+    - ineffassign   # dead assignments
+    - unused        # dead code
+    - gosec         # security: weak crypto, unhandled file perms, etc.
+    - bodyclose     # http.Response bodies (OTLP/Prometheus clients) must be closed
+    - errorlint     # use errors.Is/As, %w wrapping
+    - noctx         # no http requests without context (OTLP export must take ctx)
+    - gocritic      # opinionated correctness checks
+  settings:
+    gosec:
+      excludes:
+        - G404   # math/rand: not used for crypto here; trace IDs use crypto/rand explicitly
+      config:
+        G302: "0600"   # file perms
+        G306: "0600"
+    errcheck:
+      check-type-assertions: true
+      check-blank: false   # the codebase uses `score, _ := v["score"].(float64)` idiomatically
+  exclusions:
+    rules:
+      # Test files may ignore errors on cleanup and use fixtures freely.
+      - path: _test\.go
+        linters: [errcheck, gosec, bodyclose]
+      # Generated/vendored voice stub is build-tagged; skip dead-code noise.
+      - path: internal/voicebridge/stub\.go
+        linters: [unused]
+
+# In v2, gofmt/goimports are formatters, not linters.
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

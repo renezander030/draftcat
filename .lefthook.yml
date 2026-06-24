@@ -17,8 +17,13 @@ pre-commit:
     test:
       glob: "*.go"
       run: /usr/local/go/bin/go test -count=1 -short -timeout 30s ./...
+    golangci:
+      glob: "*.go"
+      run: golangci-lint run --new-from-rev=HEAD~1
 
 pre-push:
   commands:
     validate:
-      run: /usr/local/go/bin/go run . validate --strict
+      # Gates on errors (exit 1). Not --strict: warnings are advisory and many
+      # are environment-dependent (empty API-key env vars), so they don't block.
+      run: /usr/local/go/bin/go run . validate
