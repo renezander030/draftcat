@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/renezander030/draftcat/internal/approval"
 	_ "modernc.org/sqlite"
 )
 
@@ -65,12 +66,27 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     operator_id  INTEGER NOT NULL,           -- TG user id; 0 for system/timeout
     payload_hash TEXT    NOT NULL,           -- sha256 hex of the exact draft shown
     quorum_n     INTEGER NOT NULL DEFAULT 1, -- approvals required
-    quorum_got   INTEGER NOT NULL DEFAULT 1  -- approvals collected
+    quorum_got   INTEGER NOT NULL DEFAULT 1, -- approvals collected
+    nonce        TEXT    NOT NULL DEFAULT '', -- per-row random; anti-replay
+    signature    TEXT    NOT NULL DEFAULT ''  -- HMAC receipt over the row's fields (empty = unsigned)
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
 `
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Migrate stores created before signed receipts existed: add the columns if
+	// missing. SQLite has no "ADD COLUMN IF NOT EXISTS", so run the ALTER and
+	// tolerate the duplicate-column error on stores that already have them.
+	for _, alter := range []string{
+		`ALTER TABLE action_approvals ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN signature TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	return nil
 }
 
 // FilterUnseen returns the subset of ids not previously marked as seen for
@@ -194,7 +210,10 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 // stores the sha256 of the draft (payload_hash), NEVER the draft itself — the
 // audit log must not become a second copy of customer PII.
 
-// ApprovalRecord is one row of the action_approvals audit table.
+// ApprovalRecord is one row of the action_approvals audit table. Nonce and
+// Signature are the tamper-evidence receipt: empty on rows written before signing
+// was configured (or when no secret is set), otherwise an HMAC over the other
+// fields under the operator's approval-signing secret.
 type ApprovalRecord struct {
 	Pipeline    string
 	Step        string
@@ -204,17 +223,21 @@ type ApprovalRecord struct {
 	PayloadHash string
 	QuorumN     int
 	QuorumGot   int
+	Nonce       string
+	Signature   string
 }
 
 // RecordApproval appends one approval-decision row. Called on every terminal
 // decision (approve/skip/adjust/timeout/quorum_fail). Best-effort: a failure is
-// surfaced to the caller but must not halt the engine.
+// surfaced to the caller but must not halt the engine. nonce and signature carry
+// the receipt; pass "" for both to record an unsigned row (no secret configured).
 func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
-	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int) error {
+	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
+	nonce, signature string) error {
 	_, err := s.db.ExecContext(context.Background(),
-		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot,
+		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature,
 	)
 	return err
 }
@@ -223,7 +246,7 @@ func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
 // newest-first.
 func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRecord, error) {
 	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got
+		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature
 		 FROM action_approvals WHERE pipeline=? ORDER BY decided_at DESC, id DESC LIMIT ?`,
 		pipeline, n,
 	)
@@ -235,13 +258,50 @@ func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRec
 	for rows.Next() {
 		var r ApprovalRecord
 		var ts int64
-		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot); err != nil {
+		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot, &r.Nonce, &r.Signature); err != nil {
 			return nil, err
 		}
 		r.DecidedAt = time.Unix(ts, 0)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ApprovalVerification pairs an audit row with the result of checking its receipt.
+type ApprovalVerification struct {
+	Record ApprovalRecord
+	Status string // "ok" | "tampered" | "unsigned"
+}
+
+// VerifyApprovals re-checks the receipts on the last n approval rows for a
+// pipeline under secret. "tampered" means the row's fields no longer match its
+// signature — someone altered the audit trail after the decision was recorded.
+// "unsigned" means the row was written with no secret configured. This is the
+// read side of the tamper-evidence story: the append-only convention guards the
+// engine's own writes; this catches edits made directly to the SQLite file.
+func (s *StateStore) VerifyApprovals(secret []byte, pipeline string, n int) ([]ApprovalVerification, error) {
+	recs, err := s.ApprovalsForPipeline(pipeline, n)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ApprovalVerification, 0, len(recs))
+	for _, r := range recs {
+		status := "unsigned"
+		if r.Signature != "" {
+			f := approval.Fields{
+				Pipeline: r.Pipeline, Step: r.Step, DecidedAt: r.DecidedAt.Unix(),
+				Decision: r.Decision, OperatorID: r.OperatorID, PayloadHash: r.PayloadHash,
+				QuorumN: r.QuorumN, QuorumGot: r.QuorumGot,
+			}
+			if approval.Verify(secret, f, r.Nonce, r.Signature) {
+				status = "ok"
+			} else {
+				status = "tampered"
+			}
+		}
+		out = append(out, ApprovalVerification{Record: r, Status: status})
+	}
+	return out, nil
 }
 
 // UnapprovedActions is a compliance query: it returns the distinct gated steps

@@ -26,6 +26,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/renezander030/draftcat/internal/approval"
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
 	gmailapi "github.com/renezander030/draftcat/internal/gmail"
 	"github.com/renezander030/draftcat/internal/obs"
@@ -1453,10 +1454,17 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				return dec.Action, dec.Text, aps, nil
 			}
 
+			// approvalSecret signs the audit rows into tamper-evident receipts.
+			// Unset (empty) → rows are recorded unsigned, exactly as before, so
+			// this stays backward compatible on instances that don't opt in.
+			approvalSecret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+
 			// recordAudit appends one append-only approval row (who/what/when) and
 			// bumps the Prometheus approval counter. The audit table is always on
 			// once a state store exists, regardless of exporter settings. It stores
 			// only the sha256 of the exact draft shown — never the draft itself.
+			// When a signing secret is set, each row also carries an HMAC receipt
+			// so a later reader can prove the row wasn't altered after the fact.
 			recordAudit := func(decision, payload string, approvers []int64) {
 				obs.RecordApproval(pipeline.Name, step.Name, decision)
 				if state == nil {
@@ -1470,8 +1478,28 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				} else if decision == "approve" {
 					got = quorumN
 				}
+				decidedAt := time.Now()
 				sum := sha256.Sum256([]byte(payload))
-				if e := state.RecordApproval(pipeline.Name, step.Name, time.Now(), decision, opID, hex.EncodeToString(sum[:]), quorumN, got); e != nil {
+				payloadHash := hex.EncodeToString(sum[:])
+
+				// One timestamp feeds both the signature and the row — reading
+				// time.Now() twice could straddle a second boundary and produce a
+				// receipt that never verifies.
+				var nonce, sig string
+				if len(approvalSecret) > 0 {
+					n, nerr := approval.NewNonce()
+					if nerr != nil {
+						log.Printf("[pipeline:%s][step:%s] approval nonce failed, recording unsigned: %v", pipeline.Name, step.Name, nerr)
+					} else {
+						nonce = n
+						sig = approval.Sign(approvalSecret, approval.Fields{
+							Pipeline: pipeline.Name, Step: step.Name, DecidedAt: decidedAt.Unix(),
+							Decision: decision, OperatorID: opID, PayloadHash: payloadHash,
+							QuorumN: quorumN, QuorumGot: got,
+						}, nonce)
+					}
+				}
+				if e := state.RecordApproval(pipeline.Name, step.Name, decidedAt, decision, opID, payloadHash, quorumN, got, nonce, sig); e != nil {
 					log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
 				}
 			}
@@ -2152,6 +2180,71 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler) {
 
 // --- Main ---
 
+// runAuditVerify re-checks the HMAC receipts on a pipeline's approval audit rows
+// and reports any that fail. This is the operator-facing side of tamper-evidence:
+// the append-only convention guards draftcat's own writes, and this catches edits
+// made directly to the SQLite file. Exit 1 if any row is tampered, 0 if every row
+// verifies (or is unsigned), 2 on a usage/secret error.
+func runAuditVerify(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: draftcat audit-verify <pipeline> [config.yaml]")
+		return 2
+	}
+	pipeline := args[0]
+	configPath := "config.yaml"
+	if len(args) > 1 {
+		configPath = args[1]
+	}
+
+	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	if len(secret) == 0 {
+		fmt.Fprintln(os.Stderr, "DRAFTCAT_APPROVAL_SECRET is not set — cannot verify receipts")
+		return 2
+	}
+
+	// Resolve the state path exactly like the engine does: env override first,
+	// then the config's State.Path, then the ./state.db default.
+	statePath := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
+	if statePath == "" {
+		if data, err := os.ReadFile(configPath); err == nil {
+			var cfg config.Config
+			if yaml.Unmarshal(data, &cfg) == nil {
+				statePath = cfg.State.Path
+			}
+		}
+	}
+	if statePath == "" {
+		statePath = "./state.db"
+	}
+
+	st, err := statestore.OpenStateStore(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open state store %s: %v\n", statePath, err)
+		return 1
+	}
+	defer func() { _ = st.Close() }()
+
+	results, err := st.VerifyApprovals(secret, pipeline, 1000)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verify: %v\n", err)
+		return 1
+	}
+
+	tampered := 0
+	for _, r := range results {
+		if r.Status == "tampered" {
+			tampered++
+		}
+		fmt.Printf("%-9s %s  %-8s op=%d  step=%s\n",
+			r.Status, r.Record.DecidedAt.Format(time.RFC3339), r.Record.Decision, r.Record.OperatorID, r.Record.Step)
+	}
+	fmt.Printf("%d rows checked, %d tampered\n", len(results), tampered)
+	if tampered > 0 {
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	// Subcommand dispatch. The bare form `draftcat [config.yaml] [skills/]` still runs the engine.
 	if len(os.Args) > 1 {
@@ -2160,13 +2253,16 @@ func main() {
 			os.Exit(validate.Run(os.Args[2:]))
 		case "test":
 			os.Exit(runTestCmd(os.Args[2:]))
+		case "audit-verify":
+			os.Exit(runAuditVerify(os.Args[2:]))
 		case "-h", "--help", "help":
 			fmt.Println("Draftcat — AI communication management for service businesses.")
 			fmt.Println()
 			fmt.Println("Usage:")
-			fmt.Println("  draftcat [config.yaml] [skills/]   run the engine (default)")
-			fmt.Println("  draftcat validate [--strict]       lint config + skills, exit non-zero on errors")
-			fmt.Println("  draftcat test <pipeline>           dry-run a pipeline using fixtures/<pipeline>/")
+			fmt.Println("  draftcat [config.yaml] [skills/]       run the engine (default)")
+			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
+			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
+			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			return
 		}
 	}

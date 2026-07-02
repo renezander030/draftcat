@@ -31,10 +31,10 @@ func TestRecordAndQueryApproval(t *testing.T) {
 	t0 := time.Unix(1_700_000_000, 0)
 	h := hashOf("the exact draft shown")
 
-	if err := s.RecordApproval("p", "gate", t0, "approve", 111, h, 1, 1); err != nil {
+	if err := s.RecordApproval("p", "gate", t0, "approve", 111, h, 1, 1, "", ""); err != nil {
 		t.Fatalf("RecordApproval approve: %v", err)
 	}
-	if err := s.RecordApproval("p", "gate", t0.Add(time.Minute), "skip", 222, hashOf("other"), 1, 0); err != nil {
+	if err := s.RecordApproval("p", "gate", t0.Add(time.Minute), "skip", 222, hashOf("other"), 1, 0, "", ""); err != nil {
 		t.Fatalf("RecordApproval skip: %v", err)
 	}
 
@@ -63,7 +63,7 @@ func TestUnapprovedActions(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Unix(1_700_000_000, 0)
 
-	if err := s.RecordApproval("p", "send-email", now, "timeout", 0, hashOf("d"), 2, 1); err != nil {
+	if err := s.RecordApproval("p", "send-email", now, "timeout", 0, hashOf("d"), 2, 1, "", ""); err != nil {
 		t.Fatalf("RecordApproval: %v", err)
 	}
 	un, err := s.UnapprovedActions("p")
@@ -74,7 +74,7 @@ func TestUnapprovedActions(t *testing.T) {
 		t.Fatalf("want [send-email], got %v", un)
 	}
 
-	if err := s.RecordApproval("p", "send-email", now.Add(time.Minute), "approve", 111, hashOf("d2"), 2, 2); err != nil {
+	if err := s.RecordApproval("p", "send-email", now.Add(time.Minute), "approve", 111, hashOf("d2"), 2, 2, "", ""); err != nil {
 		t.Fatalf("RecordApproval approve: %v", err)
 	}
 	un, err = s.UnapprovedActions("p")
@@ -93,7 +93,7 @@ func TestAuditAppendOnly(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Unix(1_700_000_000, 0)
 	for i := 0; i < 2; i++ {
-		if err := s.RecordApproval("p", "gate", now.Add(time.Duration(i)*time.Minute), "approve", int64(100+i), hashOf("d"), 1, 1); err != nil {
+		if err := s.RecordApproval("p", "gate", now.Add(time.Duration(i)*time.Minute), "approve", int64(100+i), hashOf("d"), 1, 1, "", ""); err != nil {
 			t.Fatalf("RecordApproval: %v", err)
 		}
 	}
@@ -111,7 +111,7 @@ func TestAuditAppendOnly(t *testing.T) {
 func TestPayloadNotStored(t *testing.T) {
 	s := openTestStore(t)
 	const secret = "DEAR CUSTOMER your SSN is 123-45-6789"
-	if err := s.RecordApproval("p", "gate", time.Unix(1_700_000_000, 0), "approve", 111, hashOf(secret), 1, 1); err != nil {
+	if err := s.RecordApproval("p", "gate", time.Unix(1_700_000_000, 0), "approve", 111, hashOf(secret), 1, 1, "", ""); err != nil {
 		t.Fatalf("RecordApproval: %v", err)
 	}
 
