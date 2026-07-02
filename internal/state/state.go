@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS action_approvals (
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
 `
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.ExecContext(context.Background(), schema); err != nil {
 		return err
 	}
 	// Migrate stores created before signed receipts existed: add the columns if
@@ -82,7 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, 
 		`ALTER TABLE action_approvals ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE action_approvals ADD COLUMN signature TEXT NOT NULL DEFAULT ''`,
 	} {
-		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		if _, err := db.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
 		}
 	}
