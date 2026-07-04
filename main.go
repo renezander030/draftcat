@@ -33,6 +33,7 @@ import (
 	"github.com/renezander030/draftcat/internal/pdf"
 	statestore "github.com/renezander030/draftcat/internal/state"
 	"github.com/renezander030/draftcat/internal/voicebridge"
+	"github.com/renezander030/draftcat/internal/whatsapp"
 )
 
 // --- Scheduler ---
@@ -1136,6 +1137,24 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 		case "deterministic":
 			log.Printf("[pipeline:%s][step:%s] action=%s", pipeline.Name, step.Name, step.Action)
 			switch step.Action {
+			case "whatsapp_intake":
+				raw, _ := data["webhook_body"].(string)
+				if raw == "" {
+					raw, _ = data["input"].(string)
+				}
+				if raw == "" {
+					return fmt.Errorf("[step:%s] whatsapp_intake requires webhook_body or input JSON", step.Name)
+				}
+				msg, err := whatsapp.ParseWebhook(raw)
+				if err != nil {
+					return fmt.Errorf("[step:%s] %w", step.Name, err)
+				}
+				data["whatsapp_message"] = msg
+				data["whatsapp_from"] = msg.From
+				data["whatsapp_text"] = msg.Text
+				data["input"] = whatsapp.FormatForPrompt(msg)
+				log.Printf("[pipeline:%s][step:%s] accepted whatsapp message from %s", pipeline.Name, step.Name, msg.From)
+
 			case "gmail_unread":
 				if gmail == nil {
 					return fmt.Errorf("[step:%s] gmail connector not configured", step.Name)

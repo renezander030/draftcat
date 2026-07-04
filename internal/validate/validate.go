@@ -19,6 +19,7 @@ import (
 // Keep in sync when new actions are added.
 var validKnownActions = map[string]string{
 	"":                         "pass-through",
+	"whatsapp_intake":          "normalize a WhatsApp inbound payload into input/whatsapp_* fields",
 	"gmail_unread":             "fetch unread Gmail messages",
 	"notify":                   "send last ai_output to operator channel",
 	"ghl_new_contacts":         "fetch new GoHighLevel contacts",
@@ -444,6 +445,7 @@ func isCommonDataKey(k string) bool {
 	switch k {
 	case "input", "emails", "email_count", "contacts", "contact_count",
 		"opportunities", "opportunity_count", "conversations", "conversation_count",
+		"whatsapp_message", "whatsapp_from", "whatsapp_text",
 		"voice_calls", "voice_call_count",
 		"voice_handoffs", "voice_handoff_count",
 		"voice_handoffs_resolved_count",

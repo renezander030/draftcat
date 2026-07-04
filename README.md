@@ -142,6 +142,7 @@ Use n8n for drag-drop integrations across 400+ services. Use LangChain for resea
 | Action                       | What it does                                                              |
 | ---------------------------- | ------------------------------------------------------------------------ |
 | `gmail_unread`               | Fetch unread Gmail messages (deduped per pipeline)                       |
+| `whatsapp_intake`            | Normalize inbound WhatsApp JSON into governed pipeline input             |
 | `ghl_new_contacts`           | Fetch recent GoHighLevel contacts (deduped)                             |
 | `ghl_stale_opportunities`    | Fetch stalled GHL opportunities                                          |
 | `ghl_unread_conversations`   | Fetch unread GHL conversations                                          |
@@ -151,6 +152,10 @@ Use n8n for drag-drop integrations across 400+ services. Use LangChain for resea
 | `voice_*` / `dograh_*`       | Voice plugin actions (`-tags voice`)                                     |
 
 Add an action by appending a `case` to the deterministic switch in `main.go` and registering its name in `internal/validate/`. See `internal/ghl/` and `internal/dograh/` for connector patterns.
+
+For WhatsApp, run a small whatsmeow receiver as the session owner and POST its
+normalized message JSON into a `schedule: webhook` pipeline that starts with
+`whatsapp_intake`; see [`docs/whatsapp.md`](docs/whatsapp.md).
 
 ## Governance
 
