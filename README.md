@@ -158,6 +158,7 @@ Add an action by appending a `case` to the deterministic switch in `main.go` and
 - **Human-in-the-loop** — every outbound action requires explicit operator approval.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
+- **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
 - **Rate limiting** — per-user, per-minute caps on operator interactions.
 - **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
 - **Observability** — opt-in structured JSON spans, one per pipeline and step (duration, status, tokens, cost). Off by default; `observability.spans: true` or `DRAFTCAT_TRACE=1`.
@@ -165,6 +166,10 @@ Add an action by appending a `case` to the deterministic switch in `main.go` and
 ## State, dedup & triggers
 
 State persists to SQLite (`./state.db` by default): fetched item IDs are deduped per `(pipeline, scope)` so items process at most once, every run is recorded (`started_at` / `ended_at` / `status`), and writes use WAL mode for crash safety without per-write fsync.
+
+Approval rows can be made tamper-evident with signed receipts, so a later audit
+can verify which operator approved which payload hash. See
+[`docs/action-receipts.md`](docs/action-receipts.md).
 
 A pipeline's `schedule` decides when it runs — an interval (`1h`), `manual` (operator `/run` only), or `webhook`. The `webhook` server is opt-in and opens no port unless enabled:
 
