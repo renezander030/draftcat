@@ -111,7 +111,7 @@ Each pipeline is a fixed sequence of typed steps. The LLM never chooses the next
 | --------------- | -------------------------------------------------------------------- |
 | `deterministic` | Plain Go — fetch emails, parse PDFs, dedup, route, notify            |
 | `ai`            | LLM inference with a skill template, budget-checked, schema-validated |
-| `approval`      | Operator reviews via Telegram / Slack: approve / edit / reject       |
+| `approval`      | Operator reviews via Telegram: approve / edit / reject                |
 
 ```yaml
 pipelines:
@@ -160,12 +160,16 @@ normalized message JSON into a `schedule: webhook` pipeline that starts with
 ## Governance
 
 - **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
+- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. Token caps say how much it thought; these answer what it costs.
 - **Human-in-the-loop** — every outbound action requires explicit operator approval.
+- **Durable approval gates** — an open gate is written to SQLite *before* the draft is sent. If the process restarts mid-approval, the next boot records it as `interrupted`, tells the operator the action did **not** run, and leaves it visible to the audit queries. A gate whose outcome is unknown is never treated as an approval.
+- **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
 - **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
 - **Rate limiting** — per-user, per-minute caps on operator interactions.
 - **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
+- **Config validated on boot** — the engine runs the same checks as `draftcat validate` at startup and refuses to start on errors, so a bad config fails at boot rather than mid-pipeline hours later. `DRAFTCAT_SKIP_VALIDATE=1` overrides.
 - **Observability** — opt-in structured JSON spans, one per pipeline and step (duration, status, tokens, cost). Off by default; `observability.spans: true` or `DRAFTCAT_TRACE=1`.
 
 ## State, dedup & triggers
@@ -189,6 +193,22 @@ curl -X POST http://127.0.0.1:8088/hooks/invoice-due-diligence \
 
 The body reaches the pipeline as `{{webhook_body}}` / `{{input}}`; bearer auth is constant-time, and a second trigger while the pipeline is running gets `409`. A webhook only *starts* a pipeline — the approval gate still runs, so an inbound request can never make the LLM fire an outbound action.
 
+**Signed requests.** A bearer token proves only that the caller once saw the token: it does not bind the body, and a captured header replays forever. Set `require_signature: true` to demand a body-bound HMAC receipt as well:
+
+```yaml
+webhook:
+  enabled: true
+  secret_env: DRAFTCAT_WEBHOOK_SECRET
+  require_signature: true
+  max_skew_seconds: 300      # default
+```
+
+```
+X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
+```
+
+Requests outside the skew window are refused, and each signature is spent once (recorded in the dedup table), so a captured request cannot be re-fired. A signature header is verified whenever it is present, even with `require_signature: false` — a signer that breaks should fail loudly rather than be silently ignored.
+
 ## Configuration
 
 ```yaml
@@ -203,22 +223,39 @@ budgets:
   per_step_tokens:     2048
   per_pipeline_tokens: 10000
   per_day_tokens:      100000
+  per_day_cost:        5.00     # money cap, same unit as your model rates (0 = off)
+  per_pipeline_cost:   0.50
 
 observability: {spans: false}   # or DRAFTCAT_TRACE=1
 state:         {path: ./state.db}
 ```
+
+An approval step can narrow who may decide it:
+
+```yaml
+- name: release-payment
+  type: approval
+  channel: telegram
+  quorum: 2                     # how many must approve
+  approvers: [111111, 222222]   # which ones (subset of allowed_users)
+```
+
+Cost caps are enforced *between* calls — a call is refused once spend has already
+reached the cap, so one in-flight call can overshoot by at most a step. Bound
+that with `per_step_tokens`.
 
 Skills are YAML prompt templates in `skills/` with an `output_schema` the engine enforces. With `-tags voice`, a `voice:` block configures the webhook receivers, Dograh endpoints, and pre-call lookup — see [docs/voice.md](docs/voice.md).
 
 ## Commands
 
 ```bash
-draftcat                       # run the engine
+draftcat                       # run the engine (validates config first; refuses to start on errors)
 draftcat validate [--strict]   # lint config + skills
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
+draftcat audit-verify          # verify signed approval receipts
 ```
 
-Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, and `go test -short`; pre-push runs `draftcat validate --strict`.
+Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, `go test -short`, and `golangci-lint` on new code; pre-push runs `draftcat validate`.
 
 ## Voice AI plugin
 
