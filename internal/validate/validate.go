@@ -3,8 +3,6 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/renezander030/draftcat/internal/config"
-	skillsapi "github.com/renezander030/draftcat/internal/skills"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +11,10 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/renezander030/draftcat/internal/channels"
+	"github.com/renezander030/draftcat/internal/config"
+	skillsapi "github.com/renezander030/draftcat/internal/skills"
 )
 
 // validKnownActions mirrors the deterministic action switch in runPipeline.
@@ -35,10 +37,9 @@ var validStepTypes = map[string]bool{
 	"approval":      true,
 }
 
-var validApprovalChannels = map[string]bool{
-	"telegram": true,
-	"slack":    true,
-}
+// Implemented operator channels come from internal/channels, which the engine
+// reads too. Keeping a second list here is what let `channel: slack` pass
+// validation for a channel that was never built.
 
 type validateFinding struct {
 	Level   string `json:"level"`
@@ -119,16 +120,52 @@ func Run(args []string) int {
 		return printValidateReport(rep, jsonOut, strict)
 	}
 
-	skills := loadSkillsForValidate(skillsDir, rep)
-	checkConfigSecurity(&cfg, rep)
-	checkTimeouts(&cfg, rep)
-	checkRolesToModels(&cfg, rep)
-	checkEnvVars(&cfg, rep)
-	checkPipelines(&cfg, skills, skillsDir, rep)
-	checkOrphanedSkills(&cfg, skills, rep)
-	checkSecretsHygiene(rep)
+	runChecks(&cfg, skillsDir, rep)
 
 	return printValidateReport(rep, jsonOut, strict)
+}
+
+// runChecks is the shared check body behind both `draftcat validate` and the
+// engine's startup gate, so the two can never drift into disagreeing about
+// what a valid config is.
+func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
+	skills := loadSkillsForValidate(skillsDir, rep)
+	checkConfigSecurity(cfg, rep)
+	checkTimeouts(cfg, rep)
+	checkRolesToModels(cfg, rep)
+	checkEnvVars(cfg, rep)
+	checkPipelines(cfg, skills, skillsDir, rep)
+	checkOrphanedSkills(cfg, skills, rep)
+	checkSecretsHygiene(rep)
+}
+
+// Finding is one validation result surfaced to the engine at startup.
+type Finding struct {
+	Level   string // "error" | "warn"
+	Path    string
+	Message string
+}
+
+// CheckAtStartup runs the same checks as `draftcat validate` against an
+// already-parsed config and returns the findings.
+//
+// Validation used to be opt-in: thorough, but only if someone remembered to run
+// it. A config with a typo'd role or an unimplemented channel booted happily and
+// failed hours later at step-run time, which is the worst moment to discover it
+// — mid-pipeline, with a half-finished action and an operator who did not cause
+// the problem. Running it on the boot path turns a 3am runtime failure into a
+// startup refusal.
+//
+// The engine treats errors as fatal and warnings as logged. Returned rather than
+// printed so the caller controls presentation.
+func CheckAtStartup(cfg *config.Config, skillsDir string) []Finding {
+	rep := &validateReport{}
+	runChecks(cfg, skillsDir, rep)
+	out := make([]Finding, 0, len(rep.Findings))
+	for _, f := range rep.Findings {
+		out = append(out, Finding(f))
+	}
+	return out
 }
 
 func loadSkillsForValidate(skillsDir string, rep *validateReport) map[string]*skillsapi.SkillDef {
@@ -330,10 +367,15 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				if st.Mode != "" && st.Mode != "hitl" {
 					rep.warnf(spath+".mode", "only 'hitl' is supported (got %q)", st.Mode)
 				}
+				// An unimplemented channel is an ERROR, not a warning. The
+				// engine routes approvals to the one channel it is running;
+				// naming any other means the operator would be watching a
+				// channel the draft never reaches, while validate said OK.
 				if st.Channel == "" {
 					rep.errf(spath+".channel", "approval step requires 'channel'")
-				} else if !validApprovalChannels[st.Channel] {
-					rep.warnf(spath+".channel", "unknown channel %q (known: %s)", st.Channel, strings.Join(knownApprovalChannels(), ", "))
+				} else if !channels.IsImplemented(st.Channel) {
+					rep.errf(spath+".channel", "channel %q is not implemented — approvals cannot be routed there (implemented: %s)",
+						st.Channel, strings.Join(knownApprovalChannels(), ", "))
 				}
 				// Quorum (N-of-M) validation.
 				if st.Quorum < 0 {
@@ -343,9 +385,14 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) — unsatisfiable",
 						st.Quorum, len(cfg.Telegram.Security.AllowedUsers))
 				}
-				if st.Quorum >= 2 && st.Channel != "telegram" {
+				if st.Quorum >= 2 && st.Channel != channels.Telegram {
 					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' (only telegram implements multi-operator approval), got %q", st.Channel)
 				}
+				// Approver scoping: a step can only narrow the channel's allowed
+				// users, never widen them, and must leave enough approvers to
+				// satisfy its own quorum — otherwise the gate hangs until the
+				// approval timeout instead of failing at startup.
+				checkApprovers(cfg, st, spath, rep)
 			}
 		}
 
@@ -355,6 +402,42 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					aiSteps, cfg.Budgets.PerStepTokens*aiSteps, cfg.Budgets.PerPipelineTokens)
 			}
 		}
+	}
+}
+
+// checkApprovers validates a step's approver narrowing. The engine intersects
+// step.approvers with the channel's allowed_users and never widens, so an id
+// that is not an allowed user is dead weight that silently shrinks the real
+// approver pool — worth an error while the operator is still looking at it,
+// not a surprise at 4am when the gate cannot be satisfied.
+func checkApprovers(cfg *config.Config, st config.StepConfig, spath string, rep *validateReport) {
+	if len(st.Approvers) == 0 {
+		return
+	}
+	allowed := map[int64]bool{}
+	for _, id := range cfg.Telegram.Security.AllowedUsers {
+		allowed[id] = true
+	}
+	seen := map[int64]bool{}
+	valid := 0
+	for _, id := range st.Approvers {
+		if seen[id] {
+			rep.warnf(spath+".approvers", "operator %d listed more than once (counted once)", id)
+			continue
+		}
+		seen[id] = true
+		if !allowed[id] {
+			rep.errf(spath+".approvers", "operator %d is not in telegram.security.allowed_users — cannot approve anything", id)
+			continue
+		}
+		valid++
+	}
+	need := st.Quorum
+	if need < 1 {
+		need = 1
+	}
+	if valid < need {
+		rep.errf(spath+".approvers", "%d valid approver(s) cannot satisfy quorum %d — gate would hang until timeout", valid, need)
 	}
 }
 
@@ -469,11 +552,4 @@ func knownActionNames() []string {
 	return out
 }
 
-func knownApprovalChannels() []string {
-	var out []string
-	for k := range validApprovalChannels {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
+func knownApprovalChannels() []string { return channels.Names() }

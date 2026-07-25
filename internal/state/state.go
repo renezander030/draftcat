@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     signature    TEXT    NOT NULL DEFAULT ''  -- HMAC receipt over the row's fields (empty = unsigned)
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline     TEXT    NOT NULL,
+    step         TEXT    NOT NULL,
+    payload_hash TEXT    NOT NULL,           -- sha256 hex of the draft shown (never the draft)
+    quorum_n     INTEGER NOT NULL DEFAULT 1, -- approvals required
+    opened_at    INTEGER NOT NULL,           -- unix seconds the gate was opened
+    expires_at   INTEGER NOT NULL,           -- unix seconds the gate would time out
+    status       TEXT    NOT NULL            -- pending|resolved|interrupted
+);
+CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status, opened_at);
 `
 	if _, err := db.ExecContext(context.Background(), schema); err != nil {
 		return err
@@ -335,6 +346,101 @@ func (s *StateStore) UnapprovedActions(pipeline string) ([]string, error) {
 		out = append(out, step)
 	}
 	return out, rows.Err()
+}
+
+// --- Pending approvals (crash/restart durability) ---
+//
+// An approval gate used to exist only inside an in-process poll loop: the
+// engine sent the draft, blocked on a ticker, and wrote to action_approvals
+// only once a decision arrived. If the process restarted while a gate was open
+// — a redeploy, an OOM, a VPS reboot — the open gate left no trace at all. The
+// operator saw a live-looking message with buttons, the run was gone, and
+// UnapprovedActions could not see the hole because nothing was ever written.
+//
+// These three calls make the gate durable: a row is written BEFORE the draft is
+// sent, resolved when a decision arrives, and reconciled to `interrupted` on
+// the next boot if neither happened. The outcome of every gate is therefore
+// always knowable, even the ones that were cut off mid-flight.
+
+// PendingApproval is one approval gate that was open when the process stopped.
+type PendingApproval struct {
+	ID          int64
+	Pipeline    string
+	Step        string
+	PayloadHash string
+	QuorumN     int
+	OpenedAt    time.Time
+	ExpiresAt   time.Time
+}
+
+// BeginApproval records an approval gate as open and returns its row id. Called
+// immediately BEFORE the draft goes out to the operator channel, so a crash in
+// the window between sending and deciding is still visible afterwards. Like the
+// audit table it stores only the sha256 of the draft, never the draft itself.
+func (s *StateStore) BeginApproval(pipeline, step, payloadHash string, quorumN int, openedAt, expiresAt time.Time) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO pending_approvals (pipeline, step, payload_hash, quorum_n, opened_at, expires_at, status)
+		 VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+		pipeline, step, payloadHash, quorumN, openedAt.Unix(), expiresAt.Unix(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// ResolveApproval closes an open gate once a terminal decision was reached.
+// A zero id is a no-op so callers need not special-case a store-less run.
+func (s *StateStore) ResolveApproval(id int64) error {
+	if s == nil || s.db == nil || id == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE pending_approvals SET status='resolved' WHERE id=? AND status='pending'`, id)
+	return err
+}
+
+// InterruptedApprovals returns every gate still marked pending — by definition
+// gates that were open when the process last stopped, since a live run resolves
+// its own row. Call once on boot, before the engine starts.
+func (s *StateStore) InterruptedApprovals() ([]PendingApproval, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT id, pipeline, step, payload_hash, quorum_n, opened_at, expires_at
+		   FROM pending_approvals WHERE status='pending' ORDER BY opened_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []PendingApproval
+	for rows.Next() {
+		var p PendingApproval
+		var opened, expires int64
+		if err := rows.Scan(&p.ID, &p.Pipeline, &p.Step, &p.PayloadHash, &p.QuorumN, &opened, &expires); err != nil {
+			return nil, err
+		}
+		p.OpenedAt = time.Unix(opened, 0)
+		p.ExpiresAt = time.Unix(expires, 0)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// MarkInterrupted flips a pending gate to `interrupted`, the terminal state for
+// "the process died before the operator decided". The caller is expected to
+// also write an audit row so the compliance queries see it.
+func (s *StateStore) MarkInterrupted(id int64) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE pending_approvals SET status='interrupted' WHERE id=? AND status='pending'`, id)
+	return err
 }
 
 func (s *StateStore) Close() error {

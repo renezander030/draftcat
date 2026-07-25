@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -27,6 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/renezander030/draftcat/internal/approval"
+	"github.com/renezander030/draftcat/internal/channels"
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
 	gmailapi "github.com/renezander030/draftcat/internal/gmail"
 	"github.com/renezander030/draftcat/internal/obs"
@@ -189,7 +191,16 @@ type BudgetTracker struct {
 	tokensUsedPipeline int
 	callsToday         int
 	callMinutesToday   int
+	costToday          float64
+	costPipeline       float64
 	dayStart           time.Time
+	// Cost caps are held on the tracker rather than passed per call so that
+	// check() enforces them everywhere it is already called. Wiring them at
+	// each of the eight LLM call sites instead would mean a new call site added
+	// later silently spends without a cap — the failure mode is invisible until
+	// the bill arrives. 0 = no cap.
+	dayCostLimit      float64
+	pipelineCostLimit float64
 }
 
 func (b *BudgetTracker) resetIfNewDay() {
@@ -197,6 +208,7 @@ func (b *BudgetTracker) resetIfNewDay() {
 		b.tokensUsedToday = 0
 		b.callsToday = 0
 		b.callMinutesToday = 0
+		b.costToday = 0
 		b.dayStart = time.Now()
 	}
 }
@@ -206,7 +218,8 @@ func (b *BudgetTracker) check(limit int, requested int) error {
 	if b.tokensUsedToday+requested > limit {
 		return fmt.Errorf("BUDGET_BLOCKED: daily token limit %d would be exceeded (used: %d, requested: %d)", limit, b.tokensUsedToday, requested)
 	}
-	return nil
+	// Money caps ride the same pre-call gate as token caps.
+	return b.CheckCost(b.dayCostLimit, b.pipelineCostLimit)
 }
 
 func (b *BudgetTracker) record(tokens int) {
@@ -234,6 +247,35 @@ func (b *BudgetTracker) RecordCall(durationMinutes int) {
 	b.resetIfNewDay()
 	b.callsToday++
 	b.callMinutesToday += durationMinutes
+}
+
+// CheckCost blocks the next LLM call once spend has already reached a cap.
+// Token caps answer "how much did it think"; this answers the question the
+// person paying actually asks — "what is this costing me today". The per-call
+// cost was already computed from the model rates (see callLLM) and then thrown
+// away; now it accumulates and enforces.
+//
+// Deliberately checked BETWEEN calls rather than estimated ahead of one: a
+// pre-call estimate needs the response token count, which does not exist yet,
+// and guessing it either blocks legitimate work or lets the real overshoot
+// through anyway. So a single in-flight call may exceed the cap by at most one
+// step, bounded by per_step_tokens. Limits <= 0 mean "no cap".
+func (b *BudgetTracker) CheckCost(dayLimit, pipelineLimit float64) error {
+	b.resetIfNewDay()
+	if dayLimit > 0 && b.costToday >= dayLimit {
+		return fmt.Errorf("BUDGET_BLOCKED: daily cost limit %.4f reached (spent: %.4f)", dayLimit, b.costToday)
+	}
+	if pipelineLimit > 0 && b.costPipeline >= pipelineLimit {
+		return fmt.Errorf("BUDGET_BLOCKED: per-pipeline cost limit %.4f reached (spent: %.4f)", pipelineLimit, b.costPipeline)
+	}
+	return nil
+}
+
+// RecordCost accumulates the cost of one completed LLM call.
+func (b *BudgetTracker) RecordCost(cost float64) {
+	b.resetIfNewDay()
+	b.costToday += cost
+	b.costPipeline += cost
 }
 
 // --- Input Security ---
@@ -621,14 +663,22 @@ func validateOutput(text string, schema map[string]interface{}) (map[string]inte
 // The engine doesn't know which channel it's talking to.
 
 type OperatorChannel interface {
+	// Name is the channel's config name (see internal/channels). The engine
+	// compares it against a step's `channel:` so a step can never be routed to
+	// a channel that is not the one actually running.
+	Name() string
 	// Send a plain notification (no approval needed)
 	Send(text string) error
-	// Send a draft for approval with action buttons. Returns the operator's decision.
-	SendForApproval(ctx context.Context, draft string) (OperatorDecision, error)
-	// SendForQuorumApproval blocks until `need` distinct allowed operators
-	// approve, or any operator skips/adjusts, or ctx expires. need<=1 behaves
-	// like SendForApproval (single approver).
-	SendForQuorumApproval(ctx context.Context, draft string, need int) (QuorumDecision, error)
+	// SendForApproval sends a draft for approval with action buttons and returns
+	// the operator's decision. `approvers`, when non-empty, narrows who may
+	// decide to that subset of the channel's allowed users; empty = anyone
+	// allowed on the channel.
+	SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error)
+	// SendForQuorumApproval blocks until `need` distinct permitted operators
+	// approve, or any of them skips/adjusts, or ctx expires. need<=1 behaves
+	// like SendForApproval (single approver). `approvers` narrows the permitted
+	// set exactly as above.
+	SendForQuorumApproval(ctx context.Context, draft string, need int, approvers []int64) (QuorumDecision, error)
 }
 
 type OperatorDecision struct {
@@ -790,9 +840,13 @@ func (t *TGBot) answerCallback(callbackID string, text string) {
 	})
 }
 
+// Name identifies this channel to the engine's step routing check.
+func (t *TGBot) Name() string { return channels.Telegram }
+
 // SendForApproval posts a draft with Approve/Skip/Adjust buttons.
 // Waits for the operator to click a button or send a text reply for adjustment.
-func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDecision, error) {
+// `approvers` narrows who may decide (empty = any allowed user).
+func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
 	buttons := [][]map[string]string{
 		{
 			{"text": "Approve", "callback_data": "approve"},
@@ -827,8 +881,8 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDeci
 				// Handle callback query (button click)
 				if u.CallbackQuery != nil {
 					cb := u.CallbackQuery
-					// Security: verify user
-					if !t.isAllowedUser(cb.From.ID) {
+					// Security: verify user is permitted to decide THIS step
+					if !t.isApprover(cb.From.ID, approvers) {
 						t.answerCallback(cb.ID, "") // silent drop
 						log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
 						continue
@@ -864,7 +918,7 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDeci
 					if u.Message.Chat.ID != t.chatID {
 						continue
 					}
-					if !t.isAllowedUser(u.Message.From.ID) {
+					if !t.isApprover(u.Message.From.ID, approvers) {
 						log.Printf("[security] REJECTED text from user %d", u.Message.From.ID)
 						continue
 					}
@@ -892,10 +946,10 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string) (OperatorDeci
 // (allowed-user check, rate limiting, message-ID match, input validation) and
 // adds a live tally. Any single Skip vetoes immediately; Adjust takes the floor
 // and returns so the caller can rewrite and re-enter the gate.
-func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need int) (QuorumDecision, error) {
+func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need int, approvers []int64) (QuorumDecision, error) {
 	if need <= 1 {
 		// Single-approver semantics — delegate so behavior is byte-for-byte today's.
-		d, err := t.SendForApproval(ctx, draft)
+		d, err := t.SendForApproval(ctx, draft, approvers)
 		if err != nil {
 			return QuorumDecision{Action: "timeout"}, err
 		}
@@ -942,7 +996,7 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 					continue
 				}
 				cb := u.CallbackQuery
-				if !t.isAllowedUser(cb.From.ID) {
+				if !t.isApprover(cb.From.ID, approvers) {
 					t.answerCallback(cb.ID, "") // silent drop
 					log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
 					continue
@@ -986,8 +1040,28 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 }
 
 func (t *TGBot) isAllowedUser(userID int64) bool {
-	for _, id := range t.security.AllowedUsers {
-		if id == userID {
+	return t.isApprover(userID, nil)
+}
+
+// isApprover reports whether userID may decide a gate whose step narrowed the
+// approver set to `approvers`. The step list is an INTERSECTION with the
+// channel's allowed_users, never a widening: a step cannot grant approval
+// rights to someone the channel does not already trust, so a typo'd id in a
+// step's approvers list fails closed instead of opening the gate. Empty
+// approvers = anyone on allowed_users (today's behavior).
+func (t *TGBot) isApprover(userID int64, approvers []int64) bool {
+	if !containsID(t.security.AllowedUsers, userID) {
+		return false
+	}
+	if len(approvers) == 0 {
+		return true
+	}
+	return containsID(approvers, userID)
+}
+
+func containsID(ids []int64, want int64) bool {
+	for _, id := range ids {
+		if id == want {
 			return true
 		}
 	}
@@ -1058,6 +1132,7 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *BudgetTracker, ch OperatorChannel, skills *skillsapi.SkillRegistry, seed map[string]interface{}) (err error) {
 	log.Printf("[pipeline:%s] starting", pipeline.Name)
 	budget.tokensUsedPipeline = 0
+	budget.costPipeline = 0
 
 	// Observability: one pipeline span (always) + one span per step. Steps that
 	// run to completion emit at the bottom of the loop; a step that halts the
@@ -1398,6 +1473,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 			// Record token usage
 			budget.record(resp.InputTokens + resp.OutputTokens)
+			budget.RecordCost(resp.CostUSD)
 			log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
 				pipeline.Name, step.Name, resp.Model,
 				resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
@@ -1451,18 +1527,27 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				quorumN = 1
 			}
 
+			// A step may name the channel it wants. Only the running channel can
+			// serve it, so a mismatch is a hard error rather than a silent
+			// reroute to whatever channel happens to be up. `draftcat validate`
+			// catches this before boot; this is the runtime backstop.
+			if step.Channel != "" && step.Channel != ch.Name() {
+				return fmt.Errorf("[step:%s] channel %q is not the running operator channel (%q) — approvals cannot be routed there",
+					step.Name, step.Channel, ch.Name())
+			}
+
 			// getApproval dispatches to the quorum gate when quorum >= 2, else the
 			// single-approver gate (byte-for-byte today's behavior). It normalises
 			// both into (action, adjustText, approvers, err).
 			getApproval := func(cctx context.Context, draft string) (string, string, []int64, error) {
 				if step.Quorum >= 2 {
-					qd, qerr := ch.SendForQuorumApproval(cctx, draft, step.Quorum)
+					qd, qerr := ch.SendForQuorumApproval(cctx, draft, step.Quorum, step.Approvers)
 					if qerr != nil {
 						return "timeout", "", nil, qerr
 					}
 					return qd.Action, qd.Text, qd.Approvers, nil
 				}
-				dec, derr := ch.SendForApproval(cctx, draft)
+				dec, derr := ch.SendForApproval(cctx, draft, step.Approvers)
 				if derr != nil {
 					return "timeout", "", nil, derr
 				}
@@ -1533,9 +1618,28 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			currentDraft := draftMsg
 			adjustCycles := 0
 			for {
+				// Open the gate durably BEFORE the draft leaves for the operator.
+				// If the process dies in the window between sending and deciding,
+				// the next boot reconciles this row instead of the gate vanishing
+				// without a trace (see reconcileInterruptedApprovals).
+				openedAt := time.Now()
+				pendingSum := sha256.Sum256([]byte(currentDraft))
+				pendingID, perr := state.BeginApproval(pipeline.Name, step.Name,
+					hex.EncodeToString(pendingSum[:]), quorumN, openedAt, openedAt.Add(approvalTimeout))
+				if perr != nil {
+					log.Printf("[pipeline:%s][step:%s] pending-approval write failed: %v", pipeline.Name, step.Name, perr)
+				}
+
 				approvalCtx, approvalCancel := context.WithTimeout(ctx, approvalTimeout)
 				action, adjustText, approvers, aerr := getApproval(approvalCtx, currentDraft)
 				approvalCancel()
+
+				// The gate reached a terminal state in-process, whatever it was —
+				// close the pending row so boot does not later call it interrupted.
+				if rerr := state.ResolveApproval(pendingID); rerr != nil {
+					log.Printf("[pipeline:%s][step:%s] pending-approval resolve failed: %v", pipeline.Name, step.Name, rerr)
+				}
+
 				if aerr != nil {
 					recordAudit("timeout", currentDraft, nil)
 					return fmt.Errorf("[step:%s] %w", step.Name, aerr)
@@ -1591,6 +1695,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					return rerr
 				}
 				budget.record(resp.InputTokens + resp.OutputTokens)
+				budget.RecordCost(resp.CostUSD)
 
 				// Revised draft re-enters the gate (at 0/N for quorum steps).
 				currentDraft = fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
@@ -1608,6 +1713,74 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 	log.Printf("[pipeline:%s] completed. tokens_used=%d", pipeline.Name, budget.tokensUsedPipeline)
 	return nil
+}
+
+// reconcileInterruptedApprovals closes out approval gates that were open when
+// the process last stopped.
+//
+// The gate used to live only in an in-process poll loop, so a redeploy or crash
+// mid-approval left the operator looking at a live-looking message with buttons
+// attached to a run that no longer existed — and, worse, left no record at all:
+// nothing was written until a decision arrived, so the compliance queries could
+// not see the hole either. Now every gate is written down when it opens, and
+// anything still pending at boot is resolved here to `interrupted`: an audit
+// row (so UnapprovedActions counts it) plus a message telling the operator the
+// action did NOT run and the buttons on the old message are dead.
+//
+// Failing closed is the whole point. A gate whose outcome is unknown must never
+// be treated as an approval.
+func reconcileInterruptedApprovals(st *statestore.StateStore, ch OperatorChannel) {
+	pending, err := st.InterruptedApprovals()
+	if err != nil {
+		log.Printf("[approval] could not read pending approvals: %v", err)
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	log.Printf("[approval] %d approval gate(s) were open at last shutdown — marking interrupted", len(pending))
+
+	for _, p := range pending {
+		decidedAt := time.Now()
+		var nonce, sig string
+		if len(secret) > 0 {
+			if n, nerr := approval.NewNonce(); nerr == nil {
+				nonce = n
+				sig = approval.Sign(secret, approval.Fields{
+					Pipeline: p.Pipeline, Step: p.Step, DecidedAt: decidedAt.Unix(),
+					Decision: "interrupted", OperatorID: 0, PayloadHash: p.PayloadHash,
+					QuorumN: p.QuorumN, QuorumGot: 0,
+				}, nonce)
+			} else {
+				log.Printf("[approval] nonce failed for %s/%s, recording unsigned: %v", p.Pipeline, p.Step, nerr)
+			}
+		}
+		if e := st.RecordApproval(p.Pipeline, p.Step, decidedAt, "interrupted", 0,
+			p.PayloadHash, p.QuorumN, 0, nonce, sig); e != nil {
+			log.Printf("[approval] audit write failed for %s/%s: %v", p.Pipeline, p.Step, e)
+		}
+		if e := st.MarkInterrupted(p.ID); e != nil {
+			log.Printf("[approval] could not mark %d interrupted: %v", p.ID, e)
+		}
+		obs.RecordApproval(p.Pipeline, p.Step, "interrupted")
+		log.Printf("[approval] interrupted: pipeline=%s step=%s opened=%s",
+			p.Pipeline, p.Step, p.OpenedAt.Format(time.RFC3339))
+	}
+
+	if ch != nil {
+		var b strings.Builder
+		fmt.Fprintf(&b, "[draftcat] %d approval(s) were interrupted by a restart. The action was NOT taken.\n",
+			len(pending))
+		for _, p := range pending {
+			fmt.Fprintf(&b, "\n- %s / %s (opened %s)", p.Pipeline, p.Step, p.OpenedAt.Format("2006-01-02 15:04"))
+		}
+		b.WriteString("\n\nButtons on those older messages no longer do anything. Re-run the pipeline if the action is still wanted.")
+		if e := ch.Send(b.String()); e != nil {
+			log.Printf("[approval] could not notify operator of interrupted approvals: %v", e)
+		}
+	}
 }
 
 // --- Command Handler ---
@@ -1790,6 +1963,7 @@ func handleEmails(args string, bot *TGBot, cfg *config.Config, budget *BudgetTra
 			bot.Send(header + formatted[:2000] + "\n\n[truncated]")
 		} else {
 			budget.record(resp.InputTokens + resp.OutputTokens)
+			budget.RecordCost(resp.CostUSD)
 			bot.Send(header + resp.Text)
 		}
 	}
@@ -1883,6 +2057,7 @@ Body:
 			return
 		}
 		budget.record(resp.InputTokens + resp.OutputTokens)
+		budget.RecordCost(resp.CostUSD)
 		replyBody = resp.Text
 	}
 
@@ -1890,7 +2065,9 @@ Body:
 	draft := fmt.Sprintf("[reply] Draft reply to: %s\nSubject: Re: %s\n\n%s", replyTo, subject, replyBody)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
-	decision, err := bot.SendForApproval(ctx, draft)
+	// Ad-hoc operator command, not a pipeline step — no per-step approver
+	// narrowing applies, so any allowed user may decide.
+	decision, err := bot.SendForApproval(ctx, draft, nil)
 	cancel()
 	if err != nil {
 		log.Printf("[reply] approval error: %v", err)
@@ -2019,6 +2196,7 @@ Thread (%d messages):
 		return
 	}
 	budget.record(resp.InputTokens + resp.OutputTokens)
+	budget.RecordCost(resp.CostUSD)
 	bot.Send(fmt.Sprintf("[thread] %d messages — %s\n\n%s", len(threadEmails), target.Subject, resp.Text))
 }
 
@@ -2347,6 +2525,29 @@ func main() {
 	}
 	skillReg, _ := skillsapi.LoadSkills(skillsDir)
 
+	// Config validation on the boot path. `draftcat validate` runs the very same
+	// checks, but only if someone remembers to; a bad config used to start fine
+	// and fail later mid-pipeline. Errors are fatal here, warnings are logged.
+	// DRAFTCAT_SKIP_VALIDATE=1 is the escape hatch for an operator who needs to
+	// boot a knowingly-imperfect config in an emergency.
+	if os.Getenv("DRAFTCAT_SKIP_VALIDATE") == "" {
+		findings := validate.CheckAtStartup(&cfg, skillsDir)
+		fatal := 0
+		for _, f := range findings {
+			if f.Level == "error" {
+				log.Printf("[config] ERROR %s: %s", f.Path, f.Message)
+				fatal++
+			} else {
+				log.Printf("[config] warn  %s: %s", f.Path, f.Message)
+			}
+		}
+		if fatal > 0 {
+			log.Fatalf("[config] %d error(s) in %s — refusing to start. Fix them, or set DRAFTCAT_SKIP_VALIDATE=1 to override.", fatal, configPath)
+		}
+	} else {
+		log.Printf("[config] WARNING: startup validation skipped (DRAFTCAT_SKIP_VALIDATE set)")
+	}
+
 	// Init Gmail connector if configured
 	if cfg.Gmail.TokenPath != "" {
 		var err error
@@ -2404,8 +2605,18 @@ func main() {
 		security:    cfg.Telegram.Security,
 		rateLimiter: newRateLimiter(cfg.Telegram.Security.RateLimit),
 	}
-	budget := &BudgetTracker{dayStart: time.Now()}
+	budget := &BudgetTracker{
+		dayStart:          time.Now(),
+		dayCostLimit:      cfg.Budgets.PerDayCost,
+		pipelineCostLimit: cfg.Budgets.PerPipelineCost,
+	}
 	chatHistory := newChatHistory(20) // keep last 20 turns
+
+	// Any approval gate still marked pending was open when this process last
+	// stopped. Close it out — audit row plus an operator notice — before the
+	// engine starts, so no gate is left in an unknown state and no stale button
+	// looks live. Needs the bot, hence its position after it.
+	reconcileInterruptedApprovals(state, bot)
 
 	// Observability — structured span emission (off unless opted in).
 	if cfg.Observ.Spans || os.Getenv("DRAFTCAT_TRACE") != "" {
@@ -2553,6 +2764,7 @@ Rules:
 								log.Printf("[intent] classifier error: %v", err)
 							} else {
 								budget.record(intentResp.InputTokens + intentResp.OutputTokens)
+								budget.RecordCost(intentResp.CostUSD)
 								// Parse intent
 								cleaned := strings.TrimSpace(intentResp.Text)
 								if strings.HasPrefix(cleaned, "```") {
@@ -2646,6 +2858,7 @@ Conversation so far:
 								bot.Send("Commands: /help /cron /skills /run /status")
 							} else {
 								budget.record(resp.InputTokens + resp.OutputTokens)
+								budget.RecordCost(resp.CostUSD)
 								log.Printf("[msg] LLM reply (%d tokens, %dms): %s", resp.InputTokens+resp.OutputTokens, resp.LatencyMs, resp.Text[:min(80, len(resp.Text))])
 								chatHistory.Add("assistant", resp.Text)
 								if err := bot.Send(resp.Text); err != nil {
@@ -2736,6 +2949,78 @@ func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTrac
 	}()
 }
 
+// webhookSigHeader carries the body-bound HMAC receipt on inbound triggers.
+const webhookSigHeader = "X-Draftcat-Signature"
+
+// verifyWebhookSignature checks the Stripe/GitHub-style receipt
+//
+//	X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
+//
+// A bearer token proves only that the caller once saw the token: it does not
+// bind the request body, and a captured header replays forever. Since a webhook
+// here STARTS a pipeline, that is the one thing an inbound request must not be
+// able to do on its own. Signing t+body and bounding the clock skew closes both
+// holes; the nonce store below closes replay inside the skew window.
+//
+// Errors are deliberately specific for the log and generic for the caller — the
+// handler returns a bare 401 so a prober learns nothing about which check failed.
+func verifyWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) error {
+	if header == "" {
+		return fmt.Errorf("missing %s header", webhookSigHeader)
+	}
+	var tsPart, sigPart string
+	for _, field := range strings.Split(header, ",") {
+		field = strings.TrimSpace(field)
+		switch {
+		case strings.HasPrefix(field, "t="):
+			tsPart = strings.TrimPrefix(field, "t=")
+		case strings.HasPrefix(field, "v1="):
+			sigPart = strings.TrimPrefix(field, "v1=")
+		}
+	}
+	if tsPart == "" || sigPart == "" {
+		return fmt.Errorf("malformed signature header (want t=<unix>,v1=<hex>)")
+	}
+	ts, err := strconv.ParseInt(tsPart, 10, 64)
+	if err != nil {
+		return fmt.Errorf("unparseable timestamp %q", tsPart)
+	}
+	if skew := now.Unix() - ts; skew > maxSkewSeconds || skew < -maxSkewSeconds {
+		return fmt.Errorf("timestamp outside %ds window (skew %ds)", maxSkewSeconds, skew)
+	}
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(tsPart))
+	mac.Write([]byte("."))
+	mac.Write(body)
+	want := hex.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(want), []byte(sigPart)) != 1 {
+		return fmt.Errorf("signature mismatch")
+	}
+
+	// Replay guard. Within the skew window a valid signature is otherwise
+	// reusable, so each one is spent exactly once. Reuses the existing dedup
+	// table rather than adding a second store. With no state store configured
+	// the signature still authenticates — we just cannot promise single-use.
+	if state != nil {
+		unseen, ferr := state.FilterUnseen(webhookReplayScope, "sig", []string{sigPart})
+		if ferr != nil {
+			return fmt.Errorf("replay check failed: %w", ferr)
+		}
+		if len(unseen) == 0 {
+			return fmt.Errorf("signature already used (replay)")
+		}
+		if merr := state.MarkSeen(webhookReplayScope, "sig", []string{sigPart}); merr != nil {
+			return fmt.Errorf("replay record failed: %w", merr)
+		}
+	}
+	return nil
+}
+
+// webhookReplayScope namespaces spent webhook signatures in seen_items. The
+// leading underscores keep it from colliding with a real pipeline name.
+const webhookReplayScope = "__webhook"
+
 // webhookPipelines indexes the pipelines that opted into HTTP triggering.
 func webhookPipelines(cfg *config.Config) map[string]config.PipelineConfig {
 	hookable := map[string]config.PipelineConfig{}
@@ -2756,6 +3041,10 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		maxBody = 65536
 	}
 	secret := []byte(cfg.Webhook.Secret())
+	maxSkew := cfg.Webhook.MaxSkewSeconds
+	if maxSkew <= 0 {
+		maxSkew = 300
+	}
 	hookable := webhookPipelines(cfg)
 
 	mux := http.NewServeMux()
@@ -2773,14 +3062,29 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			return
 		}
 
+		// The body must be read before the signature can be checked, since the
+		// signature covers it — that binding is the point.
+		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+
+		// A signature is verified whenever it is present, and demanded when
+		// require_signature is on. Verifying an unrequested-but-present header
+		// means a signer that starts emitting bad signatures fails loudly
+		// instead of being silently ignored.
+		sigHeader := r.Header.Get(webhookSigHeader)
+		if sigHeader != "" || cfg.Webhook.RequireSignature {
+			if err := verifyWebhookSignature(sigHeader, body, secret, maxSkew, time.Now()); err != nil {
+				log.Printf("[webhook][security] signature rejected: %v", err)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		name := strings.TrimPrefix(r.URL.Path, "/hooks/")
 		p, ok := hookable[name]
 		if !ok {
 			http.Error(w, "no webhook-triggerable pipeline named "+name, http.StatusNotFound)
 			return
 		}
-
-		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
 
 		ok, reason := sched.TryStart(name)
 		if !ok {

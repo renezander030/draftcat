@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/renezander030/draftcat/internal/config"
-	skillsapi "github.com/renezander030/draftcat/internal/skills"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/renezander030/draftcat/internal/channels"
+	"github.com/renezander030/draftcat/internal/config"
+	skillsapi "github.com/renezander030/draftcat/internal/skills"
 )
 
 // stubChannel is the in-memory OperatorChannel used by `draftcat test`.
@@ -29,7 +31,29 @@ func (s *stubChannel) Send(text string) error {
 	return nil
 }
 
-func (s *stubChannel) SendForApproval(ctx context.Context, draft string) (OperatorDecision, error) {
+// Name reports the channel a fixture run stands in for. `draftcat test` is a
+// dry run, so it answers with the real channel name to keep a step's
+// `channel:` routing check behaving exactly as it would in production.
+func (s *stubChannel) Name() string { return channels.Telegram }
+
+// SendForQuorumApproval collapses an N-of-M gate to a single fixture decision.
+// A dry run has no second human to ask, so quorum is exercised for routing and
+// config correctness here, not for its multi-operator semantics — those are
+// covered by quorumReducer's unit tests.
+func (s *stubChannel) SendForQuorumApproval(ctx context.Context, draft string, need int, approvers []int64) (QuorumDecision, error) {
+	fmt.Printf("  [approval-quorum] need=%d distinct approver(s)\n", need)
+	d, err := s.SendForApproval(ctx, draft, approvers)
+	if err != nil {
+		return QuorumDecision{Action: "timeout"}, err
+	}
+	qd := QuorumDecision{Action: d.Action, Text: d.Text}
+	if d.Action == "approve" && d.ApproverID != 0 {
+		qd.Approvers = []int64{d.ApproverID}
+	}
+	return qd, nil
+}
+
+func (s *stubChannel) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
 	fmt.Printf("  [approval-draft]\n%s\n", indentBlock(draft, "    "))
 	if s.idx < len(s.decisions) {
 		d := s.decisions[s.idx]
@@ -267,7 +291,7 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 			}
 			aiOutput := data["ai_output"]
 			draftMsg := fmt.Sprintf("[test] draft:\n\n%v", aiOutput)
-			decision, _ := ch.SendForApproval(context.Background(), draftMsg)
+			decision, _ := ch.SendForApproval(context.Background(), draftMsg, nil)
 			if decision.Action == "skip" {
 				fmt.Println("  [stop] operator skipped — pipeline ends")
 				return 0

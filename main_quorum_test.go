@@ -12,11 +12,12 @@ import (
 // pure quorumReducer below, no poll loop required.
 type fakeChannel struct{}
 
+func (fakeChannel) Name() string      { return "telegram" }
 func (fakeChannel) Send(string) error { return nil }
-func (fakeChannel) SendForApproval(context.Context, string) (OperatorDecision, error) {
+func (fakeChannel) SendForApproval(context.Context, string, []int64) (OperatorDecision, error) {
 	return OperatorDecision{Action: "skip"}, nil
 }
-func (fakeChannel) SendForQuorumApproval(context.Context, string, int) (QuorumDecision, error) {
+func (fakeChannel) SendForQuorumApproval(context.Context, string, int, []int64) (QuorumDecision, error) {
 	return QuorumDecision{Action: "skip"}, nil
 }
 

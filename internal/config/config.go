@@ -79,6 +79,18 @@ type BudgetConfig struct {
 	PerDayTokens      int `yaml:"per_day_tokens"`
 	PerDayCalls       int `yaml:"per_day_calls"`
 	PerDayCallMinutes int `yaml:"per_day_call_minutes"`
+	// PerDayCost / PerPipelineCost cap spend in MONEY rather than tokens, using
+	// the same unit as models.<role>.cost_per_1k_input/output (draftcat does not
+	// assume a currency — put your provider's rates in and the cap matches them).
+	// Token caps answer "how much did it think"; these answer the question an
+	// owner actually asks, "what will this cost me today". 0 = no cap, so
+	// existing configs are unaffected.
+	//
+	// Enforcement is BETWEEN calls: a call is refused once spend has already
+	// reached the cap, so a single in-flight call can overshoot by at most one
+	// step. Pair with per_step_tokens to bound that overshoot.
+	PerDayCost      float64 `yaml:"per_day_cost"`
+	PerPipelineCost float64 `yaml:"per_pipeline_cost"`
 }
 
 type TimeoutConfig struct {
@@ -102,7 +114,25 @@ type WebhookConfig struct {
 	// MaxBodyBytes caps the request body read into data["webhook_body"].
 	// Default 65536.
 	MaxBodyBytes int64 `yaml:"max_body_bytes"`
-	secret       string
+	// RequireSignature demands a body-bound HMAC signature header on every
+	// request, on top of the bearer token:
+	//
+	//     X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
+	//
+	// A bearer token alone proves only that the caller once saw the token — a
+	// captured header replays forever and the body is not bound to it, so an
+	// intercepted request can be re-fired, or its body swapped, to start a
+	// pipeline. The signature binds caller, body and time, which is the
+	// Stripe/GitHub webhook norm.
+	//
+	// Default false keeps existing deployments working. Note that a signature
+	// header, once present, is ALWAYS verified even when this is false — a
+	// signer that breaks should fail loudly rather than be silently ignored.
+	RequireSignature bool `yaml:"require_signature"`
+	// MaxSkewSeconds bounds how far the signed timestamp may be from now, in
+	// either direction. Default 300 (5 minutes).
+	MaxSkewSeconds int64 `yaml:"max_skew_seconds"`
+	secret         string
 }
 
 // Secret / SetSecret access the runtime-resolved webhook token (never parsed from YAML).
@@ -157,4 +187,16 @@ type StepConfig struct {
 	// approval step before the action is released. 0 or 1 = single approver
 	// (default, unchanged behavior). Only the telegram channel implements N>=2.
 	Quorum int `yaml:"quorum"`
+	// Approvers narrows WHO may decide this step to a subset of the channel's
+	// allowed_users. Empty = anyone on allowed_users, i.e. today's behavior.
+	//
+	// allowed_users is one flat list and quorum is only a count, so until now
+	// every operator could approve every action: the assistant who triages
+	// inbox drafts could also release an invoice. This is the missing axis —
+	// quorum says how many, approvers says which ones.
+	//
+	// A quorum step needs at least Quorum entries here or it can never be
+	// satisfied; the validator enforces that rather than letting it hang until
+	// the approval timeout.
+	Approvers []int64 `yaml:"approvers"`
 }
