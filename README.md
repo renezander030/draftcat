@@ -16,11 +16,24 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
-> **New in v0.4.0:** approval gates now survive a restart (an interrupted gate is recorded and the operator told the action did *not* run), spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
+> **New in v0.4.0:** approval gates survive a restart, spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
 >
-> **In v0.3.1:** multi-operator quorum approval (`quorum: N`), tamper-evident signed approval receipts (`draftcat audit-verify`), and OTLP + Prometheus exporters. (v0.3.1 is v0.3.0 plus a state-init fix.)
+> **In v0.3.1:** multi-operator quorum approval (`quorum: N`), tamper-evident signed approval receipts (`draftcat audit-verify`), and OTLP + Prometheus exporters.
 
 ![Demo](demo.gif)
+
+## Why Draftcat
+
+|                              | **Draftcat**                                   | **n8n**                               | **LangChain agents**             | **Agent harnesses** (Flue, Claude Code) |
+| ---------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------- | --------------------------------------- |
+| **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes in visual workflows | Agent decides next action freely | Agent acts autonomously in a sandbox    |
+| **Human-in-the-loop**        | Required on every outbound step                | Optional manual nodes                 | Optional; not the default        | Optional (dispatch a message mid-run)   |
+| **Token budgets**            | Per-step / pipeline / day, enforced            | None                                  | None                             | App-managed, not built in               |
+| **Prompt-injection defense** | Input sanitization + output schema validation  | None                                  | None                             | Sandbox isolation; app-managed          |
+| **State & dedup**            | SQLite-backed; items processed at most once    | DB-backed                             | In-memory                        | Session store / Durable Objects         |
+| **Runtime**                  | Single Go binary                               | Node.js + Postgres                    | Python + dependency tree         | TypeScript, runtime-agnostic            |
+
+Use n8n for drag-drop integrations across 400+ services. Use LangChain for research and open-ended exploration. Use an agent harness like [Flue](https://github.com/withastro/flue) when you want an agent to roam a sandbox and choose its own steps. Use Draftcat when a wrong LLM choice means a real customer gets emailed.
 
 ## How draftcat fits
 
@@ -37,6 +50,21 @@ However your agent runs, draftcat sits between it and your customer systems as a
 </p>
 
 **You control the harness.** Your runtime (n8n, your own agent loop, Dograh) does the roaming and integrations, then routes every outbound action through draftcat — the one gate it can't bypass — and gets the result plus an audit trail back.
+
+## Governance
+
+- **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
+- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. Token caps say how much it thought; these answer what it costs.
+- **Human-in-the-loop** — every outbound action requires explicit operator approval.
+- **Durable approval gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart and its outcome always lands in the audit trail.
+- **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
+- **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
+- **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
+- **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
+- **Rate limiting** — per-user, per-minute caps on operator interactions.
+- **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
+- **Config validated on boot** — the engine runs the same checks as `draftcat validate` at startup and refuses to start on errors, so problems surface at boot rather than mid-run. `DRAFTCAT_SKIP_VALIDATE=1` overrides.
+- **Observability** — opt-in structured JSON spans, one per pipeline and step (duration, status, tokens, cost). Off by default; `observability.spans: true` or `DRAFTCAT_TRACE=1`.
 
 ## Quickstart
 
@@ -128,19 +156,6 @@ pipelines:
       - {name: review,    type: approval,      mode: hitl, channel: telegram}
 ```
 
-## Why Draftcat
-
-|                              | **Draftcat**                                   | **n8n**                               | **LangChain agents**             | **Agent harnesses** (Flue, Claude Code) |
-| ---------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------- | --------------------------------------- |
-| **AI execution model**       | Deterministic boundary; AI cannot fire actions | Bolt-on LLM nodes in visual workflows | Agent decides next action freely | Agent acts autonomously in a sandbox    |
-| **Human-in-the-loop**        | Required on every outbound step                | Optional manual nodes                 | Optional; not the default        | Optional (dispatch a message mid-run)   |
-| **Token budgets**            | Per-step / pipeline / day, enforced            | None                                  | None                             | App-managed, not built in               |
-| **Prompt-injection defense** | Input sanitization + output schema validation  | None                                  | None                             | Sandbox isolation; app-managed          |
-| **State & dedup**            | SQLite-backed; items processed at most once    | DB-backed                             | In-memory                        | Session store / Durable Objects         |
-| **Runtime**                  | Single Go binary                               | Node.js + Postgres                    | Python + dependency tree         | TypeScript, runtime-agnostic            |
-
-Use n8n for drag-drop integrations across 400+ services. Use LangChain for research and open-ended exploration. Use an agent harness like [Flue](https://github.com/withastro/flue) when you want an agent to roam a sandbox and choose its own steps. Use Draftcat when a wrong LLM choice means a real customer gets emailed.
-
 ## Built-in actions
 
 | Action                       | What it does                                                              |
@@ -160,58 +175,6 @@ Add an action by appending a `case` to the deterministic switch in `main.go` and
 For WhatsApp, run a small whatsmeow receiver as the session owner and POST its
 normalized message JSON into a `schedule: webhook` pipeline that starts with
 `whatsapp_intake`; see [`docs/whatsapp.md`](docs/whatsapp.md).
-
-## Governance
-
-- **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
-- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. Token caps say how much it thought; these answer what it costs.
-- **Human-in-the-loop** — every outbound action requires explicit operator approval.
-- **Durable approval gates** — an open gate is written to SQLite *before* the draft is sent. If the process restarts mid-approval, the next boot records it as `interrupted`, tells the operator the action did **not** run, and leaves it visible to the audit queries. A gate whose outcome is unknown is never treated as an approval.
-- **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
-- **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
-- **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
-- **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
-- **Rate limiting** — per-user, per-minute caps on operator interactions.
-- **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
-- **Config validated on boot** — the engine runs the same checks as `draftcat validate` at startup and refuses to start on errors, so a bad config fails at boot rather than mid-pipeline hours later. `DRAFTCAT_SKIP_VALIDATE=1` overrides.
-- **Observability** — opt-in structured JSON spans, one per pipeline and step (duration, status, tokens, cost). Off by default; `observability.spans: true` or `DRAFTCAT_TRACE=1`.
-
-## State, dedup & triggers
-
-State persists to SQLite (`./state.db` by default): fetched item IDs are deduped per `(pipeline, scope)` so items process at most once, every run is recorded (`started_at` / `ended_at` / `status`), and writes use WAL mode for crash safety without per-write fsync.
-
-Approval rows can be made tamper-evident with signed receipts, so a later audit
-can verify which operator approved which payload hash. See
-[`docs/action-receipts.md`](docs/action-receipts.md).
-
-A pipeline's `schedule` decides when it runs — an interval (`1h`), `manual` (operator `/run` only), or `webhook`. The `webhook` server is opt-in and opens no port unless enabled:
-
-```yaml
-webhook: {enabled: true, addr: 127.0.0.1:8088, secret_env: DRAFTCAT_WEBHOOK_SECRET}
-```
-
-```bash
-curl -X POST http://127.0.0.1:8088/hooks/invoice-due-diligence \
-  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" -d '{"path": "/inbox/invoice.pdf"}'
-```
-
-The body reaches the pipeline as `{{webhook_body}}` / `{{input}}`; bearer auth is constant-time, and a second trigger while the pipeline is running gets `409`. A webhook only *starts* a pipeline — the approval gate still runs, so an inbound request can never make the LLM fire an outbound action.
-
-**Signed requests.** A bearer token proves only that the caller once saw the token: it does not bind the body, and a captured header replays forever. Set `require_signature: true` to demand a body-bound HMAC receipt as well:
-
-```yaml
-webhook:
-  enabled: true
-  secret_env: DRAFTCAT_WEBHOOK_SECRET
-  require_signature: true
-  max_skew_seconds: 300      # default
-```
-
-```
-X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
-```
-
-Requests outside the skew window are refused, and each signature is spent once (recorded in the dedup table), so a captured request cannot be re-fired. A signature header is verified whenever it is present, even with `require_signature: false` — a signer that breaks should fail loudly rather than be silently ignored.
 
 ## Configuration
 
@@ -244,9 +207,7 @@ An approval step can narrow who may decide it:
   approvers: [111111, 222222]   # which ones (subset of allowed_users)
 ```
 
-Cost caps are enforced *between* calls — a call is refused once spend has already
-reached the cap, so one in-flight call can overshoot by at most a step. Bound
-that with `per_step_tokens`.
+Cost caps are checked between calls: a call is refused once spend has reached the cap. Pair them with `per_step_tokens` to bound the size of any single call.
 
 Skills are YAML prompt templates in `skills/` with an `output_schema` the engine enforces. With `-tags voice`, a `voice:` block configures the webhook receivers, Dograh endpoints, and pre-call lookup — see [docs/voice.md](docs/voice.md).
 
@@ -260,7 +221,7 @@ draftcat runs [pipeline]       # recent runs + the approval decisions in each (-
 draftcat audit-verify          # verify signed approval receipts
 ```
 
-`draftcat runs` reads the governance record back out of SQLite — what ran, when, and who decided what:
+`draftcat runs` reads the governance record back out of SQLite: what ran, when, and who decided what.
 
 ```
 2026-07-26T05:37:31Z  invoices    ok    60.0s
@@ -268,9 +229,46 @@ draftcat audit-verify          # verify signed approval receipts
     release-payment      approve     by 222 (2/2) [signed]
 ```
 
-Per-step timings and token counts are not here — those are observability spans (`observability.spans`, OTLP/Prometheus). This is the durable record of decisions.
+Per-step timings and token counts live in the observability spans (`observability.spans`, OTLP/Prometheus). This is the durable record of decisions.
 
 Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, `go test -short`, and `golangci-lint` on new code; pre-push runs `draftcat validate`.
+
+## State, dedup & triggers
+
+State persists to SQLite (`./state.db` by default): fetched item IDs are deduped per `(pipeline, scope)` so items process at most once, every run is recorded (`started_at` / `ended_at` / `status`), and writes use WAL mode for crash safety without per-write fsync.
+
+Approval rows can be made tamper-evident with signed receipts, so a later audit
+can verify which operator approved which payload hash. See
+[`docs/action-receipts.md`](docs/action-receipts.md).
+
+A pipeline's `schedule` decides when it runs — an interval (`1h`), `manual` (operator `/run` only), or `webhook`. The `webhook` server is opt-in and opens no port unless enabled:
+
+```yaml
+webhook: {enabled: true, addr: 127.0.0.1:8088, secret_env: DRAFTCAT_WEBHOOK_SECRET}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8088/hooks/invoice-due-diligence \
+  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" -d '{"path": "/inbox/invoice.pdf"}'
+```
+
+The body reaches the pipeline as `{{webhook_body}}` / `{{input}}`; bearer auth is constant-time, and a second trigger while the pipeline is running gets `409`. A webhook only *starts* a pipeline — the approval gate still runs, so an inbound request can never make the LLM fire an outbound action.
+
+**Signed requests.** Bind each trigger to its exact body and a timestamp with an HMAC receipt, on top of the bearer token:
+
+```yaml
+webhook:
+  enabled: true
+  secret_env: DRAFTCAT_WEBHOOK_SECRET
+  require_signature: true
+  max_skew_seconds: 300      # default
+```
+
+```
+X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
+```
+
+Requests outside the skew window are refused, and each signature is spent once (recorded in the dedup table), so a captured request cannot be re-fired. A signature header is always verified when present, even with `require_signature: false`.
 
 ## Voice AI plugin
 
@@ -298,12 +296,6 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 ## Related projects
 
 - [capcut-cli](https://github.com/renezander030/capcut-cli) — edit CapCut / JianYing video drafts from the CLI. Same DNA: single binary, no API, structured JSON boundary between agent and tool.
-
-## Status
-
-**v0.4.0** — early access. Single-business deployments; multi-operator approval is supported via `quorum` + `approvers`. Public APIs may change between minor versions until v1.0.
-
-Planned: a generic HTTP action, per-step retry + circuit breaker, and resuming an interrupted pipeline at its approval step rather than only recording it. Telegram is the only implemented operator channel — a second channel is a real piece of work, not a config flag, so `channel:` accepts only what ships (see `internal/channels`).
 
 ## License
 
