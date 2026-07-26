@@ -16,6 +16,10 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
+> **New in v0.4.0:** approval gates now survive a restart (an interrupted gate is recorded and the operator told the action did *not* run), spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path, and WhatsApp intake (`whatsapp_intake`).
+>
+> **In v0.3.1:** multi-operator quorum approval (`quorum: N`), tamper-evident signed approval receipts (`draftcat audit-verify`), and OTLP + Prometheus exporters. (v0.3.1 is v0.3.0 plus a state-init fix.)
+
 ![Demo](demo.gif)
 
 ## How draftcat fits
@@ -286,9 +290,9 @@ The deterministic-boundary architecture is documented in the **Production AI Aut
 
 ## Status
 
-**v0.2.2** — early access. Single-business, single-operator deployments. Public APIs may change between minor versions until v1.0.
+**v0.4.0** — early access. Single-business deployments; multi-operator approval is supported via `quorum` + `approvers`. Public APIs may change between minor versions until v1.0.
 
-New in v0.2: webhook triggers (`schedule: webhook`), structured observability spans, and `enum` / `number` enforcement in output schemas. Planned: a generic HTTP action, per-step retry + circuit breaker, Slack approval, and an OpenTelemetry/Prometheus span exporter.
+Planned: a generic HTTP action, per-step retry + circuit breaker, and resuming an interrupted pipeline at its approval step rather than only recording it. Telegram is the only implemented operator channel — a second channel is a real piece of work, not a config flag, so `channel:` accepts only what ships (see `internal/channels`).
 
 ## License
 
