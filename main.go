@@ -2452,6 +2452,8 @@ func main() {
 			os.Exit(runTestCmd(os.Args[2:]))
 		case "audit-verify":
 			os.Exit(runAuditVerify(os.Args[2:]))
+		case "runs":
+			os.Exit(runRunsCmd(os.Args[2:]))
 		case "-h", "--help", "help":
 			fmt.Println("Draftcat — AI communication management for service businesses.")
 			fmt.Println()
@@ -2459,6 +2461,7 @@ func main() {
 			fmt.Println("  draftcat [config.yaml] [skills/]       run the engine (default)")
 			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
+			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			return
 		}

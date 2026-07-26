@@ -294,6 +294,13 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 		}
 		seen[p.Name] = true
 
+		// A pipeline with no steps is almost always a half-finished edit or a
+		// YAML indentation slip. It schedules, runs, and does nothing, which
+		// looks like success — so it is an error, not a warning.
+		if len(p.Steps) == 0 {
+			rep.errf(path+".steps", "pipeline has no steps — it would run and do nothing")
+		}
+
 		switch p.Schedule {
 		case "", "manual":
 			// operator /run only
@@ -314,13 +321,15 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				rep.errf(spath, "missing 'name'")
 			}
 			if !validStepTypes[st.Type] {
-				rep.errf(spath+".type", "invalid type %q (must be one of: deterministic, ai, approval)", st.Type)
+				rep.errf(spath+".type", "invalid type %q%s (must be one of: deterministic, ai, approval)",
+					st.Type, didYouMean(st.Type, stepTypeNames()))
 				continue
 			}
 			switch st.Type {
 			case "deterministic":
 				if _, ok := validKnownActions[st.Action]; !ok {
-					rep.errf(spath+".action", "unknown action %q (known: %s)", st.Action, strings.Join(knownActionNames(), ", "))
+					rep.errf(spath+".action", "unknown action %q%s (known: %s)",
+						st.Action, didYouMean(st.Action, knownActionNames()), strings.Join(knownActionNames(), ", "))
 				}
 				if st.Action == "ghl_stale_opportunities" && st.Vars["pipeline_id"] == "" {
 					rep.errf(spath+".vars.pipeline_id", "ghl_stale_opportunities requires vars.pipeline_id")
@@ -553,3 +562,102 @@ func knownActionNames() []string {
 }
 
 func knownApprovalChannels() []string { return channels.Names() }
+
+func stepTypeNames() []string {
+	out := make([]string, 0, len(validStepTypes))
+	for k := range validStepTypes {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// didYouMean returns ` — did you mean "ai"?` when got is a near miss for one of
+// the candidates, or "" when nothing is close enough. A typo'd step type or
+// action is the single most common config mistake, and "invalid type" plus a
+// list of twelve valid names makes the reader do the diffing. Naming the likely
+// intent turns that into a one-second fix.
+//
+// The cutoff is deliberately tight (edit distance <= 2, and never more than a
+// third of the word): a wrong-but-not-similar value is a different mistake, and
+// a confidently wrong suggestion is worse than none.
+func didYouMean(got string, candidates []string) string {
+	if got == "" {
+		return ""
+	}
+	best, bestDist := "", 1<<30
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		d := editDistance(strings.ToLower(got), strings.ToLower(c))
+		if d < bestDist {
+			best, bestDist = c, d
+		}
+	}
+	limit := len(got) / 3
+	if limit > 2 {
+		limit = 2
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if best == "" || bestDist > limit {
+		return ""
+	}
+	return fmt.Sprintf(" — did you mean %q?", best)
+}
+
+// editDistance is Damerau-Levenshtein (optimal string alignment), i.e.
+// Levenshtein plus adjacent transposition as a single edit.
+//
+// Transposition has to count as one edit or the most common typo of all is
+// missed: "ia" -> "ai" is two substitutions under plain Levenshtein, which
+// pushes it past the cutoff on a short word and loses exactly the suggestion
+// the config linter most wants to make.
+func editDistance(a, b string) int {
+	if a == b {
+		return 0
+	}
+	ar, br := []rune(a), []rune(b)
+	if len(ar) == 0 {
+		return len(br)
+	}
+	if len(br) == 0 {
+		return len(ar)
+	}
+	// Full matrix: the transposition rule needs row i-2.
+	d := make([][]int, len(ar)+1)
+	for i := range d {
+		d[i] = make([]int, len(br)+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= len(br); j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			d[i][j] = min3(d[i][j-1]+1, d[i-1][j]+1, d[i-1][j-1]+cost)
+			if i > 1 && j > 1 && ar[i-1] == br[j-2] && ar[i-2] == br[j-1] {
+				if t := d[i-2][j-2] + 1; t < d[i][j] {
+					d[i][j] = t
+				}
+			}
+		}
+	}
+	return d[len(ar)][len(br)]
+}
+
+func min3(a, b, c int) int {
+	if b < a {
+		a = b
+	}
+	if c < a {
+		a = c
+	}
+	return a
+}

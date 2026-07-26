@@ -16,7 +16,7 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
-> **New in v0.4.0:** approval gates now survive a restart (an interrupted gate is recorded and the operator told the action did *not* run), spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path, and WhatsApp intake (`whatsapp_intake`).
+> **New in v0.4.0:** approval gates now survive a restart (an interrupted gate is recorded and the operator told the action did *not* run), spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
 >
 > **In v0.3.1:** multi-operator quorum approval (`quorum: N`), tamper-evident signed approval receipts (`draftcat audit-verify`), and OTLP + Prometheus exporters. (v0.3.1 is v0.3.0 plus a state-init fix.)
 
@@ -256,8 +256,19 @@ Skills are YAML prompt templates in `skills/` with an `output_schema` the engine
 draftcat                       # run the engine (validates config first; refuses to start on errors)
 draftcat validate [--strict]   # lint config + skills
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
+draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat audit-verify          # verify signed approval receipts
 ```
+
+`draftcat runs` reads the governance record back out of SQLite — what ran, when, and who decided what:
+
+```
+2026-07-26T05:37:31Z  invoices    ok    60.0s
+    release-payment      adjust      by 111 (0/2)
+    release-payment      approve     by 222 (2/2) [signed]
+```
+
+Per-step timings and token counts are not here — those are observability spans (`observability.spans`, OTLP/Prometheus). This is the durable record of decisions.
 
 Pre-commit hooks (lefthook) run `gofmt`, `go vet`, `go build`, `go test -short`, and `golangci-lint` on new code; pre-push runs `draftcat validate`.
 

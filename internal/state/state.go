@@ -225,6 +225,33 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 // Signature are the tamper-evidence receipt: empty on rows written before signing
 // was configured (or when no secret is set), otherwise an HMAC over the other
 // fields under the operator's approval-signing secret.
+// AllRecentRuns is RecentRuns across every pipeline, newest first. Used by
+// `draftcat runs` when no pipeline is named.
+func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT pipeline, started_at, ended_at, status, COALESCE(error_text,'')
+		   FROM pipeline_runs ORDER BY started_at DESC LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []RunRecord
+	for rows.Next() {
+		var r RunRecord
+		var st, en int64
+		if err := rows.Scan(&r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
+			return nil, err
+		}
+		r.StartedAt = time.Unix(st, 0)
+		r.EndedAt = time.Unix(en, 0)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 type ApprovalRecord struct {
 	Pipeline    string
 	Step        string
