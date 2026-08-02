@@ -2597,6 +2597,21 @@ func main() {
 		log.Printf("[config] WARNING: startup validation skipped (DRAFTCAT_SKIP_VALIDATE set)")
 	}
 
+	// The relay channel is built here, before the state store and voice bridge
+	// register their cleanup, so a relay that cannot start fails while there is
+	// still nothing to unwind. A configured relay is not optional: an operator
+	// who set one up is watching that surface, and quietly falling back to
+	// Telegram would route approvals to a channel nobody is reading, which is
+	// the exact failure internal/channels exists to prevent.
+	var relayCh *RelayChannel
+	if cfg.Relay.Enabled() {
+		rc, rerr := NewRelayChannel(cfg.Relay)
+		if rerr != nil {
+			log.Fatalf("[relay] channel failed to start: %v", rerr)
+		}
+		relayCh = rc
+	}
+
 	// Init Gmail connector if configured
 	if cfg.Gmail.TokenPath != "" {
 		var err error
@@ -2656,19 +2671,12 @@ func main() {
 	}
 
 	// Operator channel selection. A configured relay takes the gate; Telegram
-	// keeps the command surface either way. A relay that cannot start is fatal
-	// rather than a silent fallback to Telegram: an operator who configured a
-	// relay is watching that surface, and an approval quietly rerouted to a
-	// channel nobody is reading is the exact failure internal/channels exists
-	// to prevent.
+	// keeps the command surface either way. The relay was already built and
+	// proven startable above, so nothing here can fail.
 	opChan = OperatorChannel(bot)
-	if cfg.Relay.Enabled() {
-		rc, rerr := NewRelayChannel(cfg.Relay)
-		if rerr != nil {
-			log.Fatalf("[relay] channel failed to start: %v", rerr)
-		}
-		defer func() { _ = rc.Close() }()
-		opChan = rc
+	if relayCh != nil {
+		defer func() { _ = relayCh.Close() }()
+		opChan = relayCh
 		log.Printf("[relay] operator channel active — approvals dispatch to %s", cfg.Relay.URL)
 	}
 	budget := &BudgetTracker{
