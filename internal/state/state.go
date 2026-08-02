@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     quorum_got   INTEGER NOT NULL DEFAULT 1, -- approvals collected
     nonce        TEXT    NOT NULL DEFAULT '', -- per-row random; anti-replay
     signature    TEXT    NOT NULL DEFAULT '', -- HMAC receipt over the row's fields (empty = unsigned)
-    run_id       TEXT    NOT NULL DEFAULT ''  -- the pipeline run this decision released
+    run_id       TEXT    NOT NULL DEFAULT '', -- the pipeline run this decision released
+    policy       TEXT    NOT NULL DEFAULT ''  -- rule that released it when decision='policy_approve'
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
@@ -103,6 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status, opene
 		// from here on carry both a run_id and a receipt that still verifies.
 		`ALTER TABLE action_approvals ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE pipeline_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN policy TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -293,10 +295,20 @@ func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
 func (s *StateStore) RecordApprovalForRun(runID, pipeline, step string, decidedAt time.Time,
 	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
 	nonce, signature string) error {
+	return s.RecordApprovalRow(runID, pipeline, step, decidedAt, decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, "")
+}
+
+// RecordApprovalRow is the full write, including the policy rule that released
+// a decision. policy is non-empty only for decision "policy_approve", so the
+// audit trail always distinguishes what a human tapped from what a
+// pre-declared rule released.
+func (s *StateStore) RecordApprovalRow(runID, pipeline, step string, decidedAt time.Time,
+	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
+	nonce, signature, policy string) error {
 	_, err := s.db.ExecContext(context.Background(),
-		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature, run_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, runID,
+		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature, run_id, policy)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, runID, policy,
 	)
 	return err
 }

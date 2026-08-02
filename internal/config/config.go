@@ -25,6 +25,8 @@ type Config struct {
 	Roles     map[string]string      `yaml:"roles"`
 	Budgets   BudgetConfig           `yaml:"budgets"`
 	Timeouts  TimeoutConfig          `yaml:"timeouts"`
+	Policy    ApprovalPolicy         `yaml:"approval_policy"`
+	ToolGate  ToolGateConfig         `yaml:"tool_gate"`
 	Webhook   WebhookConfig          `yaml:"webhook"`
 	Observ    ObservabilityConfig    `yaml:"observability"`
 	Pipelines []PipelineConfig       `yaml:"pipelines"`
@@ -277,4 +279,157 @@ type StepConfig struct {
 	// satisfied; the validator enforces that rather than letting it hang until
 	// the approval timeout.
 	Approvers []int64 `yaml:"approvers"`
+	// Risk is the operator's own classification of what this step releases:
+	// "low", "normal" (default) or "high". It is declared in config, never
+	// inferred by a model. It travels on the hitl/v0 envelope so a relay can
+	// style the prompt, and it is the axis approval_policy matches on.
+	//
+	// "high" can never be auto-approved, whatever the policy says.
+	Risk string `yaml:"risk"`
+	// EscalateAfter re-notifies the operator channel once this much of the
+	// approval window has passed with no decision, e.g. "30m". Empty = no
+	// reminder, today's behavior.
+	EscalateAfter string `yaml:"escalate_after"`
+	// EscalateTo names additional operators to notify at the reminder. They are
+	// NOT added to the permitted approver set — escalation widens who is TOLD,
+	// never who may decide, because widening authority on a timer would let a
+	// slow operator silently promote someone the config never approved.
+	EscalateTo []int64 `yaml:"escalate_to"`
+}
+
+// Risk levels. Declared by the operator in config, never inferred.
+const (
+	RiskLow    = "low"
+	RiskNormal = "normal"
+	RiskHigh   = "high"
+)
+
+// RiskOf returns the step's declared risk, defaulting to normal.
+func (s StepConfig) RiskOf() string {
+	switch strings.ToLower(strings.TrimSpace(s.Risk)) {
+	case RiskLow:
+		return RiskLow
+	case RiskHigh:
+		return RiskHigh
+	default:
+		return RiskNormal
+	}
+}
+
+// ApprovalPolicy lets an operator decide IN ADVANCE that a declared class of
+// action does not need a fresh tap every time.
+//
+// The reason this exists is that an approval gate people switch off protects
+// nothing. Operators facing a prompt for every low-risk action reliably disable
+// the gate wholesale, which trades a narrow, audited exemption for a total one.
+// A policy tier is still an explicit operator decision — made once, in version
+// control, reviewable — and every auto-approval is written to the audit trail
+// with decision "policy_approve" and the rule that fired, so the trail always
+// distinguishes what a human tapped from what a policy released.
+//
+// Empty policy = nothing is ever auto-approved, which is the default.
+type ApprovalPolicy struct {
+	AutoApprove []AutoApproveRule `yaml:"auto_approve"`
+}
+
+// AutoApproveRule matches an approval step. Every non-empty field must match;
+// an empty field is a wildcard. A rule with no Risk is rejected by the
+// validator — an unscoped auto-approve is how a policy tier turns into "no gate
+// at all" by accident.
+type AutoApproveRule struct {
+	Risk     string `yaml:"risk"`
+	Pipeline string `yaml:"pipeline"`
+	Step     string `yaml:"step"`
+	// MaxCost, when > 0, refuses the exemption once the pipeline has already
+	// spent that much, so a cheap-per-action rule cannot quietly cover an
+	// expensive run.
+	MaxCost float64 `yaml:"max_cost"`
+	// Reason is the operator's note for the audit trail, e.g. "internal drafts
+	// only". Recorded on every row the rule releases.
+	Reason string `yaml:"reason"`
+}
+
+// Match reports whether the rule covers this step, and is the single place the
+// exemption is decided. High-risk steps are excluded here rather than at the
+// call site so no future caller can route around it.
+func (r AutoApproveRule) Match(pipeline string, st StepConfig, pipelineCost float64) bool {
+	if st.RiskOf() == RiskHigh {
+		return false
+	}
+	if r.Risk == "" || !strings.EqualFold(r.Risk, st.RiskOf()) {
+		return false
+	}
+	if r.Pipeline != "" && r.Pipeline != pipeline {
+		return false
+	}
+	if r.Step != "" && r.Step != st.Name {
+		return false
+	}
+	if r.MaxCost > 0 && pipelineCost >= r.MaxCost {
+		return false
+	}
+	return true
+}
+
+// AutoApproves returns the first matching rule, or nil when the step needs a
+// human.
+func (p ApprovalPolicy) AutoApproves(pipeline string, st StepConfig, pipelineCost float64) *AutoApproveRule {
+	for i := range p.AutoApprove {
+		if p.AutoApprove[i].Match(pipeline, st, pipelineCost) {
+			return &p.AutoApprove[i]
+		}
+	}
+	return nil
+}
+
+// ToolGateConfig exposes the approval gate to an agent's individual tool calls,
+// not just to declared pipeline steps.
+//
+// draftcat's claim is to be the gate an agent cannot route around. For a
+// pipeline that is structurally true. For a harness that also calls MCP or SDK
+// tools mid-run it was true only by convention: those calls never reached the
+// gate. This endpoint closes that by letting the harness ask permission for one
+// tool call and get a decision back, with the same policy, audit and human
+// escalation the pipeline steps use.
+//
+// Default is deny: a tool nobody listed is refused, so forgetting to configure
+// a tool fails closed.
+type ToolGateConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Tools is the allowlist. A name not listed here is denied.
+	Tools []ToolRule `yaml:"tools"`
+}
+
+// ToolRule declares how one named tool call is handled.
+type ToolRule struct {
+	Name string `yaml:"name"`
+	// Risk classifies the tool the same way a step is classified.
+	Risk string `yaml:"risk"`
+	// RequireApproval sends the call to the operator channel before allowing
+	// it. Without this, a listed tool is allowed on the strength of being
+	// listed — which is a real, auditable decision the operator made in config.
+	RequireApproval bool `yaml:"require_approval"`
+}
+
+// RiskOf returns the rule's declared risk, defaulting to normal.
+func (t ToolRule) RiskOf() string {
+	switch strings.ToLower(strings.TrimSpace(t.Risk)) {
+	case RiskLow:
+		return RiskLow
+	case RiskHigh:
+		return RiskHigh
+	default:
+		return RiskNormal
+	}
+}
+
+// Lookup returns the rule for a tool name, and whether one exists. An unknown
+// tool has no rule and is therefore denied.
+func (g ToolGateConfig) Lookup(name string) (ToolRule, bool) {
+	for _, t := range g.Tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return ToolRule{}, false
 }

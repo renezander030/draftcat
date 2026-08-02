@@ -214,6 +214,16 @@ func (r *RelayChannel) SendForQuorumApproval(ctx context.Context, draft string, 
 		r.mu.Unlock()
 	}()
 
+	// Budget context rides the envelope so the human decides with the run's
+	// spend in front of them; a relay that ignores it loses nothing.
+	var budgetPtr *relay.Budget
+	if b, ok := budgetFromContext(ctx); ok {
+		budgetPtr = &relay.Budget{
+			SpentToday: b.SpentToday, CapToday: b.CapToday,
+			SpentPipeline: b.SpentRun, CapPipeline: b.CapRun,
+		}
+	}
+
 	req := relay.Request{
 		Protocol:    relay.Version,
 		ApprovalID:  approvalID,
@@ -222,10 +232,12 @@ func (r *RelayChannel) SendForQuorumApproval(ctx context.Context, draft string, 
 		Step:        stepFromContext(ctx),
 		IssuedAt:    time.Now().UTC().Format(time.RFC3339),
 		ExpiresAt:   deadline.UTC().Format(time.RFC3339),
+		Risk:        riskFromContext(ctx),
 		Quorum:      relay.Quorum{Required: need},
 		Approvers:   wire,
 		PayloadHash: hash,
 		Draft:       relay.Draft{ContentType: "text/plain", Body: draft},
+		Budget:      budgetPtr,
 		Actions: []relay.Action{
 			{Verb: relay.ActionApprove},
 			{Verb: relay.ActionSkip},

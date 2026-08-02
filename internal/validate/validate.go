@@ -233,6 +233,8 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 		rep.errf("telegram.security.rate_limit", "must be set and > 0 (engine refuses to start without it)")
 	}
 	checkRelay(cfg, rep)
+	checkApprovalPolicy(cfg, rep)
+	checkToolGate(cfg, rep)
 	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
 		rep.warnf("telegram.security.allowed_users", "empty — channel will accept no operator")
 	}
@@ -488,6 +490,99 @@ func checkRelay(cfg *config.Config, rep *validateReport) {
 	}
 	if len(cfg.Relay.Security.AllowedUsers) == 0 {
 		rep.errf("relay.security.allowed_users", "empty — the relay channel would accept no operator")
+	}
+}
+
+// checkApprovalPolicy validates auto-approve rules.
+//
+// A policy tier is a narrow, declared exemption. The failure mode worth
+// guarding is the one where it quietly stops being narrow: a rule with no risk
+// scope matches every non-high step in every pipeline, which is "no gate at
+// all" written in a way that still looks like governance. That is an error, not
+// a warning.
+func checkApprovalPolicy(cfg *config.Config, rep *validateReport) {
+	for i, rule := range cfg.Policy.AutoApprove {
+		p := fmt.Sprintf("approval_policy.auto_approve[%d]", i)
+		switch strings.ToLower(strings.TrimSpace(rule.Risk)) {
+		case config.RiskLow, config.RiskNormal:
+		case "":
+			rep.errf(p+".risk", "required — an unscoped auto-approve rule matches every step and removes the gate entirely")
+		case config.RiskHigh:
+			rep.errf(p+".risk", "high-risk steps can never be auto-approved; remove the rule or lower the step's declared risk deliberately")
+		default:
+			rep.errf(p+".risk", "must be one of low, normal (got %q)", rule.Risk)
+		}
+		if rule.MaxCost < 0 {
+			rep.errf(p+".max_cost", "must be >= 0 (got %.4f)", rule.MaxCost)
+		}
+		if rule.Pipeline != "" {
+			known := false
+			for _, pl := range cfg.Pipelines {
+				if pl.Name == rule.Pipeline {
+					known = true
+					break
+				}
+			}
+			if !known {
+				rep.errf(p+".pipeline", "no pipeline named %q — the rule can never match", rule.Pipeline)
+			}
+		}
+		// A rule scoped to normal risk with no pipeline or step narrowing is
+		// broad enough to deserve saying out loud, even though it is legal.
+		if strings.EqualFold(rule.Risk, config.RiskNormal) && rule.Pipeline == "" && rule.Step == "" && rule.MaxCost == 0 {
+			rep.warnf(p, "matches every normal-risk approval step in every pipeline — consider narrowing by pipeline, step or max_cost")
+		}
+	}
+	// Steps must declare a risk value the policy can actually match on.
+	for _, pl := range cfg.Pipelines {
+		for _, st := range pl.Steps {
+			if st.Risk == "" {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(st.Risk)) {
+			case config.RiskLow, config.RiskNormal, config.RiskHigh:
+			default:
+				rep.errf(fmt.Sprintf("pipelines.%s.steps.%s.risk", pl.Name, st.Name),
+					"must be one of low, normal, high (got %q)", st.Risk)
+			}
+		}
+	}
+}
+
+// checkToolGate validates the tool-call gate allowlist.
+func checkToolGate(cfg *config.Config, rep *validateReport) {
+	if !cfg.ToolGate.Enabled {
+		if len(cfg.ToolGate.Tools) > 0 {
+			rep.warnf("tool_gate.enabled", "tools are listed but the tool gate is disabled — the endpoint is not served")
+		}
+		return
+	}
+	if !cfg.Webhook.Enabled {
+		rep.errf("tool_gate.enabled", "requires webhook.enabled — the gate endpoint is served on the webhook listener")
+	}
+	if len(cfg.ToolGate.Tools) == 0 {
+		rep.warnf("tool_gate.tools", "empty allowlist — every tool call will be denied")
+	}
+	seen := map[string]bool{}
+	for i, t := range cfg.ToolGate.Tools {
+		p := fmt.Sprintf("tool_gate.tools[%d]", i)
+		if strings.TrimSpace(t.Name) == "" {
+			rep.errf(p+".name", "tool name is required")
+		}
+		if seen[t.Name] {
+			rep.errf(p+".name", "duplicate tool %q — the first entry would always win", t.Name)
+		}
+		seen[t.Name] = true
+		switch strings.ToLower(strings.TrimSpace(t.Risk)) {
+		case "", config.RiskLow, config.RiskNormal, config.RiskHigh:
+		default:
+			rep.errf(p+".risk", "must be one of low, normal, high (got %q)", t.Risk)
+		}
+		// A high-risk tool that anyone can call without a human is the exact
+		// shape of the gap this gate exists to close.
+		if strings.EqualFold(t.Risk, config.RiskHigh) && !t.RequireApproval {
+			rep.errf(p+".require_approval", "tool %q is declared high risk but is allowed without approval", t.Name)
+		}
 	}
 }
 

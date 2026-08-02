@@ -1,0 +1,105 @@
+{
+  "type": "object",
+  "properties": {
+    "protocol": {
+      "type": "string"
+    },
+    "approval_id": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "pipeline": {
+      "type": "string"
+    },
+    "step": {
+      "type": "string"
+    },
+    "issued_at": {
+      "type": "string"
+    },
+    "expires_at": {
+      "type": "string"
+    },
+    "risk": {
+      "type": "string"
+    },
+    "quorum": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "integer"
+        },
+        "collected": {
+          "type": "integer"
+        }
+      }
+    },
+    "approvers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "payload_hash": {
+      "type": "string"
+    },
+    "draft": {
+      "type": "object",
+      "properties": {
+        "content_type": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "unit": {
+          "type": "string"
+        },
+        "spent_today": {
+          "type": "number"
+        },
+        "cap_today": {
+          "type": "number"
+        },
+        "spent_pipeline": {
+          "type": "number"
+        },
+        "cap_pipeline": {
+          "type": "number"
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "verb": {
+            "type": "string"
+          },
+          "accepts": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "callback": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "nonce": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

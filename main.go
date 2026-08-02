@@ -1619,6 +1619,35 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			}
 
 			currentDraft := draftMsg
+
+			// Policy tier. An operator can decide IN ADVANCE that a declared class
+			// of action does not need a fresh tap, because a gate people switch off
+			// protects nothing: the observed workaround for approval fatigue is
+			// disabling approval wholesale, which trades a narrow audited exemption
+			// for a total one. High-risk steps are never eligible (enforced inside
+			// AutoApproveRule.Match so no caller can route around it), and every
+			// exemption is written to the audit trail as "policy_approve" with the
+			// rule that fired, so the trail never conflates a policy release with a
+			// human decision.
+			if rule := cfg.Policy.AutoApproves(pipeline.Name, step, budget.costPipeline); rule != nil {
+				sum := sha256.Sum256([]byte(currentDraft))
+				ph := hex.EncodeToString(sum[:])
+				reason := rule.Reason
+				if reason == "" {
+					reason = fmt.Sprintf("risk=%s", step.RiskOf())
+				}
+				log.Printf("[pipeline:%s][step:%s] released by approval_policy (%s) — no operator prompt", pipeline.Name, step.Name, reason)
+				obs.RecordApproval(pipeline.Name, step.Name, "policy_approve")
+				if state != nil {
+					if e := state.RecordApprovalRow(runID, pipeline.Name, step.Name, time.Now(),
+						"policy_approve", 0, ph, quorumN, quorumN, "", "", reason); e != nil {
+						log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
+					}
+				}
+				data["approved"] = true
+				break
+			}
+
 			adjustCycles := 0
 			for {
 				// Open the gate durably BEFORE the draft leaves for the operator.
@@ -1804,7 +1833,7 @@ var vbridge *voicebridge.Bridge    // voice plugin (nil when disabled or built l
 // rerouting — and the relay does not change that. It is set at boot to the
 // relay when one is configured, otherwise the Telegram bot.
 var opChan OperatorChannel
-var lastEmails []gmailapi.Email    // last fetched emails for /reply reference
+var lastEmails []gmailapi.Email // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
 
 // citeTagRe captures <cite file="X" page="N">verbatim text</cite> emitted by
@@ -3085,6 +3114,14 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	hookable := webhookPipelines(cfg)
 
 	mux := http.NewServeMux()
+	// Tool-call gate: an agent harness asks permission for one tool call.
+	// Mounted on the same server as the webhook trigger so enabling it opens no
+	// additional port. Default-deny lives in the handler.
+	if cfg.ToolGate.Enabled {
+		mux.HandleFunc(toolGatePath, handleToolCall(cfg, gateChannel(bot)))
+		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
+	}
+
 	mux.HandleFunc("/hooks/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
