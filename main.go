@@ -1130,7 +1130,10 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 // --- Pipeline Engine ---
 
 func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *BudgetTracker, ch OperatorChannel, skills *skillsapi.SkillRegistry, seed map[string]interface{}) (err error) {
-	log.Printf("[pipeline:%s] starting", pipeline.Name)
+	// One identity for this run, minted before any work happens so every
+	// approval and audit row produced below can be joined back to it.
+	runID := newRunID(time.Now())
+	log.Printf("[pipeline:%s] starting (run %s)", pipeline.Name, runID)
 	budget.tokensUsedPipeline = 0
 	budget.costPipeline = 0
 
@@ -1174,7 +1177,7 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 	if pipelineTimeout == 0 {
 		pipelineTimeout = 5 * time.Minute
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), pipelineTimeout)
+	ctx, cancel := context.WithTimeout(withRun(context.Background(), runID, pipeline.Name), pipelineTimeout)
 	defer cancel()
 
 	// Pipeline data flows through this map
@@ -1603,7 +1606,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 						}, nonce)
 					}
 				}
-				if e := state.RecordApproval(pipeline.Name, step.Name, decidedAt, decision, opID, payloadHash, quorumN, got, nonce, sig); e != nil {
+				if e := state.RecordApprovalForRun(runID, pipeline.Name, step.Name, decidedAt, decision, opID, payloadHash, quorumN, got, nonce, sig); e != nil {
 					log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
 				}
 			}
@@ -1616,6 +1619,35 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			}
 
 			currentDraft := draftMsg
+
+			// Policy tier. An operator can decide IN ADVANCE that a declared class
+			// of action does not need a fresh tap, because a gate people switch off
+			// protects nothing: the observed workaround for approval fatigue is
+			// disabling approval wholesale, which trades a narrow audited exemption
+			// for a total one. High-risk steps are never eligible (enforced inside
+			// AutoApproveRule.Match so no caller can route around it), and every
+			// exemption is written to the audit trail as "policy_approve" with the
+			// rule that fired, so the trail never conflates a policy release with a
+			// human decision.
+			if rule := cfg.Policy.AutoApproves(pipeline.Name, step, budget.costPipeline); rule != nil {
+				sum := sha256.Sum256([]byte(currentDraft))
+				ph := hex.EncodeToString(sum[:])
+				reason := rule.Reason
+				if reason == "" {
+					reason = fmt.Sprintf("risk=%s", step.RiskOf())
+				}
+				log.Printf("[pipeline:%s][step:%s] released by approval_policy (%s) — no operator prompt", pipeline.Name, step.Name, reason)
+				obs.RecordApproval(pipeline.Name, step.Name, "policy_approve")
+				if state != nil {
+					if e := state.RecordApprovalRow(runID, pipeline.Name, step.Name, time.Now(),
+						"policy_approve", 0, ph, quorumN, quorumN, "", "", reason); e != nil {
+						log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
+					}
+				}
+				data["approved"] = true
+				break
+			}
+
 			adjustCycles := 0
 			for {
 				// Open the gate durably BEFORE the draft leaves for the operator.
@@ -1630,7 +1662,10 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					log.Printf("[pipeline:%s][step:%s] pending-approval write failed: %v", pipeline.Name, step.Name, perr)
 				}
 
-				approvalCtx, approvalCancel := context.WithTimeout(ctx, approvalTimeout)
+				// withStep puts the step name on the context so a channel that
+				// dispatches off-process (the relay) can name the gate it is
+				// asking about. In-binary channels ignore it.
+				approvalCtx, approvalCancel := context.WithTimeout(withStep(ctx, step.Name), approvalTimeout)
 				action, adjustText, approvers, aerr := getApproval(approvalCtx, currentDraft)
 				approvalCancel()
 
@@ -1791,7 +1826,14 @@ var ghl *ghlapi.GHLConnector       // initialized in main if configured
 var pdfParser *pdf.PDFParser       // initialized unconditionally in main (no config required)
 var state *statestore.StateStore   // SQLite-backed state store; opened in main, closed on shutdown
 var vbridge *voicebridge.Bridge    // voice plugin (nil when disabled or built lean)
-var lastEmails []gmailapi.Email    // last fetched emails for /reply reference
+
+// opChan is the ONE operator channel approval gates route to this process.
+// draftcat has always run a single operator channel — the approval step refuses
+// a step whose `channel:` is not the running one, rather than silently
+// rerouting — and the relay does not change that. It is set at boot to the
+// relay when one is configured, otherwise the Telegram bot.
+var opChan OperatorChannel
+var lastEmails []gmailapi.Email // last fetched emails for /reply reference
 var lastEmailsMu sync.Mutex
 
 // citeTagRe captures <cite file="X" page="N">verbatim text</cite> emitted by
@@ -2351,7 +2393,7 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 	sched.SetRunning(name, true)
 	go func() {
 		defer sched.SetRunning(name, false)
-		if err := runPipeline(cfg, *pipeline, budget, bot, skills, nil); err != nil {
+		if err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil); err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
 			bot.Send(fmt.Sprintf("[run] ERROR in %s: %s", name, err))
 		}
@@ -2454,6 +2496,8 @@ func main() {
 			os.Exit(runAuditVerify(os.Args[2:]))
 		case "runs":
 			os.Exit(runRunsCmd(os.Args[2:]))
+		case "hitl":
+			os.Exit(runHitlCmd(os.Args[2:]))
 		case "-h", "--help", "help":
 			fmt.Println("Draftcat — AI communication management for service businesses.")
 			fmt.Println()
@@ -2463,6 +2507,7 @@ func main() {
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
+			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			return
 		}
 	}
@@ -2484,6 +2529,7 @@ func main() {
 
 	// Resolve env vars
 	cfg.Telegram.SetToken(resolveEnv(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"))
+	cfg.Relay.SetSecret(resolveEnv(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET"))
 	cfg.Provider.SetAPIKey(resolveEnv(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY"))
 
 	if cfg.Telegram.Token() == "" {
@@ -2551,6 +2597,21 @@ func main() {
 		log.Printf("[config] WARNING: startup validation skipped (DRAFTCAT_SKIP_VALIDATE set)")
 	}
 
+	// The relay channel is built here, before the state store and voice bridge
+	// register their cleanup, so a relay that cannot start fails while there is
+	// still nothing to unwind. A configured relay is not optional: an operator
+	// who set one up is watching that surface, and quietly falling back to
+	// Telegram would route approvals to a channel nobody is reading, which is
+	// the exact failure internal/channels exists to prevent.
+	var relayCh *RelayChannel
+	if cfg.Relay.Enabled() {
+		rc, rerr := NewRelayChannel(cfg.Relay)
+		if rerr != nil {
+			log.Fatalf("[relay] channel failed to start: %v", rerr)
+		}
+		relayCh = rc
+	}
+
 	// Init Gmail connector if configured
 	if cfg.Gmail.TokenPath != "" {
 		var err error
@@ -2608,6 +2669,16 @@ func main() {
 		security:    cfg.Telegram.Security,
 		rateLimiter: newRateLimiter(cfg.Telegram.Security.RateLimit),
 	}
+
+	// Operator channel selection. A configured relay takes the gate; Telegram
+	// keeps the command surface either way. The relay was already built and
+	// proven startable above, so nothing here can fail.
+	opChan = OperatorChannel(bot)
+	if relayCh != nil {
+		defer func() { _ = relayCh.Close() }()
+		opChan = relayCh
+		log.Printf("[relay] operator channel active — approvals dispatch to %s", cfg.Relay.URL)
+	}
 	budget := &BudgetTracker{
 		dayStart:          time.Now(),
 		dayCostLimit:      cfg.Budgets.PerDayCost,
@@ -2619,7 +2690,7 @@ func main() {
 	// stopped. Close it out — audit row plus an operator notice — before the
 	// engine starts, so no gate is left in an unknown state and no stale button
 	// looks live. Needs the bot, hence its position after it.
-	reconcileInterruptedApprovals(state, bot)
+	reconcileInterruptedApprovals(state, opChan)
 
 	// Observability — structured span emission (off unless opted in).
 	if cfg.Observ.Spans || os.Getenv("DRAFTCAT_TRACE") != "" {
@@ -2910,7 +2981,7 @@ Conversation so far:
 						sched.SetRunning(name, true)
 						go func(p config.PipelineConfig) {
 							defer sched.SetRunning(p.Name, false)
-							if err := runPipeline(&cfg, p, budget, bot, skillReg, nil); err != nil {
+							if err := runPipeline(&cfg, p, budget, gateChannel(bot), skillReg, nil); err != nil {
 								log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
 								bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
 							}
@@ -3051,6 +3122,14 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	hookable := webhookPipelines(cfg)
 
 	mux := http.NewServeMux()
+	// Tool-call gate: an agent harness asks permission for one tool call.
+	// Mounted on the same server as the webhook trigger so enabling it opens no
+	// additional port. Default-deny lives in the handler.
+	if cfg.ToolGate.Enabled {
+		mux.HandleFunc(toolGatePath, handleToolCall(cfg, gateChannel(bot)))
+		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
+	}
+
 	mux.HandleFunc("/hooks/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -3102,7 +3181,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			if strings.TrimSpace(string(body)) != "" {
 				seed["input"] = string(body)
 			}
-			if err := runPipeline(cfg, p, budget, bot, skills, seed); err != nil {
+			if err := runPipeline(cfg, p, budget, gateChannel(bot), skills, seed); err != nil {
 				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
 				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))
 			}

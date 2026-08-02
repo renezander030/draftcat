@@ -17,13 +17,24 @@ package channels
 
 import "sort"
 
-// Telegram is the only implemented operator channel today.
-const Telegram = "telegram"
+const (
+	// Telegram is the in-binary channel: draftcat runs the bot itself.
+	Telegram = "telegram"
+	// Relay is the hitl/v0 protocol channel. draftcat stays the gate — policy,
+	// quorum, expiry, payload hash, audit — and an external, untrusted relay
+	// owns only presentation, so reaching a new operator surface no longer
+	// means draftcat taking on that vendor's bot lifecycle. It qualifies for
+	// this list on the same terms as Telegram: a complete OperatorChannel
+	// round trip ships in the binary, including the callback server that
+	// receives the decision. See docs/hitl-protocol.md.
+	Relay = "relay"
+)
 
 // implemented maps channel name -> one-line description, shown in validator
 // messages so the operator sees what they can actually pick.
 var implemented = map[string]string{
 	Telegram: "Telegram bot with inline approve/skip/adjust buttons",
+	Relay:    "hitl/v0 protocol relay (Teams via Power Automate, Slack, any signed HTTP presenter)",
 }
 
 // IsImplemented reports whether name is a channel the engine can actually

@@ -1,0 +1,61 @@
+{
+  "type": "AdaptiveCard",
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "version": "1.4",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "draftcat needs your approval",
+      "weight": "Bolder",
+      "size": "Medium",
+      "wrap": true
+    },
+    {
+      "type": "FactSet",
+      "facts": [
+        { "title": "Pipeline", "value": "@{triggerBody()?['pipeline']}" },
+        { "title": "Step", "value": "@{triggerBody()?['step']}" },
+        { "title": "Risk", "value": "@{triggerBody()?['risk']}" },
+        { "title": "Expires", "value": "@{triggerBody()?['expires_at']}" }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "@{triggerBody()?['draft']?['body']}",
+      "wrap": true,
+      "separator": true
+    },
+    {
+      "type": "TextBlock",
+      "text": "Spend today @{triggerBody()?['budget']?['spent_today']} of @{triggerBody()?['budget']?['cap_today']}",
+      "wrap": true,
+      "isSubtle": true,
+      "size": "Small"
+    },
+    {
+      "type": "Input.Text",
+      "id": "adjust_text",
+      "placeholder": "Optional: describe a change, then choose Request changes",
+      "isMultiline": true
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "title": "Approve",
+      "style": "positive",
+      "data": { "decision": "approve" }
+    },
+    {
+      "type": "Action.Submit",
+      "title": "Reject",
+      "style": "destructive",
+      "data": { "decision": "skip" }
+    },
+    {
+      "type": "Action.Submit",
+      "title": "Request changes",
+      "data": { "decision": "adjust" }
+    }
+  ]
+}

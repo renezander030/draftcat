@@ -16,9 +16,9 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
-> **New in v0.4.0:** approval gates survive a restart, spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
+> **New in v0.5.0:** approvals reach any operator surface via the [`hitl/v0` protocol](docs/hitl-protocol.md) — Microsoft Teams through a Power Automate flow in your own tenant, with no bot and no Azure app registration. Plus a tool-call gate for an agent's MCP/SDK calls (`POST /gate/tool-call`), risk tiers with pre-declared `approval_policy` exemptions, run-correlated audit rows, spend shown at the moment of decision, and `escalate_after` reminders before a gate times out.
 >
-> **In v0.3.1:** multi-operator quorum approval (`quorum: N`), tamper-evident signed approval receipts (`draftcat audit-verify`), and OTLP + Prometheus exporters.
+> **In v0.4.0:** approval gates survive a restart, spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
 
 ![Demo](demo.gif)
 
@@ -54,9 +54,13 @@ However your agent runs, draftcat sits between it and your customer systems as a
 ## Governance
 
 - **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
-- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. Token caps say how much it thought; these answer what it costs.
-- **Human-in-the-loop** — every outbound action requires explicit operator approval.
-- **Durable approval gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart and its outcome always lands in the audit trail.
+- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. The approval prompt shows what the run has spent, so the person releasing the action sees the number first.
+- **Human-in-the-loop** — every outbound action requires an explicit operator decision, made live or declared in advance.
+- **Any operator channel** — the [`hitl/v0` protocol](docs/hitl-protocol.md) keeps draftcat as the gate and lets an untrusted relay own presentation. Teams runs through a Power Automate flow in your own tenant: no bot, no Azure app registration, no admin consent. Check yours with `draftcat hitl verify <relay-url>`.
+- **Tool-call gate** — `POST /gate/tool-call` puts an agent's MCP or SDK calls through the same gate as a pipeline step. Denies by default; the approval binds to a hash of the exact arguments.
+- **Risk tiers** — steps declare `risk: low | normal | high`, and `approval_policy` can pre-approve a declared class. High risk never qualifies, and each exemption is audited as `policy_approve` with the rule that fired.
+- **Escalation** — `escalate_after` re-notifies before a gate times out; `escalate_to` widens who is told, never who may decide.
+- **Durable, run-correlated gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart, and each decision records the run it released.
 - **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
@@ -219,6 +223,7 @@ draftcat validate [--strict]   # lint config + skills
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat audit-verify          # verify signed approval receipts
+draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
 
 `draftcat runs` reads the governance record back out of SQLite: what ran, when, and who decided what.

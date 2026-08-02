@@ -232,6 +232,9 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	if cfg.Telegram.Security.RateLimit <= 0 {
 		rep.errf("telegram.security.rate_limit", "must be set and > 0 (engine refuses to start without it)")
 	}
+	checkRelay(cfg, rep)
+	checkApprovalPolicy(cfg, rep)
+	checkToolGate(cfg, rep)
 	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
 		rep.warnf("telegram.security.allowed_users", "empty — channel will accept no operator")
 	}
@@ -386,16 +389,27 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					rep.errf(spath+".channel", "channel %q is not implemented — approvals cannot be routed there (implemented: %s)",
 						st.Channel, strings.Join(knownApprovalChannels(), ", "))
 				}
-				// Quorum (N-of-M) validation.
+				// Quorum (N-of-M) validation, counted against the operator pool
+				// of the channel the step actually names — the relay keeps its
+				// own operator list, so validating a relay step against the
+				// Telegram allow-list would reject satisfiable gates and accept
+				// unsatisfiable ones.
 				if st.Quorum < 0 {
 					rep.errf(spath+".quorum", "quorum must be >= 0 (got %d)", st.Quorum)
 				}
-				if st.Quorum > len(cfg.Telegram.Security.AllowedUsers) {
-					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) — unsatisfiable",
-						st.Quorum, len(cfg.Telegram.Security.AllowedUsers))
+				pool := len(cfg.Telegram.Security.AllowedUsers)
+				if st.Channel == channels.Relay {
+					pool = len(cfg.Relay.Security.AllowedUsers)
 				}
-				if st.Quorum >= 2 && st.Channel != channels.Telegram {
-					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' (only telegram implements multi-operator approval), got %q", st.Channel)
+				if st.Quorum > pool {
+					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) on channel %q — unsatisfiable",
+						st.Quorum, pool, st.Channel)
+				}
+				if st.Quorum >= 2 && st.Channel != channels.Telegram && st.Channel != channels.Relay {
+					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' or 'relay' (only these implement multi-operator approval), got %q", st.Channel)
+				}
+				if st.Channel == channels.Relay && !cfg.Relay.Enabled() {
+					rep.errf(spath+".channel", "step routes to channel 'relay' but no relay is configured (set relay.url)")
 				}
 				// Approver scoping: a step can only narrow the channel's allowed
 				// users, never widen them, and must leave enough approvers to
@@ -410,6 +424,164 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				rep.warnf(path, "per_step_tokens × %d ai step(s) = %d exceeds per_pipeline_tokens = %d (pipeline may halt mid-run)",
 					aiSteps, cfg.Budgets.PerStepTokens*aiSteps, cfg.Budgets.PerPipelineTokens)
 			}
+		}
+	}
+}
+
+// checkRelay validates the hitl/v0 relay channel. Every finding here is an
+// error rather than a warning for the same reason the channel allow-list is an
+// error: a misconfigured relay does not fail loudly at the gate, it fails as an
+// approval request nobody receives, which looks identical to an operator who is
+// simply slow to answer. See docs/hitl-protocol.md.
+func checkRelay(cfg *config.Config, rep *validateReport) {
+	if !cfg.Relay.Enabled() {
+		// Operators listed with no relay URL is a config half-written; the
+		// channel is off and those operators can approve nothing.
+		if len(cfg.Relay.Operators) > 0 {
+			rep.warnf("relay.url", "relay operators are configured but relay.url is empty — the relay channel is off")
+		}
+		return
+	}
+	if strings.TrimSpace(cfg.Relay.SecretEnv) == "" {
+		rep.errf("relay.secret_env", "required when relay.url is set — dispatches and decisions are both HMAC-signed")
+	} else if os.Getenv(cfg.Relay.SecretEnv) == "" {
+		rep.errf("relay.secret_env", "env var %q is empty — the relay secret must be set for the channel to start", cfg.Relay.SecretEnv)
+	}
+	if strings.TrimSpace(cfg.Relay.PublicURL) == "" {
+		rep.errf("relay.public_url", "required when relay.url is set — the relay cannot post a decision back to a loopback address")
+	} else if !strings.HasPrefix(cfg.Relay.PublicURL, "http://") && !strings.HasPrefix(cfg.Relay.PublicURL, "https://") {
+		rep.errf("relay.public_url", "must be an absolute http(s) URL (got %q)", cfg.Relay.PublicURL)
+	}
+	if !strings.HasPrefix(cfg.Relay.URL, "http://") && !strings.HasPrefix(cfg.Relay.URL, "https://") {
+		rep.errf("relay.url", "must be an absolute http(s) URL (got %q)", cfg.Relay.URL)
+	}
+	if len(cfg.Relay.Operators) == 0 {
+		rep.errf("relay.operators", "at least one operator (id + identity) is required — the gate would admit no approver")
+	}
+	seenID := map[int64]bool{}
+	seenIdent := map[string]bool{}
+	for i, op := range cfg.Relay.Operators {
+		p := fmt.Sprintf("relay.operators[%d]", i)
+		if op.ID == 0 {
+			rep.errf(p+".id", "operator id must be non-zero (0 is reserved for system/timeout rows in the audit trail)")
+		}
+		if strings.TrimSpace(op.Identity) == "" {
+			rep.errf(p+".identity", "operator identity is required — it is what the relay reports back and what the gate checks")
+		}
+		// Duplicates make membership ambiguous: two ids for one identity means
+		// the audit trail cannot say which operator decided.
+		if op.ID != 0 && seenID[op.ID] {
+			rep.errf(p+".id", "duplicate operator id %d", op.ID)
+		}
+		if op.Identity != "" && seenIdent[op.Identity] {
+			rep.errf(p+".identity", "duplicate operator identity %q", op.Identity)
+		}
+		seenID[op.ID] = true
+		seenIdent[op.Identity] = true
+	}
+	// Every allowed user must map to a wire identity, or the gate silently
+	// shrinks: the engine would present to fewer people than configured and a
+	// quorum that looks satisfiable would hang until timeout.
+	for _, id := range cfg.Relay.Security.AllowedUsers {
+		if cfg.Relay.IdentityFor(id) == "" {
+			rep.errf("relay.security.allowed_users",
+				"operator %d has no matching relay.operators entry — it can never be presented to or counted", id)
+		}
+	}
+	if len(cfg.Relay.Security.AllowedUsers) == 0 {
+		rep.errf("relay.security.allowed_users", "empty — the relay channel would accept no operator")
+	}
+}
+
+// checkApprovalPolicy validates auto-approve rules.
+//
+// A policy tier is a narrow, declared exemption. The failure mode worth
+// guarding is the one where it quietly stops being narrow: a rule with no risk
+// scope matches every non-high step in every pipeline, which is "no gate at
+// all" written in a way that still looks like governance. That is an error, not
+// a warning.
+func checkApprovalPolicy(cfg *config.Config, rep *validateReport) {
+	for i, rule := range cfg.Policy.AutoApprove {
+		p := fmt.Sprintf("approval_policy.auto_approve[%d]", i)
+		switch strings.ToLower(strings.TrimSpace(rule.Risk)) {
+		case config.RiskLow, config.RiskNormal:
+		case "":
+			rep.errf(p+".risk", "required — an unscoped auto-approve rule matches every step and removes the gate entirely")
+		case config.RiskHigh:
+			rep.errf(p+".risk", "high-risk steps can never be auto-approved; remove the rule or lower the step's declared risk deliberately")
+		default:
+			rep.errf(p+".risk", "must be one of low, normal (got %q)", rule.Risk)
+		}
+		if rule.MaxCost < 0 {
+			rep.errf(p+".max_cost", "must be >= 0 (got %.4f)", rule.MaxCost)
+		}
+		if rule.Pipeline != "" {
+			known := false
+			for _, pl := range cfg.Pipelines {
+				if pl.Name == rule.Pipeline {
+					known = true
+					break
+				}
+			}
+			if !known {
+				rep.errf(p+".pipeline", "no pipeline named %q — the rule can never match", rule.Pipeline)
+			}
+		}
+		// A rule scoped to normal risk with no pipeline or step narrowing is
+		// broad enough to deserve saying out loud, even though it is legal.
+		if strings.EqualFold(rule.Risk, config.RiskNormal) && rule.Pipeline == "" && rule.Step == "" && rule.MaxCost == 0 {
+			rep.warnf(p, "matches every normal-risk approval step in every pipeline — consider narrowing by pipeline, step or max_cost")
+		}
+	}
+	// Steps must declare a risk value the policy can actually match on.
+	for _, pl := range cfg.Pipelines {
+		for _, st := range pl.Steps {
+			if st.Risk == "" {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(st.Risk)) {
+			case config.RiskLow, config.RiskNormal, config.RiskHigh:
+			default:
+				rep.errf(fmt.Sprintf("pipelines.%s.steps.%s.risk", pl.Name, st.Name),
+					"must be one of low, normal, high (got %q)", st.Risk)
+			}
+		}
+	}
+}
+
+// checkToolGate validates the tool-call gate allowlist.
+func checkToolGate(cfg *config.Config, rep *validateReport) {
+	if !cfg.ToolGate.Enabled {
+		if len(cfg.ToolGate.Tools) > 0 {
+			rep.warnf("tool_gate.enabled", "tools are listed but the tool gate is disabled — the endpoint is not served")
+		}
+		return
+	}
+	if !cfg.Webhook.Enabled {
+		rep.errf("tool_gate.enabled", "requires webhook.enabled — the gate endpoint is served on the webhook listener")
+	}
+	if len(cfg.ToolGate.Tools) == 0 {
+		rep.warnf("tool_gate.tools", "empty allowlist — every tool call will be denied")
+	}
+	seen := map[string]bool{}
+	for i, t := range cfg.ToolGate.Tools {
+		p := fmt.Sprintf("tool_gate.tools[%d]", i)
+		if strings.TrimSpace(t.Name) == "" {
+			rep.errf(p+".name", "tool name is required")
+		}
+		if seen[t.Name] {
+			rep.errf(p+".name", "duplicate tool %q — the first entry would always win", t.Name)
+		}
+		seen[t.Name] = true
+		switch strings.ToLower(strings.TrimSpace(t.Risk)) {
+		case "", config.RiskLow, config.RiskNormal, config.RiskHigh:
+		default:
+			rep.errf(p+".risk", "must be one of low, normal, high (got %q)", t.Risk)
+		}
+		// A high-risk tool that anyone can call without a human is the exact
+		// shape of the gap this gate exists to close.
+		if strings.EqualFold(t.Risk, config.RiskHigh) && !t.RequireApproval {
+			rep.errf(p+".require_approval", "tool %q is declared high risk but is allowed without approval", t.Name)
 		}
 	}
 }

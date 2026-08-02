@@ -6,6 +6,8 @@
 package config
 
 import (
+	"strings"
+
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -14,6 +16,7 @@ import (
 
 type Config struct {
 	Telegram  TelegramConfig         `yaml:"telegram"`
+	Relay     RelayConfig            `yaml:"relay"`
 	Gmail     gmailapi.GmailConfig   `yaml:"gmail"`
 	GHL       ghlapi.GHLConfig       `yaml:"gohighlevel"`
 	State     StateConfig            `yaml:"state"`
@@ -22,6 +25,8 @@ type Config struct {
 	Roles     map[string]string      `yaml:"roles"`
 	Budgets   BudgetConfig           `yaml:"budgets"`
 	Timeouts  TimeoutConfig          `yaml:"timeouts"`
+	Policy    ApprovalPolicy         `yaml:"approval_policy"`
+	ToolGate  ToolGateConfig         `yaml:"tool_gate"`
 	Webhook   WebhookConfig          `yaml:"webhook"`
 	Observ    ObservabilityConfig    `yaml:"observability"`
 	Pipelines []PipelineConfig       `yaml:"pipelines"`
@@ -46,6 +51,81 @@ type TelegramConfig struct {
 // Token / SetToken access the runtime-resolved bot token (never parsed from YAML).
 func (t TelegramConfig) Token() string      { return t.token }
 func (t *TelegramConfig) SetToken(s string) { t.token = s }
+
+// RelayConfig configures the `relay` operator channel: the hitl/v0 protocol
+// endpoint that lets any external presenter (a Power Automate flow, a bot, n8n,
+// a shell script) run the human round trip on draftcat's behalf.
+//
+// The relay exists so draftcat never owns a vendor's bot lifecycle. Teams is
+// the motivating case — incoming webhooks were disabled in May 2026 and the
+// only remaining in-binary path is an Azure app registration plus tenant admin
+// consent, per vendor. See docs/hitl-protocol.md.
+//
+// The relay is untrusted: it can DENY (never answer, and the gate times out and
+// the action does not fire) but it cannot AUTHORISE. Five checks enforce that —
+// body-bound HMAC, clock-skew window, single-use nonce, payload-hash echo, and
+// approver membership against Operators below.
+type RelayConfig struct {
+	// URL is the relay's dispatch endpoint. Empty = channel disabled.
+	URL string `yaml:"url"`
+	// SecretEnv names the env var holding the shared HMAC secret used in BOTH
+	// directions. REQUIRED when URL is set.
+	SecretEnv string `yaml:"secret_env"`
+	// CallbackAddr is where the gate listens for decision envelopes, e.g.
+	// "127.0.0.1:8089". Default "127.0.0.1:8089".
+	CallbackAddr string `yaml:"callback_addr"`
+	// PublicURL is the externally reachable base the relay posts decisions
+	// back to; the callback path is appended. REQUIRED when URL is set,
+	// because the relay cannot reach a loopback address.
+	PublicURL string `yaml:"public_url"`
+	// Operators maps each permitted human to the internal numeric ID the rest
+	// of the engine already uses for quorum counting and approver scoping.
+	// Identity is what travels on the wire and what the relay reports back.
+	Operators []RelayOperator `yaml:"operators"`
+	// Security carries the same allowed-user and input limits every operator
+	// channel must declare. AllowedUsers holds the numeric IDs from Operators.
+	Security ChannelSecurity `yaml:"security"`
+
+	secret string
+}
+
+// RelayOperator binds a wire identity to the numeric operator ID used
+// internally. Two representations exist because quorum, approver scoping and
+// the audit trail were all built on int64 operator IDs, while a relay speaks in
+// whatever identity its surface uses (an email, an SSO subject).
+type RelayOperator struct {
+	ID       int64  `yaml:"id"`
+	Identity string `yaml:"identity"`
+}
+
+// Secret / SetSecret access the runtime-resolved relay secret (never parsed
+// from YAML), matching how the Telegram bot token is handled.
+func (r RelayConfig) Secret() string      { return r.secret }
+func (r *RelayConfig) SetSecret(s string) { r.secret = s }
+
+// Enabled reports whether the relay channel is configured at all.
+func (r RelayConfig) Enabled() bool { return strings.TrimSpace(r.URL) != "" }
+
+// IdentityFor returns the wire identity for a numeric operator ID.
+func (r RelayConfig) IdentityFor(id int64) string {
+	for _, op := range r.Operators {
+		if op.ID == id {
+			return op.Identity
+		}
+	}
+	return ""
+}
+
+// OperatorFor returns the numeric operator ID for a wire identity, and whether
+// it is known. An unknown identity is never admitted.
+func (r RelayConfig) OperatorFor(identity string) (int64, bool) {
+	for _, op := range r.Operators {
+		if op.Identity == identity {
+			return op.ID, true
+		}
+	}
+	return 0, false
+}
 
 // ChannelSecurity is REQUIRED per operator channel. Engine refuses to start without it.
 type ChannelSecurity struct {
@@ -199,4 +279,157 @@ type StepConfig struct {
 	// satisfied; the validator enforces that rather than letting it hang until
 	// the approval timeout.
 	Approvers []int64 `yaml:"approvers"`
+	// Risk is the operator's own classification of what this step releases:
+	// "low", "normal" (default) or "high". It is declared in config, never
+	// inferred by a model. It travels on the hitl/v0 envelope so a relay can
+	// style the prompt, and it is the axis approval_policy matches on.
+	//
+	// "high" can never be auto-approved, whatever the policy says.
+	Risk string `yaml:"risk"`
+	// EscalateAfter re-notifies the operator channel once this much of the
+	// approval window has passed with no decision, e.g. "30m". Empty = no
+	// reminder, today's behavior.
+	EscalateAfter string `yaml:"escalate_after"`
+	// EscalateTo names additional operators to notify at the reminder. They are
+	// NOT added to the permitted approver set — escalation widens who is TOLD,
+	// never who may decide, because widening authority on a timer would let a
+	// slow operator silently promote someone the config never approved.
+	EscalateTo []int64 `yaml:"escalate_to"`
+}
+
+// Risk levels. Declared by the operator in config, never inferred.
+const (
+	RiskLow    = "low"
+	RiskNormal = "normal"
+	RiskHigh   = "high"
+)
+
+// RiskOf returns the step's declared risk, defaulting to normal.
+func (s StepConfig) RiskOf() string {
+	switch strings.ToLower(strings.TrimSpace(s.Risk)) {
+	case RiskLow:
+		return RiskLow
+	case RiskHigh:
+		return RiskHigh
+	default:
+		return RiskNormal
+	}
+}
+
+// ApprovalPolicy lets an operator decide IN ADVANCE that a declared class of
+// action does not need a fresh tap every time.
+//
+// The reason this exists is that an approval gate people switch off protects
+// nothing. Operators facing a prompt for every low-risk action reliably disable
+// the gate wholesale, which trades a narrow, audited exemption for a total one.
+// A policy tier is still an explicit operator decision — made once, in version
+// control, reviewable — and every auto-approval is written to the audit trail
+// with decision "policy_approve" and the rule that fired, so the trail always
+// distinguishes what a human tapped from what a policy released.
+//
+// Empty policy = nothing is ever auto-approved, which is the default.
+type ApprovalPolicy struct {
+	AutoApprove []AutoApproveRule `yaml:"auto_approve"`
+}
+
+// AutoApproveRule matches an approval step. Every non-empty field must match;
+// an empty field is a wildcard. A rule with no Risk is rejected by the
+// validator — an unscoped auto-approve is how a policy tier turns into "no gate
+// at all" by accident.
+type AutoApproveRule struct {
+	Risk     string `yaml:"risk"`
+	Pipeline string `yaml:"pipeline"`
+	Step     string `yaml:"step"`
+	// MaxCost, when > 0, refuses the exemption once the pipeline has already
+	// spent that much, so a cheap-per-action rule cannot quietly cover an
+	// expensive run.
+	MaxCost float64 `yaml:"max_cost"`
+	// Reason is the operator's note for the audit trail, e.g. "internal drafts
+	// only". Recorded on every row the rule releases.
+	Reason string `yaml:"reason"`
+}
+
+// Match reports whether the rule covers this step, and is the single place the
+// exemption is decided. High-risk steps are excluded here rather than at the
+// call site so no future caller can route around it.
+func (r AutoApproveRule) Match(pipeline string, st StepConfig, pipelineCost float64) bool {
+	if st.RiskOf() == RiskHigh {
+		return false
+	}
+	if r.Risk == "" || !strings.EqualFold(r.Risk, st.RiskOf()) {
+		return false
+	}
+	if r.Pipeline != "" && r.Pipeline != pipeline {
+		return false
+	}
+	if r.Step != "" && r.Step != st.Name {
+		return false
+	}
+	if r.MaxCost > 0 && pipelineCost >= r.MaxCost {
+		return false
+	}
+	return true
+}
+
+// AutoApproves returns the first matching rule, or nil when the step needs a
+// human.
+func (p ApprovalPolicy) AutoApproves(pipeline string, st StepConfig, pipelineCost float64) *AutoApproveRule {
+	for i := range p.AutoApprove {
+		if p.AutoApprove[i].Match(pipeline, st, pipelineCost) {
+			return &p.AutoApprove[i]
+		}
+	}
+	return nil
+}
+
+// ToolGateConfig exposes the approval gate to an agent's individual tool calls,
+// not just to declared pipeline steps.
+//
+// draftcat's claim is to be the gate an agent cannot route around. For a
+// pipeline that is structurally true. For a harness that also calls MCP or SDK
+// tools mid-run it was true only by convention: those calls never reached the
+// gate. This endpoint closes that by letting the harness ask permission for one
+// tool call and get a decision back, with the same policy, audit and human
+// escalation the pipeline steps use.
+//
+// Default is deny: a tool nobody listed is refused, so forgetting to configure
+// a tool fails closed.
+type ToolGateConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Tools is the allowlist. A name not listed here is denied.
+	Tools []ToolRule `yaml:"tools"`
+}
+
+// ToolRule declares how one named tool call is handled.
+type ToolRule struct {
+	Name string `yaml:"name"`
+	// Risk classifies the tool the same way a step is classified.
+	Risk string `yaml:"risk"`
+	// RequireApproval sends the call to the operator channel before allowing
+	// it. Without this, a listed tool is allowed on the strength of being
+	// listed — which is a real, auditable decision the operator made in config.
+	RequireApproval bool `yaml:"require_approval"`
+}
+
+// RiskOf returns the rule's declared risk, defaulting to normal.
+func (t ToolRule) RiskOf() string {
+	switch strings.ToLower(strings.TrimSpace(t.Risk)) {
+	case RiskLow:
+		return RiskLow
+	case RiskHigh:
+		return RiskHigh
+	default:
+		return RiskNormal
+	}
+}
+
+// Lookup returns the rule for a tool name, and whether one exists. An unknown
+// tool has no rule and is therefore denied.
+func (g ToolGateConfig) Lookup(name string) (ToolRule, bool) {
+	for _, t := range g.Tools {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return ToolRule{}, false
 }
