@@ -54,9 +54,11 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     started_at  INTEGER NOT NULL,
     ended_at    INTEGER NOT NULL,
     status      TEXT NOT NULL,
-    error_text  TEXT
+    error_text  TEXT,
+    run_id      TEXT NOT NULL DEFAULT ''       -- minted at run start; joins to action_approvals
 );
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON pipeline_runs(pipeline, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_runid ON pipeline_runs(run_id);
 CREATE TABLE IF NOT EXISTS action_approvals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline     TEXT    NOT NULL,
@@ -68,9 +70,11 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     quorum_n     INTEGER NOT NULL DEFAULT 1, -- approvals required
     quorum_got   INTEGER NOT NULL DEFAULT 1, -- approvals collected
     nonce        TEXT    NOT NULL DEFAULT '', -- per-row random; anti-replay
-    signature    TEXT    NOT NULL DEFAULT ''  -- HMAC receipt over the row's fields (empty = unsigned)
+    signature    TEXT    NOT NULL DEFAULT '', -- HMAC receipt over the row's fields (empty = unsigned)
+    run_id       TEXT    NOT NULL DEFAULT ''  -- the pipeline run this decision released
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline     TEXT    NOT NULL,
@@ -92,6 +96,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status, opene
 	for _, alter := range []string{
 		`ALTER TABLE action_approvals ADD COLUMN nonce TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE action_approvals ADD COLUMN signature TEXT NOT NULL DEFAULT ''`,
+		// run_id is a correlation column, deliberately outside the receipt
+		// signature: adding a field to internal/approval.Fields would
+		// invalidate the HMAC on every row signed before this release, so an
+		// existing store would fail audit-verify after an upgrade. Rows written
+		// from here on carry both a run_id and a receipt that still verifies.
+		`ALTER TABLE action_approvals ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pipeline_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -272,12 +283,47 @@ type ApprovalRecord struct {
 func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
 	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
 	nonce, signature string) error {
+	return s.RecordApprovalForRun("", pipeline, step, decidedAt, decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature)
+}
+
+// RecordApprovalForRun is RecordApproval with the run identity attached, so the
+// audit trail can answer which run a decision released rather than only which
+// pipeline. runID may be "" for callers with no run context (the standalone
+// approval path), which reproduces the previous behavior exactly.
+func (s *StateStore) RecordApprovalForRun(runID, pipeline, step string, decidedAt time.Time,
+	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
+	nonce, signature string) error {
 	_, err := s.db.ExecContext(context.Background(),
-		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature,
+		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature, run_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, runID,
 	)
 	return err
+}
+
+// ApprovalsForRun returns every approval decision recorded against one run, in
+// decision order. This is the join the audit trail previously could not make.
+func (s *StateStore) ApprovalsForRun(runID string) ([]ApprovalRecord, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature
+		 FROM action_approvals WHERE run_id=? ORDER BY decided_at ASC, id ASC`,
+		runID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ApprovalRecord
+	for rows.Next() {
+		var r ApprovalRecord
+		var ts int64
+		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot, &r.Nonce, &r.Signature); err != nil {
+			return nil, err
+		}
+		r.DecidedAt = time.Unix(ts, 0)
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ApprovalsForPipeline returns the last n approval rows for a pipeline,

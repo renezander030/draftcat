@@ -56,6 +56,8 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
 - **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. Token caps say how much it thought; these answer what it costs.
 - **Human-in-the-loop** — every outbound action requires explicit operator approval.
+- **Vendor-neutral approval channels** — the [`hitl/v0` protocol](docs/hitl-protocol.md) lets any external presenter run the human round trip: draftcat stays the gate (policy, quorum, expiry, payload hash, audit) and a relay owns only presentation. Microsoft Teams works through a Power Automate flow in your own tenant — no Azure app registration, no bot, no admin consent. Slack, email, PagerDuty or a shell script are the same three steps. `draftcat hitl verify <relay-url>` runs the conformance suite against yours.
+- **Run-correlated audit** — every approval decision records the pipeline run it released, so the trail answers *which run* an approval let proceed, not just which pipeline.
 - **Durable approval gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart and its outcome always lands in the audit trail.
 - **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.

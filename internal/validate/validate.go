@@ -232,6 +232,7 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	if cfg.Telegram.Security.RateLimit <= 0 {
 		rep.errf("telegram.security.rate_limit", "must be set and > 0 (engine refuses to start without it)")
 	}
+	checkRelay(cfg, rep)
 	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
 		rep.warnf("telegram.security.allowed_users", "empty — channel will accept no operator")
 	}
@@ -386,16 +387,27 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					rep.errf(spath+".channel", "channel %q is not implemented — approvals cannot be routed there (implemented: %s)",
 						st.Channel, strings.Join(knownApprovalChannels(), ", "))
 				}
-				// Quorum (N-of-M) validation.
+				// Quorum (N-of-M) validation, counted against the operator pool
+				// of the channel the step actually names — the relay keeps its
+				// own operator list, so validating a relay step against the
+				// Telegram allow-list would reject satisfiable gates and accept
+				// unsatisfiable ones.
 				if st.Quorum < 0 {
 					rep.errf(spath+".quorum", "quorum must be >= 0 (got %d)", st.Quorum)
 				}
-				if st.Quorum > len(cfg.Telegram.Security.AllowedUsers) {
-					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) — unsatisfiable",
-						st.Quorum, len(cfg.Telegram.Security.AllowedUsers))
+				pool := len(cfg.Telegram.Security.AllowedUsers)
+				if st.Channel == channels.Relay {
+					pool = len(cfg.Relay.Security.AllowedUsers)
 				}
-				if st.Quorum >= 2 && st.Channel != channels.Telegram {
-					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' (only telegram implements multi-operator approval), got %q", st.Channel)
+				if st.Quorum > pool {
+					rep.errf(spath+".quorum", "quorum %d exceeds the %d allowed operator(s) on channel %q — unsatisfiable",
+						st.Quorum, pool, st.Channel)
+				}
+				if st.Quorum >= 2 && st.Channel != channels.Telegram && st.Channel != channels.Relay {
+					rep.errf(spath+".quorum", "quorum >= 2 requires channel 'telegram' or 'relay' (only these implement multi-operator approval), got %q", st.Channel)
+				}
+				if st.Channel == channels.Relay && !cfg.Relay.Enabled() {
+					rep.errf(spath+".channel", "step routes to channel 'relay' but no relay is configured (set relay.url)")
 				}
 				// Approver scoping: a step can only narrow the channel's allowed
 				// users, never widen them, and must leave enough approvers to
@@ -411,6 +423,71 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					aiSteps, cfg.Budgets.PerStepTokens*aiSteps, cfg.Budgets.PerPipelineTokens)
 			}
 		}
+	}
+}
+
+// checkRelay validates the hitl/v0 relay channel. Every finding here is an
+// error rather than a warning for the same reason the channel allow-list is an
+// error: a misconfigured relay does not fail loudly at the gate, it fails as an
+// approval request nobody receives, which looks identical to an operator who is
+// simply slow to answer. See docs/hitl-protocol.md.
+func checkRelay(cfg *config.Config, rep *validateReport) {
+	if !cfg.Relay.Enabled() {
+		// Operators listed with no relay URL is a config half-written; the
+		// channel is off and those operators can approve nothing.
+		if len(cfg.Relay.Operators) > 0 {
+			rep.warnf("relay.url", "relay operators are configured but relay.url is empty — the relay channel is off")
+		}
+		return
+	}
+	if strings.TrimSpace(cfg.Relay.SecretEnv) == "" {
+		rep.errf("relay.secret_env", "required when relay.url is set — dispatches and decisions are both HMAC-signed")
+	} else if os.Getenv(cfg.Relay.SecretEnv) == "" {
+		rep.errf("relay.secret_env", "env var %q is empty — the relay secret must be set for the channel to start", cfg.Relay.SecretEnv)
+	}
+	if strings.TrimSpace(cfg.Relay.PublicURL) == "" {
+		rep.errf("relay.public_url", "required when relay.url is set — the relay cannot post a decision back to a loopback address")
+	} else if !strings.HasPrefix(cfg.Relay.PublicURL, "http://") && !strings.HasPrefix(cfg.Relay.PublicURL, "https://") {
+		rep.errf("relay.public_url", "must be an absolute http(s) URL (got %q)", cfg.Relay.PublicURL)
+	}
+	if !strings.HasPrefix(cfg.Relay.URL, "http://") && !strings.HasPrefix(cfg.Relay.URL, "https://") {
+		rep.errf("relay.url", "must be an absolute http(s) URL (got %q)", cfg.Relay.URL)
+	}
+	if len(cfg.Relay.Operators) == 0 {
+		rep.errf("relay.operators", "at least one operator (id + identity) is required — the gate would admit no approver")
+	}
+	seenID := map[int64]bool{}
+	seenIdent := map[string]bool{}
+	for i, op := range cfg.Relay.Operators {
+		p := fmt.Sprintf("relay.operators[%d]", i)
+		if op.ID == 0 {
+			rep.errf(p+".id", "operator id must be non-zero (0 is reserved for system/timeout rows in the audit trail)")
+		}
+		if strings.TrimSpace(op.Identity) == "" {
+			rep.errf(p+".identity", "operator identity is required — it is what the relay reports back and what the gate checks")
+		}
+		// Duplicates make membership ambiguous: two ids for one identity means
+		// the audit trail cannot say which operator decided.
+		if op.ID != 0 && seenID[op.ID] {
+			rep.errf(p+".id", "duplicate operator id %d", op.ID)
+		}
+		if op.Identity != "" && seenIdent[op.Identity] {
+			rep.errf(p+".identity", "duplicate operator identity %q", op.Identity)
+		}
+		seenID[op.ID] = true
+		seenIdent[op.Identity] = true
+	}
+	// Every allowed user must map to a wire identity, or the gate silently
+	// shrinks: the engine would present to fewer people than configured and a
+	// quorum that looks satisfiable would hang until timeout.
+	for _, id := range cfg.Relay.Security.AllowedUsers {
+		if cfg.Relay.IdentityFor(id) == "" {
+			rep.errf("relay.security.allowed_users",
+				"operator %d has no matching relay.operators entry — it can never be presented to or counted", id)
+		}
+	}
+	if len(cfg.Relay.Security.AllowedUsers) == 0 {
+		rep.errf("relay.security.allowed_users", "empty — the relay channel would accept no operator")
 	}
 }
 

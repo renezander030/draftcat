@@ -6,6 +6,8 @@
 package config
 
 import (
+	"strings"
+
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -14,6 +16,7 @@ import (
 
 type Config struct {
 	Telegram  TelegramConfig         `yaml:"telegram"`
+	Relay     RelayConfig            `yaml:"relay"`
 	Gmail     gmailapi.GmailConfig   `yaml:"gmail"`
 	GHL       ghlapi.GHLConfig       `yaml:"gohighlevel"`
 	State     StateConfig            `yaml:"state"`
@@ -46,6 +49,81 @@ type TelegramConfig struct {
 // Token / SetToken access the runtime-resolved bot token (never parsed from YAML).
 func (t TelegramConfig) Token() string      { return t.token }
 func (t *TelegramConfig) SetToken(s string) { t.token = s }
+
+// RelayConfig configures the `relay` operator channel: the hitl/v0 protocol
+// endpoint that lets any external presenter (a Power Automate flow, a bot, n8n,
+// a shell script) run the human round trip on draftcat's behalf.
+//
+// The relay exists so draftcat never owns a vendor's bot lifecycle. Teams is
+// the motivating case — incoming webhooks were disabled in May 2026 and the
+// only remaining in-binary path is an Azure app registration plus tenant admin
+// consent, per vendor. See docs/hitl-protocol.md.
+//
+// The relay is untrusted: it can DENY (never answer, and the gate times out and
+// the action does not fire) but it cannot AUTHORISE. Five checks enforce that —
+// body-bound HMAC, clock-skew window, single-use nonce, payload-hash echo, and
+// approver membership against Operators below.
+type RelayConfig struct {
+	// URL is the relay's dispatch endpoint. Empty = channel disabled.
+	URL string `yaml:"url"`
+	// SecretEnv names the env var holding the shared HMAC secret used in BOTH
+	// directions. REQUIRED when URL is set.
+	SecretEnv string `yaml:"secret_env"`
+	// CallbackAddr is where the gate listens for decision envelopes, e.g.
+	// "127.0.0.1:8089". Default "127.0.0.1:8089".
+	CallbackAddr string `yaml:"callback_addr"`
+	// PublicURL is the externally reachable base the relay posts decisions
+	// back to; the callback path is appended. REQUIRED when URL is set,
+	// because the relay cannot reach a loopback address.
+	PublicURL string `yaml:"public_url"`
+	// Operators maps each permitted human to the internal numeric ID the rest
+	// of the engine already uses for quorum counting and approver scoping.
+	// Identity is what travels on the wire and what the relay reports back.
+	Operators []RelayOperator `yaml:"operators"`
+	// Security carries the same allowed-user and input limits every operator
+	// channel must declare. AllowedUsers holds the numeric IDs from Operators.
+	Security ChannelSecurity `yaml:"security"`
+
+	secret string
+}
+
+// RelayOperator binds a wire identity to the numeric operator ID used
+// internally. Two representations exist because quorum, approver scoping and
+// the audit trail were all built on int64 operator IDs, while a relay speaks in
+// whatever identity its surface uses (an email, an SSO subject).
+type RelayOperator struct {
+	ID       int64  `yaml:"id"`
+	Identity string `yaml:"identity"`
+}
+
+// Secret / SetSecret access the runtime-resolved relay secret (never parsed
+// from YAML), matching how the Telegram bot token is handled.
+func (r RelayConfig) Secret() string      { return r.secret }
+func (r *RelayConfig) SetSecret(s string) { r.secret = s }
+
+// Enabled reports whether the relay channel is configured at all.
+func (r RelayConfig) Enabled() bool { return strings.TrimSpace(r.URL) != "" }
+
+// IdentityFor returns the wire identity for a numeric operator ID.
+func (r RelayConfig) IdentityFor(id int64) string {
+	for _, op := range r.Operators {
+		if op.ID == id {
+			return op.Identity
+		}
+	}
+	return ""
+}
+
+// OperatorFor returns the numeric operator ID for a wire identity, and whether
+// it is known. An unknown identity is never admitted.
+func (r RelayConfig) OperatorFor(identity string) (int64, bool) {
+	for _, op := range r.Operators {
+		if op.Identity == identity {
+			return op.ID, true
+		}
+	}
+	return 0, false
+}
 
 // ChannelSecurity is REQUIRED per operator channel. Engine refuses to start without it.
 type ChannelSecurity struct {
