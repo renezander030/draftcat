@@ -14,6 +14,7 @@ import (
 	"github.com/renezander030/draftcat/internal/validate"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -397,6 +398,7 @@ func validateChannelSecurity(cfg *config.Config) error {
 
 // RateLimiter tracks per-user message rates
 type RateLimiter struct {
+	mu      sync.Mutex
 	windows map[int64][]time.Time // userID → timestamps of recent messages
 	limit   int                   // max messages per minute
 }
@@ -411,7 +413,18 @@ func newRateLimiter(limit int) *RateLimiter {
 	}
 }
 
+// allow is called from every approval waiter and the command loop at once, so
+// the window map is locked — an unlocked map written from two gates is a
+// runtime fatal, not a wrong answer.
 func (r *RateLimiter) allow(userID int64) bool {
+	if r == nil {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.windows == nil {
+		r.windows = make(map[int64][]time.Time)
+	}
 	now := time.Now()
 	cutoff := now.Add(-1 * time.Minute)
 
@@ -431,7 +444,7 @@ func (r *RateLimiter) allow(userID int64) bool {
 	return true
 }
 
-// --- LLM Provider (OpenRouter) ---
+// --- LLM Provider (OpenAI-compatible chat completions; OpenRouter by default) ---
 
 type CompletionRequest struct {
 	Model     string
@@ -443,9 +456,20 @@ type CompletionResponse struct {
 	Text         string
 	InputTokens  int
 	OutputTokens int
-	LatencyMs    int64
-	CostUSD      float64
-	Model        string
+	// CachedTokens and ReasoningTokens are the provider's breakdown when it
+	// reports one (OpenRouter usage accounting); zero otherwise.
+	CachedTokens    int
+	ReasoningTokens int
+	LatencyMs       int64
+	CostUSD         float64
+	// CostSource says where CostUSD came from: "provider" when the response
+	// carried the real charge, "rates" when it was computed from the
+	// configured per-1k prices.
+	CostSource string
+	Model      string
+	// Attempts is how many HTTP requests the call took, so a run that limped
+	// through rate limits is visible in the log rather than only slow.
+	Attempts int
 }
 
 // httpClient with connection settings tuned for flaky providers
@@ -457,6 +481,53 @@ var httpClient = &http.Client{
 		TLSHandshakeTimeout: 10 * time.Second,
 	},
 	Timeout: 30 * time.Second,
+}
+
+// llmRetryable reports whether a status is worth another attempt: rate limits,
+// request timeouts and server-side failures. Any other 4xx is the caller's
+// mistake, and retrying it only spends the budget again.
+func llmRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+}
+
+// retryDelay is how long to wait before the given retry (1-based). A
+// Retry-After header wins when present — that is the provider saying when it
+// will accept the call — capped so a provider cannot park a run indefinitely.
+// Otherwise exponential backoff with ±25% jitter, so parallel pipelines that
+// hit one rate limit together do not all come back together.
+func retryDelay(retry int, retryAfter string, now time.Time) time.Duration {
+	const capAfter = 30 * time.Second
+	if s := strings.TrimSpace(retryAfter); s != "" {
+		if secs, err := strconv.Atoi(s); err == nil && secs >= 0 {
+			d := time.Duration(secs) * time.Second
+			if d > capAfter {
+				d = capAfter
+			}
+			return d
+		}
+		if at, err := http.ParseTime(s); err == nil {
+			d := at.Sub(now)
+			if d < 0 {
+				d = 0
+			}
+			if d > capAfter {
+				d = capAfter
+			}
+			return d
+		}
+	}
+	if retry < 1 {
+		retry = 1
+	}
+	base := 500 * time.Millisecond
+	for i := 0; i < retry && base < 10*time.Second; i++ {
+		base *= 2 // 1s, 2s, 4s, 8s, 10s cap
+	}
+	if base > 10*time.Second {
+		base = 10 * time.Second
+	}
+	jitter := time.Duration(rand.Int63n(int64(base)/2+1)) - base/4
+	return base + jitter
 }
 
 func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string) (*CompletionResponse, error) {
@@ -476,18 +547,36 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		},
 		"max_tokens": modelCfg.MaxTokens,
 	}
+	// OpenRouter reports the real charge (usage.cost) and the cached/reasoning
+	// token breakdown when asked. Other OpenAI-compatible servers reject
+	// unknown request fields, which is why this is a switch and not a default.
+	usageAccounting := cfg.Provider.UsageAccountingOn()
+	if usageAccounting {
+		reqBody["usage"] = map[string]bool{"include": true}
+	}
+	body, _ := json.Marshal(reqBody)
 
-	var respBody []byte
-	var latency int64
-	var lastErr error
-
-	for attempt := 0; attempt < 3; attempt++ {
+	var (
+		respBody   []byte
+		latency    int64
+		lastErr    error
+		retryAfter string
+		attempts   int
+	)
+	maxAttempts := cfg.Provider.RetriesOrDefault() + 1
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			log.Printf("[llm] retry %d after error: %v", attempt, lastErr)
-			time.Sleep(time.Duration(attempt) * time.Second)
+			delay := retryDelay(attempt, retryAfter, time.Now())
+			log.Printf("[llm] retry %d/%d in %s after: %v", attempt, maxAttempts-1, delay.Round(time.Millisecond), lastErr)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("LLM call abandoned during backoff: %w (last error: %w)", ctx.Err(), lastErr)
+			}
 		}
+		attempts++
+		retryAfter = ""
 
-		body, _ := json.Marshal(reqBody)
 		req, err := http.NewRequestWithContext(ctx, "POST", cfg.Provider.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return nil, err
@@ -499,24 +588,27 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("LLM request failed: %w", err)
+			if ctx.Err() != nil {
+				return nil, lastErr
+			}
 			continue
 		}
 		latency = time.Since(start).Milliseconds()
 
 		respBody, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
-			continue
+		if resp.StatusCode == http.StatusOK {
+			lastErr = nil
+			break
 		}
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
+		lastErr = fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
+		if !llmRetryable(resp.StatusCode) {
+			return nil, lastErr
 		}
-		lastErr = nil
-		break
+		retryAfter = resp.Header.Get("Retry-After")
 	}
 	if lastErr != nil {
-		return nil, lastErr
+		return nil, fmt.Errorf("%w (gave up after %d attempt(s))", lastErr, attempts)
 	}
 
 	var result struct {
@@ -526,8 +618,15 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int      `json:"prompt_tokens"`
+			CompletionTokens    int      `json:"completion_tokens"`
+			Cost                *float64 `json:"cost"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 		Model string `json:"model"`
 	}
@@ -538,16 +637,28 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		return nil, fmt.Errorf("LLM returned no choices")
 	}
 
+	// The configured rates are the fallback. When the provider states what it
+	// actually charged, the caps are enforced on that number — rates alone
+	// undercount reasoning tokens and overcount cached ones.
 	cost := float64(result.Usage.PromptTokens)/1000*modelCfg.CostIn +
 		float64(result.Usage.CompletionTokens)/1000*modelCfg.CostOut
+	source := "rates"
+	if usageAccounting && result.Usage.Cost != nil {
+		cost = *result.Usage.Cost
+		source = "provider"
+	}
 
 	return &CompletionResponse{
-		Text:         result.Choices[0].Message.Content,
-		InputTokens:  result.Usage.PromptTokens,
-		OutputTokens: result.Usage.CompletionTokens,
-		LatencyMs:    latency,
-		CostUSD:      cost,
-		Model:        result.Model,
+		Text:            result.Choices[0].Message.Content,
+		InputTokens:     result.Usage.PromptTokens,
+		OutputTokens:    result.Usage.CompletionTokens,
+		CachedTokens:    result.Usage.PromptTokensDetails.CachedTokens,
+		ReasoningTokens: result.Usage.CompletionTokensDetails.ReasoningTokens,
+		LatencyMs:       latency,
+		CostUSD:         cost,
+		CostSource:      source,
+		Model:           result.Model,
+		Attempts:        attempts,
 	}, nil
 }
 
@@ -751,12 +862,24 @@ type TGBot struct {
 	offset      int
 	security    config.ChannelSecurity
 	rateLimiter *RateLimiter
+
+	// api and fetch are the network seams; nil means the real Bot API. Tests
+	// script both so an approval round trip runs without Telegram.
+	api   func(method string, payload map[string]interface{}) (json.RawMessage, error)
+	fetch func() ([]TGUpdate, error)
+
+	// The single update pump — see telegram_pump.go. Only it calls getUpdates.
+	pumpOnce sync.Once
+	updates  *tgPump
 }
 
 // tgClient — dedicated HTTP client for Telegram API with timeouts
 var tgClient = &http.Client{Timeout: 10 * time.Second}
 
 func (t *TGBot) apiCall(method string, payload map[string]interface{}) (json.RawMessage, error) {
+	if t.api != nil {
+		return t.api(method, payload)
+	}
 	body, _ := json.Marshal(payload)
 	resp, err := tgClient.Post(
 		fmt.Sprintf("https://api.telegram.org/bot%s/%s", t.token, method),
@@ -845,7 +968,12 @@ func (t *TGBot) Name() string { return channels.Telegram }
 
 // SendForApproval posts a draft with Approve/Skip/Adjust buttons.
 // Waits for the operator to click a button or send a text reply for adjustment.
-// `approvers` narrows who may decide (empty = any allowed user).
+//
+// Updates reach this waiter through the bot's single update pump (see
+// telegram_pump.go): it registers for its own message id and receives exactly
+// the callbacks aimed at that message, plus adjustment text once it asked for
+// it. It never calls getUpdates itself — two pollers on one Bot API stream
+// each consume the other's taps.
 func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
 	buttons := [][]map[string]string{
 		{
@@ -861,81 +989,73 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 	}
 	log.Printf("[telegram] draft posted (msg_id=%d), waiting for operator action...", msgID)
 
-	// Poll for callback queries (button clicks) or text replies
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	waitingForText := false
+	w := t.pump().register(msgID)
+	defer t.pump().release(msgID)
 
 	for {
 		select {
 		case <-ctx.Done():
 			t.editButtons(msgID, draft+"\n\n[Timed out]", nil)
 			return OperatorDecision{}, fmt.Errorf("approval timeout")
-		case <-ticker.C:
-			updates, err := t.getUpdates()
-			if err != nil {
+		case u := <-w.ch:
+			// Button click on our message
+			if u.CallbackQuery != nil {
+				cb := u.CallbackQuery
+				// Security: verify user is permitted to decide THIS step
+				if !t.isApprover(cb.From.ID, approvers) {
+					t.answerCallback(cb.ID, "") // silent drop
+					log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
+					continue
+				}
+				if !t.rateLimiter.allow(cb.From.ID) {
+					t.answerCallback(cb.ID, "") // silent drop
+					continue
+				}
+				// Must be for our message
+				if cb.Message.MessageID != msgID {
+					continue
+				}
+
+				switch cb.Data {
+				case "approve":
+					t.answerCallback(cb.ID, "Approved")
+					t.editButtons(msgID, draft+"\n\n[Approved]", nil)
+					return OperatorDecision{Action: "approve", ApproverID: cb.From.ID}, nil
+				case "skip":
+					t.answerCallback(cb.ID, "Skipped")
+					t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+					return OperatorDecision{Action: "skip"}, nil
+				case "adjust":
+					t.answerCallback(cb.ID, "Send your adjustment as a text message")
+					w.wantText(true)
+					t.editButtons(msgID, draft+"\n\n[Waiting for adjustment text...]", nil)
+				}
 				continue
 			}
-			for _, u := range updates {
-				// Handle callback query (button click)
-				if u.CallbackQuery != nil {
-					cb := u.CallbackQuery
-					// Security: verify user is permitted to decide THIS step
-					if !t.isApprover(cb.From.ID, approvers) {
-						t.answerCallback(cb.ID, "") // silent drop
-						log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
-						continue
-					}
-					if !t.rateLimiter.allow(cb.From.ID) {
-						t.answerCallback(cb.ID, "") // silent drop
-						continue
-					}
-					// Must be for our message
-					if cb.Message.MessageID != msgID {
-						continue
-					}
 
-					switch cb.Data {
-					case "approve":
-						t.answerCallback(cb.ID, "Approved")
-						t.editButtons(msgID, draft+"\n\n[Approved]", nil)
-						return OperatorDecision{Action: "approve", ApproverID: cb.From.ID}, nil
-					case "skip":
-						t.answerCallback(cb.ID, "Skipped")
-						t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
-						return OperatorDecision{Action: "skip"}, nil
-					case "adjust":
-						t.answerCallback(cb.ID, "Send your adjustment as a text message")
-						waitingForText = true
-						t.editButtons(msgID, draft+"\n\n[Waiting for adjustment text...]", nil)
-					}
+			// Adjustment text, routed here only after Adjust was tapped
+			if u.Message != nil && w.wantsText() && u.Message.Text != "" {
+				// Security checks
+				if u.Message.Chat.ID != t.chatID {
+					continue
+				}
+				if !t.isApprover(u.Message.From.ID, approvers) {
+					log.Printf("[security] REJECTED text from user %d", u.Message.From.ID)
+					continue
+				}
+				if !t.rateLimiter.allow(u.Message.From.ID) {
+					continue
 				}
 
-				// Handle text message (adjustment)
-				if waitingForText && u.Message.Text != "" {
-					// Security checks
-					if u.Message.Chat.ID != t.chatID {
-						continue
-					}
-					if !t.isApprover(u.Message.From.ID, approvers) {
-						log.Printf("[security] REJECTED text from user %d", u.Message.From.ID)
-						continue
-					}
-					if !t.rateLimiter.allow(u.Message.From.ID) {
-						continue
-					}
-
-					// Input validation
-					result := validateOperatorInput(u.Message.Text, t.security)
-					if !result.Clean {
-						log.Printf("[security] %s (user: %d)", result.Reason, u.Message.From.ID)
-						// silent drop — don't tell attacker why input was rejected
-						continue
-					}
-
-					return OperatorDecision{Action: "adjust", Text: result.Text}, nil
+				// Input validation
+				result := validateOperatorInput(u.Message.Text, t.security)
+				if !result.Clean {
+					log.Printf("[security] %s (user: %d)", result.Reason, u.Message.From.ID)
+					// silent drop — don't tell attacker why input was rejected
+					continue
 				}
+
+				return OperatorDecision{Action: "adjust", Text: result.Text}, nil
 			}
 		}
 	}
@@ -977,63 +1097,58 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 	}
 	log.Printf("[telegram] quorum draft posted (msg_id=%d), need=%d distinct approvers...", msgID, need)
 
+	w := t.pump().register(msgID)
+	defer t.pump().release(msgID)
+
 	approved := map[int64]bool{}
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			t.editButtons(msgID, fmt.Sprintf("%s\n\n[Timed out — %d/%d approvals not reached]", draft, len(approved), need), nil)
 			return QuorumDecision{Action: "timeout"}, fmt.Errorf("approval timeout")
-		case <-ticker.C:
-			updates, err := t.getUpdates()
-			if err != nil {
+		case u := <-w.ch:
+			if u.CallbackQuery == nil {
 				continue
 			}
-			for _, u := range updates {
-				if u.CallbackQuery == nil {
-					continue
-				}
-				cb := u.CallbackQuery
-				if !t.isApprover(cb.From.ID, approvers) {
-					t.answerCallback(cb.ID, "") // silent drop
-					log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
-					continue
-				}
-				if !t.rateLimiter.allow(cb.From.ID) {
-					t.answerCallback(cb.ID, "") // silent drop
-					continue
-				}
-				if cb.Message.MessageID != msgID {
-					continue
-				}
+			cb := u.CallbackQuery
+			if !t.isApprover(cb.From.ID, approvers) {
+				t.answerCallback(cb.ID, "") // silent drop
+				log.Printf("[security] REJECTED callback from user %d", cb.From.ID)
+				continue
+			}
+			if !t.rateLimiter.allow(cb.From.ID) {
+				t.answerCallback(cb.ID, "") // silent drop
+				continue
+			}
+			if cb.Message.MessageID != msgID {
+				continue
+			}
 
-				switch cb.Data {
-				case "skip":
-					// A single veto stops the action. Easy to stop, hard to release.
-					t.answerCallback(cb.ID, "Skipped (veto)")
-					t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
-					return QuorumDecision{Action: "skip"}, nil
-				case "adjust":
-					t.answerCallback(cb.ID, "Send your adjustment as a text message")
-					t.editButtons(msgID, draft+"\n\n[Adjustment requested — rewrite will re-enter the gate at 0/"+strconv.Itoa(need)+"]", nil)
-					return QuorumDecision{Action: "adjust"}, nil
-				case "approve":
-					if approved[cb.From.ID] {
-						t.answerCallback(cb.ID, "Already counted")
-						continue
-					}
-					approved[cb.From.ID] = true
-					got := len(approved)
-					if got >= need {
-						t.answerCallback(cb.ID, "Approved — quorum reached")
-						t.editButtons(msgID, fmt.Sprintf("%s\n\n[Approved %d/%d]", draft, got, need), nil)
-						return QuorumDecision{Action: "approve", Approvers: sortedIDs(approved)}, nil
-					}
-					t.answerCallback(cb.ID, fmt.Sprintf("Approved (%d/%d)", got, need))
-					t.editButtons(msgID, tally(got), buttons)
+			switch cb.Data {
+			case "skip":
+				// A single veto stops the action. Easy to stop, hard to release.
+				t.answerCallback(cb.ID, "Skipped (veto)")
+				t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+				return QuorumDecision{Action: "skip"}, nil
+			case "adjust":
+				t.answerCallback(cb.ID, "Send your adjustment as a text message")
+				t.editButtons(msgID, draft+"\n\n[Adjustment requested — rewrite will re-enter the gate at 0/"+strconv.Itoa(need)+"]", nil)
+				return QuorumDecision{Action: "adjust"}, nil
+			case "approve":
+				if approved[cb.From.ID] {
+					t.answerCallback(cb.ID, "Already counted")
+					continue
 				}
+				approved[cb.From.ID] = true
+				got := len(approved)
+				if got >= need {
+					t.answerCallback(cb.ID, "Approved — quorum reached")
+					t.editButtons(msgID, fmt.Sprintf("%s\n\n[Approved %d/%d]", draft, got, need), nil)
+					return QuorumDecision{Action: "approve", Approvers: sortedIDs(approved)}, nil
+				}
+				t.answerCallback(cb.ID, fmt.Sprintf("Approved (%d/%d)", got, need))
+				t.editButtons(msgID, tally(got), buttons)
 			}
 		}
 	}
@@ -1904,7 +2019,9 @@ func handleCommand(cmd string, args string, bot *TGBot, sched *Scheduler, skills
 	case "/run":
 		handleRun(args, bot, sched, cfg, budget, skills)
 	case "/status":
-		handleStatus(bot, budget, sched)
+		handleStatus(bot, budget, sched, cfg)
+	case "/pending":
+		handlePending(bot)
 	case "/emails":
 		handleEmails(args, bot, cfg, budget)
 	case "/reply":
@@ -1916,7 +2033,7 @@ func handleCommand(cmd string, args string, bot *TGBot, sched *Scheduler, skills
 	case "/authcode":
 		handleAuthCode(args, bot)
 	case "/help":
-		bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you")
 	}
 }
 
@@ -2401,7 +2518,7 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 	}()
 }
 
-func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler) {
+func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *config.Config) {
 	states := sched.GetAll()
 	active := 0
 	paused := 0
@@ -2412,9 +2529,56 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler) {
 			active++
 		}
 	}
-	msg := fmt.Sprintf("[status] Engine running\nPipelines: %d active, %d paused\nTokens today: %d\nBudget day start: %s",
-		active, paused, budget.tokensUsedToday, budget.dayStart.Format("15:04:05"))
-	bot.Send(msg)
+	open, oerr := state.OpenApprovals()
+	_ = bot.Send(statusReport(active, paused, budget, cfg, open, oerr, time.Now()))
+}
+
+// statusReport renders /status. Spend is shown against every cap that is
+// configured — the person paying should see how close the day is to its cap
+// without waiting for the next approval prompt to tell them — and open gates
+// are counted so a stuck approval is one line away instead of invisible.
+func statusReport(active, paused int, budget *BudgetTracker, cfg *config.Config, open []statestore.PendingApproval, openErr error, now time.Time) string {
+	lines := []string{
+		"[status] Engine running",
+		fmt.Sprintf("Pipelines: %d active, %d paused", active, paused),
+	}
+	if cap := cfg.Budgets.PerDayTokens; cap > 0 {
+		lines = append(lines, fmt.Sprintf("Tokens today: %d / %d (%.0f%% left)",
+			budget.tokensUsedToday, cap, pctLeft(float64(budget.tokensUsedToday), float64(cap))))
+	} else {
+		lines = append(lines, fmt.Sprintf("Tokens today: %d (no cap)", budget.tokensUsedToday))
+	}
+	if budget.dayCostLimit > 0 {
+		lines = append(lines, fmt.Sprintf("Spend today: %.4f / %.4f (%.0f%% left)",
+			budget.costToday, budget.dayCostLimit, pctLeft(budget.costToday, budget.dayCostLimit)))
+	} else {
+		lines = append(lines, fmt.Sprintf("Spend today: %.4f (no cap)", budget.costToday))
+	}
+	if budget.pipelineCostLimit > 0 {
+		lines = append(lines, fmt.Sprintf("Per-pipeline cap: %.4f", budget.pipelineCostLimit))
+	}
+	if cap := cfg.Budgets.PerDayCalls; cap > 0 {
+		lines = append(lines, fmt.Sprintf("Calls today: %d / %d", budget.callsToday, cap))
+	}
+	if cap := cfg.Budgets.PerDayCallMinutes; cap > 0 {
+		lines = append(lines, fmt.Sprintf("Call minutes today: %d / %d", budget.callMinutesToday, cap))
+	}
+	switch {
+	case openErr != nil:
+		lines = append(lines, "Gates open: unknown ("+openErr.Error()+")")
+	case len(open) == 0:
+		lines = append(lines, "Gates open: 0")
+	default:
+		oldest := open[0].OpenedAt
+		for _, p := range open {
+			if p.OpenedAt.Before(oldest) {
+				oldest = p.OpenedAt
+			}
+		}
+		lines = append(lines, fmt.Sprintf("Gates open: %d (oldest %s ago — /pending)", len(open), humanDuration(now.Sub(oldest))))
+	}
+	lines = append(lines, "Budget day start: "+budget.dayStart.Format("15:04:05"))
+	return strings.Join(lines, "\n")
 }
 
 // --- Main ---
@@ -2496,6 +2660,8 @@ func main() {
 			os.Exit(runAuditVerify(os.Args[2:]))
 		case "runs":
 			os.Exit(runRunsCmd(os.Args[2:]))
+		case "pending":
+			os.Exit(runPendingCmd(os.Args[2:]))
 		case "hitl":
 			os.Exit(runHitlCmd(os.Args[2:]))
 		case "-h", "--help", "help":
@@ -2506,6 +2672,7 @@ func main() {
 			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
+			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			return
@@ -2736,8 +2903,12 @@ func main() {
 		startWebhookServer(&cfg, sched, budget, bot, skillReg)
 	}
 
-	// Drain pending updates
+	// Drain updates that arrived while the engine was down, then start the
+	// single update pump. Every consumer — the command loop below, each
+	// approval waiter — reads from the pump; nothing else calls getUpdates.
 	bot.getUpdates()
+	bot.startPump(2 * time.Second)
+	defer bot.stopPump()
 
 	// Startup notification
 	// No startup message — don't leak that the bot is running to anyone watching the chat
@@ -2760,11 +2931,10 @@ func main() {
 			return
 
 		case <-ticker.C:
-			// 1. Check for operator commands and callbacks
-			updates, err := bot.getUpdates()
-			if err != nil {
-				continue
-			}
+			// 1. Operator commands and callbacks — whatever the update pump
+			// queued for the command loop since the last tick. Approval taps
+			// never arrive here; the pump routes them to their waiter.
+			updates := bot.drainUpdates()
 			for _, u := range updates {
 				// Handle text messages (commands)
 				if u.Message != nil {
@@ -2919,7 +3089,8 @@ Commands the operator can use:
 /cron - view/manage pipeline schedules
 /skills - list skills
 /run <name> - run a pipeline now
-/status - engine status
+/status - engine status, spend against caps, open gates
+/pending - approval gates waiting on the operator
 
 When the operator asks about emails, you can fetch them directly. When they ask for features not yet available (calendar, Slack, etc), say briefly what's needed and that it's on the roadmap. Be direct, concise, no fluff. Remember the conversation context.
 
@@ -3126,7 +3297,9 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	// Mounted on the same server as the webhook trigger so enabling it opens no
 	// additional port. Default-deny lives in the handler.
 	if cfg.ToolGate.Enabled {
-		mux.HandleFunc(toolGatePath, handleToolCall(cfg, gateChannel(bot)))
+		gate := newToolGate(cfg, gateChannel(bot))
+		mux.HandleFunc(toolGatePath, gate.HandleCall)
+		mux.HandleFunc(toolGatePath+"/", gate.HandleStatus)
 		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
 	}
 

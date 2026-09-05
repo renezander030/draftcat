@@ -516,6 +516,15 @@ func (s *StateStore) InterruptedApprovals() ([]PendingApproval, error) {
 	return out, rows.Err()
 }
 
+// OpenApprovals returns the gates currently waiting on a human, oldest first.
+// Same rows as InterruptedApprovals — the difference is who is asking: the
+// reconciler asks at boot, when "still pending" means "orphaned"; the
+// operator's /pending command and `draftcat pending` ask while the engine is
+// live, when it means "waiting on me". Either way the answer is the table.
+func (s *StateStore) OpenApprovals() ([]PendingApproval, error) {
+	return s.InterruptedApprovals()
+}
+
 // MarkInterrupted flips a pending gate to `interrupted`, the terminal state for
 // "the process died before the operator decided". The caller is expected to
 // also write an audit row so the compliance queries see it.

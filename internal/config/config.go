@@ -6,7 +6,14 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
+	"path"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -139,12 +146,46 @@ type ProviderConfig struct {
 	Type      string `yaml:"type"`
 	APIKeyEnv string `yaml:"api_key_env"`
 	BaseURL   string `yaml:"base_url"`
-	apiKey    string
+	// UsageAccounting asks the provider to report what each call actually cost
+	// (OpenRouter: `usage.include`) and enforces the cost caps on that number,
+	// falling back to the configured per-1k rates when the response carries no
+	// cost. Rates alone undercount whenever a model bills reasoning tokens or
+	// discounts cached ones. Omitted = on for OpenRouter, off for any other
+	// OpenAI-compatible endpoint (those reject unknown request fields).
+	UsageAccounting *bool `yaml:"usage_accounting"`
+	// MaxRetries bounds how many times one call is retried on a transient
+	// failure (429, 408, 5xx, network error). 0 = default (3).
+	MaxRetries int `yaml:"max_retries"`
+	apiKey     string
 }
 
 // APIKey / SetAPIKey access the runtime-resolved provider key (never parsed from YAML).
 func (p ProviderConfig) APIKey() string      { return p.apiKey }
 func (p *ProviderConfig) SetAPIKey(s string) { p.apiKey = s }
+
+// IsOpenRouter reports whether the provider is OpenRouter. An empty type has
+// always meant OpenRouter (the key falls back to OPENROUTER_API_KEY).
+func (p ProviderConfig) IsOpenRouter() bool {
+	t := strings.ToLower(strings.TrimSpace(p.Type))
+	return t == "" || t == "openrouter"
+}
+
+// UsageAccountingOn resolves the tri-state: explicit setting wins, otherwise
+// on exactly when the provider is OpenRouter.
+func (p ProviderConfig) UsageAccountingOn() bool {
+	if p.UsageAccounting != nil {
+		return *p.UsageAccounting
+	}
+	return p.IsOpenRouter()
+}
+
+// RetriesOrDefault returns the retry budget for one LLM call.
+func (p ProviderConfig) RetriesOrDefault() int {
+	if p.MaxRetries > 0 {
+		return p.MaxRetries
+	}
+	return 3
+}
 
 type ModelConfig struct {
 	Model     string  `yaml:"model"`
@@ -398,6 +439,55 @@ type ToolGateConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Tools is the allowlist. A name not listed here is denied.
 	Tools []ToolRule `yaml:"tools"`
+	// NotifyDenials tells the operator channel about calls the gate refused
+	// WITHOUT asking a human — an unlisted tool, an argument that failed a
+	// rule with on_mismatch: deny, the repeat guard. A human's own Skip is not
+	// repeated back. Notices are deduplicated per agent+tool+reason inside
+	// notify_window. Omitted = on.
+	NotifyDenials *bool `yaml:"notify_denials"`
+	// NotifyWindow is the dedup window for denial notices. Default 10m.
+	NotifyWindow string `yaml:"notify_window"`
+	// RepeatWindow is how long the gate remembers its decision on an identical
+	// call (same agent, tool and argument hash). Inside it a call the operator
+	// or a rule already denied is denied again without a new prompt, and a rule
+	// with remember_approval reuses an approval. "0" disables. Default 10m.
+	RepeatWindow string `yaml:"repeat_window"`
+	// MaxRepeats caps how many times the identical call may reach the human
+	// inside repeat_window before the gate stops asking and denies. 0 = no cap.
+	MaxRepeats int `yaml:"max_repeats"`
+}
+
+// NotifyDenialsOn resolves the tri-state; omitted means on.
+func (g ToolGateConfig) NotifyDenialsOn() bool {
+	if g.NotifyDenials != nil {
+		return *g.NotifyDenials
+	}
+	return true
+}
+
+// NotifyWindowOrDefault parses notify_window; unparseable or empty = 10m.
+func (g ToolGateConfig) NotifyWindowOrDefault() time.Duration {
+	return durationOr(g.NotifyWindow, 10*time.Minute)
+}
+
+// RepeatWindowOrDefault parses repeat_window; empty = 10m, "0" = off.
+func (g ToolGateConfig) RepeatWindowOrDefault() time.Duration {
+	return durationOr(g.RepeatWindow, 10*time.Minute)
+}
+
+func durationOr(s string, def time.Duration) time.Duration {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	if s == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return def
+	}
+	return d
 }
 
 // ToolRule declares how one named tool call is handled.
@@ -409,6 +499,178 @@ type ToolRule struct {
 	// it. Without this, a listed tool is allowed on the strength of being
 	// listed — which is a real, auditable decision the operator made in config.
 	RequireApproval bool `yaml:"require_approval"`
+	// Args constrains the call's arguments. Each key names a top-level
+	// argument; the call matches the rule only when every constraint holds.
+	// A listed key that is absent from the call is a mismatch unless the
+	// constraint says `optional: true`. What happens on a mismatch is
+	// OnMismatch — the rule never widens on a mismatch, only tightens.
+	Args map[string]ArgConstraint `yaml:"args"`
+	// OnMismatch is what the gate does when the arguments fail the
+	// constraints: "approve" (default) asks a human even if the rule would
+	// otherwise allow silently; "deny" refuses without asking.
+	OnMismatch string `yaml:"on_mismatch"`
+	// RememberApproval lets an identical call (same agent, tool, argument hash)
+	// inside tool_gate.repeat_window reuse an operator's approval instead of
+	// asking again. Off by default: approving one send does not approve the
+	// next, because the next one has the same side effect.
+	RememberApproval bool `yaml:"remember_approval"`
+}
+
+// ArgConstraint is one condition on one argument. Every non-empty field must
+// hold. Values are compared in their string form (numbers without exponent,
+// booleans as true/false, anything structured as compact JSON) except min/max,
+// which need a number.
+type ArgConstraint struct {
+	Equals   interface{} `yaml:"equals"`
+	OneOf    []string    `yaml:"one_of"`
+	Glob     string      `yaml:"glob"`  // path.Match syntax: * ? [...]
+	Regex    string      `yaml:"regex"` // Go RE2, unanchored unless you write ^ $
+	Max      *float64    `yaml:"max"`
+	Min      *float64    `yaml:"min"`
+	Optional bool        `yaml:"optional"`
+}
+
+// Empty reports a constraint with no condition at all — almost certainly a
+// typo'd key, and worth refusing at validate time.
+func (c ArgConstraint) Empty() bool {
+	return c.Equals == nil && len(c.OneOf) == 0 && c.Glob == "" && c.Regex == "" && c.Max == nil && c.Min == nil
+}
+
+// Check returns whether v satisfies the constraint and, when it does not, a
+// short reason naming the failing condition. present=false means the argument
+// was not in the call at all.
+func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
+	if !present {
+		if c.Optional {
+			return true, ""
+		}
+		return false, "missing"
+	}
+	s := ArgString(v)
+	if c.Equals != nil && s != ArgString(c.Equals) {
+		return false, fmt.Sprintf("%q is not %q", clip(s), clip(ArgString(c.Equals)))
+	}
+	if len(c.OneOf) > 0 {
+		found := false
+		for _, o := range c.OneOf {
+			if s == o {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false, fmt.Sprintf("%q is not one of [%s]", clip(s), strings.Join(c.OneOf, ", "))
+		}
+	}
+	if c.Glob != "" {
+		ok, err := path.Match(c.Glob, s)
+		if err != nil || !ok {
+			return false, fmt.Sprintf("%q does not match glob %q", clip(s), c.Glob)
+		}
+	}
+	if c.Regex != "" {
+		re, err := regexp.Compile(c.Regex)
+		if err != nil || !re.MatchString(s) {
+			return false, fmt.Sprintf("%q does not match regex %q", clip(s), c.Regex)
+		}
+	}
+	if c.Max != nil || c.Min != nil {
+		f, ok := argNumber(v)
+		if !ok {
+			return false, fmt.Sprintf("%q is not a number", clip(s))
+		}
+		if c.Max != nil && f > *c.Max {
+			return false, fmt.Sprintf("%s exceeds max %s", s, strconv.FormatFloat(*c.Max, 'f', -1, 64))
+		}
+		if c.Min != nil && f < *c.Min {
+			return false, fmt.Sprintf("%s is below min %s", s, strconv.FormatFloat(*c.Min, 'f', -1, 64))
+		}
+	}
+	return true, ""
+}
+
+// ArgString renders an argument value the way constraints compare it.
+func ArgString(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case bool:
+		return strconv.FormatBool(x)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 64)
+	case int:
+		return strconv.Itoa(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case json.Number:
+		return x.String()
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(b)
+	}
+}
+
+func argNumber(v interface{}) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case json.Number:
+		f, err := x.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func clip(s string) string {
+	if len(s) > 80 {
+		return s[:77] + "..."
+	}
+	return s
+}
+
+// MatchArgs checks the call's arguments against the rule. It returns true when
+// the rule has no constraints or all of them hold; otherwise false and a
+// one-line reason naming the first failing argument. Keys are checked in
+// sorted order so the reason is stable.
+func (t ToolRule) MatchArgs(args map[string]interface{}) (bool, string) {
+	if len(t.Args) == 0 {
+		return true, ""
+	}
+	keys := make([]string, 0, len(t.Args))
+	for k := range t.Args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v, present := args[k]
+		if ok, why := t.Args[k].Check(v, present); !ok {
+			return false, k + ": " + why
+		}
+	}
+	return true, ""
+}
+
+// DeniesOnMismatch reports whether an argument mismatch is refused outright
+// rather than escalated to a human.
+func (t ToolRule) DeniesOnMismatch() bool {
+	return strings.EqualFold(strings.TrimSpace(t.OnMismatch), "deny")
 }
 
 // RiskOf returns the rule's declared risk, defaulting to normal.
