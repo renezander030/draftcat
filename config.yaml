@@ -68,6 +68,23 @@ observability:
 #   secret_env: DRAFTCAT_WEBHOOK_SECRET   # required when enabled (bearer token)
 #   max_body_bytes: 65536
 
+# Tool-call gate for an agent's MCP/SDK calls — POST /gate/tool-call on the
+# webhook listener (requires webhook.enabled). Anything not listed is denied.
+# See docs/tool-gate.md.
+# tool_gate:
+#   enabled: true
+#   repeat_window: 10m        # remember a decision on an identical call; 0 = off
+#   max_repeats: 3            # prompts allowed per identical call inside the window; 0 = no cap
+#   notify_denials: true      # tell the operator about denials the gate made on its own
+#   tools:
+#     - name: read_calendar                     # listed without approval = allowed, audited
+#     - name: send_email
+#       risk: high
+#       require_approval: true
+#       args:
+#         to: {glob: "*@example.com"}           # arguments inside the rule → ask as usual
+#       on_mismatch: deny                       # outside it → refuse without asking
+
 pipelines:
   # Uses skill reference instead of inline prompt
   - name: test-screener

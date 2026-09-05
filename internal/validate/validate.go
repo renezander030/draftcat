@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -563,6 +564,21 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 	if len(cfg.ToolGate.Tools) == 0 {
 		rep.warnf("tool_gate.tools", "empty allowlist — every tool call will be denied")
 	}
+	for _, f := range []struct{ key, val string }{
+		{"repeat_window", cfg.ToolGate.RepeatWindow},
+		{"notify_window", cfg.ToolGate.NotifyWindow},
+	} {
+		v := strings.TrimSpace(f.val)
+		if v == "" || v == "0" {
+			continue
+		}
+		if d, err := time.ParseDuration(v); err != nil || d < 0 {
+			rep.errf("tool_gate."+f.key, "must be a duration like 10m, or 0 to disable (got %q)", f.val)
+		}
+	}
+	if cfg.ToolGate.MaxRepeats < 0 {
+		rep.errf("tool_gate.max_repeats", "must be 0 (no cap) or a positive count (got %d)", cfg.ToolGate.MaxRepeats)
+	}
 	seen := map[string]bool{}
 	for i, t := range cfg.ToolGate.Tools {
 		p := fmt.Sprintf("tool_gate.tools[%d]", i)
@@ -582,6 +598,55 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		// shape of the gap this gate exists to close.
 		if strings.EqualFold(t.Risk, config.RiskHigh) && !t.RequireApproval {
 			rep.errf(p+".require_approval", "tool %q is declared high risk but is allowed without approval", t.Name)
+		}
+		switch strings.ToLower(strings.TrimSpace(t.OnMismatch)) {
+		case "", "approve", "deny":
+		default:
+			rep.errf(p+".on_mismatch", "must be approve or deny (got %q)", t.OnMismatch)
+		}
+		if t.OnMismatch != "" && len(t.Args) == 0 {
+			rep.warnf(p+".on_mismatch", "set without any args constraints — it never applies")
+		}
+		if t.RememberApproval && !t.RequireApproval {
+			rep.warnf(p+".remember_approval", "tool %q never asks a human, so there is no approval to remember", t.Name)
+		}
+		if t.RememberApproval && strings.EqualFold(t.Risk, config.RiskHigh) {
+			rep.errf(p+".remember_approval", "tool %q is high risk — every call must be decided by a human", t.Name)
+		}
+		checkArgConstraints(t, p, rep)
+	}
+}
+
+// checkArgConstraints validates one rule's `args:` block. A malformed regex or
+// glob would otherwise fail every call at runtime (which is safe, but useless),
+// and an empty constraint is almost always a typo'd condition key.
+func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
+	keys := make([]string, 0, len(t.Args))
+	for k := range t.Args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		c := t.Args[k]
+		ap := fmt.Sprintf("%s.args.%s", p, k)
+		if strings.TrimSpace(k) == "" {
+			rep.errf(ap, "argument name is required")
+		}
+		if c.Empty() {
+			rep.errf(ap, "no condition — use equals, one_of, glob, regex, min or max")
+		}
+		if c.Regex != "" {
+			if _, err := regexp.Compile(c.Regex); err != nil {
+				rep.errf(ap+".regex", "does not compile: %v", err)
+			}
+		}
+		if c.Glob != "" {
+			if _, err := path.Match(c.Glob, ""); err != nil {
+				rep.errf(ap+".glob", "bad pattern %q", c.Glob)
+			}
+		}
+		if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
+			rep.errf(ap, "min %v is greater than max %v", *c.Min, *c.Max)
 		}
 	}
 }

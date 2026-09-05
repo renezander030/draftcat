@@ -16,9 +16,9 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
-> **New in v0.5.0:** approvals reach any operator surface via the [`hitl/v0` protocol](docs/hitl-protocol.md) — Microsoft Teams through a Power Automate flow in your own tenant, with no bot and no Azure app registration. Plus a tool-call gate for an agent's MCP/SDK calls (`POST /gate/tool-call`), risk tiers with pre-declared `approval_policy` exemptions, run-correlated audit rows, spend shown at the moment of decision, and `escalate_after` reminders before a gate times out.
+> **New in v0.6.0:** the gate holds under load. The [tool-call gate](docs/tool-gate.md) answers asynchronously (`mode: async`, `wait:`) so a harness with a short HTTP timeout never loses a decision, and a tool call waiting on a human is durable across a restart. Rules constrain arguments (`args:` — glob, regex, `one_of`, `min`/`max`) and never widen on a mismatch. A repeat guard stops an agent that loops on one call from paging you, the operator hears about denials the gate made on its own, `/pending` and `draftcat pending` list every open gate, `/status` shows spend against caps, cost caps enforce the provider's real charge, rate limits back off instead of failing the run — and one Telegram update pump fixes taps that were silently lost while two gates were open at once.
 >
-> **In v0.4.0:** approval gates survive a restart, spend caps in money (`per_day_cost`), per-step `approvers`, body-signed webhooks (`require_signature`), config validated on the boot path with did-you-mean hints, `draftcat runs` to read the audit trail back, and WhatsApp intake (`whatsapp_intake`).
+> **In v0.5.0:** approvals reach any operator surface via the [`hitl/v0` protocol](docs/hitl-protocol.md) — Microsoft Teams through a Power Automate flow in your own tenant, with no bot and no Azure app registration. Plus a tool-call gate for an agent's MCP/SDK calls (`POST /gate/tool-call`), risk tiers with pre-declared `approval_policy` exemptions, run-correlated audit rows, spend shown at the moment of decision, and `escalate_after` reminders before a gate times out.
 
 ![Demo](demo.gif)
 
@@ -54,10 +54,13 @@ However your agent runs, draftcat sits between it and your customer systems as a
 ## Governance
 
 - **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
-- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money, using the same unit as your model rates. The approval prompt shows what the run has spent, so the person releasing the action sees the number first.
+- **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money. On OpenRouter the caps are enforced on the charge the provider reports for each call (cached and reasoning tokens included); elsewhere on your configured per-1k rates. The approval prompt shows what the run has spent, and `/status` shows the day against every cap.
 - **Human-in-the-loop** — every outbound action requires an explicit operator decision, made live or declared in advance.
 - **Any operator channel** — the [`hitl/v0` protocol](docs/hitl-protocol.md) keeps draftcat as the gate and lets an untrusted relay own presentation. Teams runs through a Power Automate flow in your own tenant: no bot, no Azure app registration, no admin consent. Check yours with `draftcat hitl verify <relay-url>`.
-- **Tool-call gate** — `POST /gate/tool-call` puts an agent's MCP or SDK calls through the same gate as a pipeline step. Denies by default; the approval binds to a hash of the exact arguments.
+- **Tool-call gate** — `POST /gate/tool-call` puts an agent's MCP or SDK calls through the same gate as a pipeline step. Denies by default; the approval binds to a hash of the exact arguments. Rules can constrain the arguments themselves (`args:`) and a mismatch only ever tightens — ask a human, or refuse. A decision that needs a human can be collected asynchronously (`mode: async`, `wait:`, `GET /gate/tool-call/<id>`), and the open gate is durable across a restart. See [`docs/tool-gate.md`](docs/tool-gate.md).
+- **Repeat guard** — inside `repeat_window` an identical tool call (same agent, tool, arguments) gets the gate's remembered answer instead of a new prompt: a denied call stays denied, an in-flight call joins the open prompt, and `max_repeats` stops a looping agent from paging you.
+- **Denial notices** — a refusal the gate makes on its own (unlisted tool, argument outside a rule, repeat guard) is reported to the operator channel, one notice per agent, tool and reason per window, so nothing is refused silently.
+- **Open gates** — `/pending` on the channel and `draftcat pending` on the host list every approval waiting on a human, pipeline steps and tool calls alike, with how long each has waited and how long it has left.
 - **Risk tiers** — steps declare `risk: low | normal | high`, and `approval_policy` can pre-approve a declared class. High risk never qualifies, and each exemption is audited as `policy_approve` with the rule that fired.
 - **Escalation** — `escalate_after` re-notifies before a gate times out; `escalate_to` widens who is told, never who may decide.
 - **Durable, run-correlated gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart, and each decision records the run it released.
@@ -211,7 +214,23 @@ An approval step can narrow who may decide it:
   approvers: [111111, 222222]   # which ones (subset of allowed_users)
 ```
 
-Cost caps are checked between calls: a call is refused once spend has reached the cap. Pair them with `per_step_tokens` to bound the size of any single call.
+Cost caps are checked between calls: a call is refused once spend has reached the cap. Pair them with `per_step_tokens` to bound the size of any single call. A transient provider failure (429, 408, 5xx) is retried with backoff — honouring `Retry-After` — before it fails a step; `provider.max_retries` sets the budget.
+
+The tool-call gate is configured the same way, per tool:
+
+```yaml
+tool_gate:
+  enabled: true                       # served on the webhook listener
+  repeat_window: 10m                  # identical call → same answer, no second prompt
+  tools:
+    - name: read_calendar             # listed = allowed, audited
+    - name: send_email
+      risk: high
+      require_approval: true
+      args:
+        to: {glob: "*@example.com"}   # inside the rule: ask as usual
+      on_mismatch: deny               # outside it: refuse without asking
+```
 
 Skills are YAML prompt templates in `skills/` with an `output_schema` the engine enforces. With `-tags voice`, a `voice:` block configures the webhook receivers, Dograh endpoints, and pre-call lookup — see [docs/voice.md](docs/voice.md).
 
@@ -222,6 +241,7 @@ draftcat                       # run the engine (validates config first; refuses
 draftcat validate [--strict]   # lint config + skills
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
+draftcat pending               # approval gates waiting on a human right now (--json)
 draftcat audit-verify          # verify signed approval receipts
 draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
