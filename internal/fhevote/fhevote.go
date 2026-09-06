@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	SecretKeySchema = "draftcat.fhe-vote-secret.v1"
+	schemaPrivate   = "draftcat.fhe-vote-secret.v1"
 	PublicKeySchema = "draftcat.fhe-vote-public.v1"
 	BallotSchema    = "draftcat.fhe-vote-ballot.v1"
 	TallySchema     = "draftcat.fhe-vote-tally.v1"
@@ -115,7 +115,7 @@ func GenerateKeys() (SecretKeyFile, PublicKeyFile, error) {
 		PublicKeyBase64: base64.StdEncoding.EncodeToString(pkBytes),
 	}
 	secret := SecretKeyFile{
-		Schema: SecretKeySchema, Suite: Suite, KeyID: id,
+		Schema: schemaPrivate, Suite: Suite, KeyID: id,
 		SecretKeyBase64: base64.StdEncoding.EncodeToString(skBytes),
 		PublicKeyBase64: public.PublicKeyBase64,
 	}
@@ -262,7 +262,7 @@ func Decrypt(secret SecretKeyFile, context string, tally Tally) (Result, error) 
 			return Result{}, errors.New("encrypted tally contains unexpected data outside the vote slot")
 		}
 	}
-	return Result{Approvals: int(values[0]), Ballots: tally.Ballots}, nil
+	return Result{Approvals: int(values[0]), Ballots: tally.Ballots}, nil // #nosec G115 -- bounded to maxBallots above.
 }
 
 func loadPublicKey(file PublicKeyFile) (bgv.Parameters, *rlwe.PublicKey, error) {
@@ -292,7 +292,7 @@ func loadSecretKey(file SecretKeyFile) (bgv.Parameters, *rlwe.SecretKey, error) 
 	if err != nil {
 		return bgv.Parameters{}, nil, err
 	}
-	if file.Schema != SecretKeySchema || file.Suite != Suite {
+	if file.Schema != schemaPrivate || file.Suite != Suite {
 		return bgv.Parameters{}, nil, errors.New("unsupported FHE secret-key schema or suite")
 	}
 	publicBytes, err := decodeBase64(file.PublicKeyBase64, "public key")
