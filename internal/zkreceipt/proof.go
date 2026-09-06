@@ -98,7 +98,7 @@ func GenerateArtifacts(directory string) error {
 	if err != nil {
 		return fmt.Errorf("Groth16 setup: %w", err)
 	}
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return err
 	}
 	artifacts := []struct {
@@ -116,7 +116,7 @@ func GenerateArtifacts(directory string) error {
 		if _, err := artifact.writer.WriteTo(&buffer); err != nil {
 			return fmt.Errorf("serialize %s: %w", artifact.name, err)
 		}
-		if err := os.WriteFile(filepath.Join(directory, artifact.name), buffer.Bytes(), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(directory, artifact.name), buffer.Bytes(), 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", artifact.name, err)
 		}
 	}

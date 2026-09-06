@@ -153,6 +153,7 @@ func resolveZKStatePath(configPath string) string {
 	if value := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); value != "" {
 		return value
 	}
+	// #nosec G304 -- the operator explicitly chooses which local Draftcat config to read.
 	if data, err := os.ReadFile(configPath); err == nil {
 		var cfg config.Config
 		if yaml.Unmarshal(data, &cfg) == nil && strings.TrimSpace(cfg.State.Path) != "" {
@@ -173,6 +174,7 @@ func runZKReceiptVerify(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: draftcat zk-receipt verify --expect-key <commitment> <proof.json>")
 		return 2
 	}
+	// #nosec G304 -- the proof bundle path is the explicit CLI input to verify.
 	data, err := os.ReadFile(flags.Arg(0))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "read proof: %v\n", err)
