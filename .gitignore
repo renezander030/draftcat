@@ -4,6 +4,8 @@ draftcat
 *.env
 *.key
 *.secret
+fhe-secret.json
+*.fhe-secret.json
 secrets.yaml
 state.db
 state.db-shm

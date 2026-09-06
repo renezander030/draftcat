@@ -2660,6 +2660,8 @@ func main() {
 			os.Exit(runAuditVerify(os.Args[2:]))
 		case "zk-receipt":
 			os.Exit(runZKReceiptCmd(os.Args[2:]))
+		case "fhe-vote":
+			os.Exit(runFHEVoteCmd(os.Args[2:]))
 		case "runs":
 			os.Exit(runRunsCmd(os.Args[2:]))
 		case "pending":
@@ -2677,6 +2679,7 @@ func main() {
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat zk-receipt <command>          prove an approval without revealing its private fields")
+			fmt.Println("  draftcat fhe-vote <command>             count encrypted approval votes without reading them")
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			return
 		}
