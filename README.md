@@ -16,6 +16,29 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
+## Prove approval without sharing the customer data
+
+Sometimes a customer, auditor, or partner needs evidence that a human approved an AI action — but should **not** receive the message, the reviewer's identity, or your internal workflow. Draftcat can turn a signed approval row into a zero-knowledge proof:
+
+| The verifier learns | What stays private |
+| --- | --- |
+| A direct human approval was recorded | Customer message and payload hash |
+| The required reviewer quorum was met | Reviewer identity and exact vote counts |
+| The proof came from the Draftcat instance key they pinned | Pipeline, step, time, nonce, and instance secret |
+
+```bash
+# Operator: publish this commitment once through a trusted channel.
+./draftcat zk-receipt key-id
+
+# Operator: create a shareable proof for the latest human approval.
+./draftcat zk-receipt prove --out approval.proof.json invoice-due-diligence
+
+# Customer or auditor: verify it without DRAFTCAT_APPROVAL_SECRET or database access.
+./draftcat zk-receipt verify --expect-key <pinned-key-commitment> approval.proof.json
+```
+
+This is an **experimental cryptographic preview**, not a production compliance claim. It uses an embedded BN254/Groth16 circuit and a development single-party setup; the circuit has not received an independent audit. Use it to evaluate the disclosure model, then replace the setup through a ceremony before relying on it in production. See [zero-knowledge approval proofs](docs/zk-approval-proofs.md) for the trust model, exact statement, and limitations.
+
 > **New in v0.6.0:** the gate holds under load. The [tool-call gate](docs/tool-gate.md) answers asynchronously (`mode: async`, `wait:`) so a harness with a short HTTP timeout never loses a decision, and a tool call waiting on a human is durable across a restart. Rules constrain arguments (`args:` — glob, regex, `one_of`, `min`/`max`) and never widen on a mismatch. A repeat guard stops an agent that loops on one call from paging you, the operator hears about denials the gate made on its own, `/pending` and `draftcat pending` list every open gate, `/status` shows spend against caps, cost caps enforce the provider's real charge, rate limits back off instead of failing the run — and one Telegram update pump fixes taps that were silently lost while two gates were open at once.
 >
 > **In v0.5.0:** approvals reach any operator surface via the [`hitl/v0` protocol](docs/hitl-protocol.md) — Microsoft Teams through a Power Automate flow in your own tenant, with no bot and no Azure app registration. Plus a tool-call gate for an agent's MCP/SDK calls (`POST /gate/tool-call`), risk tiers with pre-declared `approval_policy` exemptions, run-correlated audit rows, spend shown at the moment of decision, and `escalate_after` reminders before a gate times out.
@@ -68,6 +91,7 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
 - **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
+- **Private approval proofs** — share proof that a direct human approval met quorum without sharing the action, approver, or counts; see [`docs/zk-approval-proofs.md`](docs/zk-approval-proofs.md).
 - **Rate limiting** — per-user, per-minute caps on operator interactions.
 - **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
 - **Config validated on boot** — the engine runs the same checks as `draftcat validate` at startup and refuses to start on errors, so problems surface at boot rather than mid-run. `DRAFTCAT_SKIP_VALIDATE=1` overrides.
