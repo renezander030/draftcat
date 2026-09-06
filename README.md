@@ -16,6 +16,32 @@
 
 Draftcat runs YAML-defined pipelines that triage email, qualify leads, draft replies, extract data from PDFs, and govern self-hosted voice AI. Every outbound action passes an operator approval gate, every LLM call is budget-checked, and every fetched item is deduped against a SQLite state store. One business per instance, self-hosted, auditable.
 
+## Let a server count votes it cannot read
+
+A normal approval server sees how every person voted. Draftcat's experimental **FHE encrypted tally** lets three or more reviewers turn `approve` or `reject` into unreadable ciphertext on their own machines. A collector combines those files without opening them; only the key owner can reveal the final count and learn whether quorum was met.
+
+```text
+reviewers encrypt votes  →  collector adds unreadable ballots  →  key owner opens one total
+                              collector never sees yes or no
+```
+
+```bash
+# Once per vote: create the private key and the public key reviewers receive.
+./draftcat fhe-vote keygen
+
+# Each reviewer encrypts locally. The readable vote is never sent.
+./draftcat fhe-vote encrypt --public fhe-public.json --context invoice-4821 \
+  --ballot <unique-random-invite> --vote approve --out reviewer.vote.json
+
+# The collector combines 3+ encrypted ballots; the owner alone opens the result.
+./draftcat fhe-vote tally --public fhe-public.json --context invoice-4821 \
+  --out tally.json alice.vote.json bob.vote.json carol.vote.json
+./draftcat fhe-vote decrypt --secret fhe-secret.json --context invoice-4821 \
+  --expected 3 --quorum 2 tally.json
+```
+
+**Use it when** separate teams, companies, or committee members need a shared approval but the tally host must not know individual votes. Keep the collector separate from the key owner and give the key owner only the final tally. **Skip it when** the same trusted Draftcat owner may see the votes, fewer than three people vote, or you need a public audit receipt—the zero-knowledge feature below is for that. Ciphertext files are still sent; the plaintext votes are not. Read the [encrypted vote walkthrough and threat model](docs/fhe-vote-tally.md) before evaluating it.
+
 ## Prove approval without sharing the customer data
 
 Sometimes a customer, auditor, or partner needs evidence that a human approved an AI action — but should **not** receive the message, the reviewer's identity, or your internal workflow. Draftcat can turn a signed approval row into a zero-knowledge proof:
@@ -92,6 +118,7 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
 - **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
 - **Private approval proofs** — share proof that a direct human approval met quorum without sharing the action, approver, or counts; see [`docs/zk-approval-proofs.md`](docs/zk-approval-proofs.md).
+- **Encrypted approval tally** — combine three or more encrypted votes without letting the collector read any individual vote; see [`docs/fhe-vote-tally.md`](docs/fhe-vote-tally.md).
 - **Rate limiting** — per-user, per-minute caps on operator interactions.
 - **Channel security** — allowed-user lists + input-length limits enforced at startup; the engine refuses to start without them.
 - **Config validated on boot** — the engine runs the same checks as `draftcat validate` at startup and refuses to start on errors, so problems surface at boot rather than mid-run. `DRAFTCAT_SKIP_VALIDATE=1` overrides.
