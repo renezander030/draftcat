@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ func TestV2SchemaMigratesExistingApprovalRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`CREATE TABLE action_approvals (
+	_, err = db.ExecContext(context.Background(), `CREATE TABLE action_approvals (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, pipeline TEXT NOT NULL, step TEXT NOT NULL,
 		decided_at INTEGER NOT NULL, decision TEXT NOT NULL, operator_id INTEGER NOT NULL,
 		payload_hash TEXT NOT NULL, quorum_n INTEGER NOT NULL DEFAULT 1,
