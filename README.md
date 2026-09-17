@@ -129,6 +129,17 @@ However your agent runs, draftcat sits between it and your customer systems as a
 
 ## Quickstart
 
+Install the native binary through npm (Node.js 18 or newer):
+
+```bash
+npm install -g draftcat
+draftcat --help
+```
+
+The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required.
+
+Or build from source:
+
 ```bash
 git clone https://github.com/renezander030/draftcat.git && cd draftcat
 cp secrets.yaml.example secrets.yaml   # operator IDs + API keys

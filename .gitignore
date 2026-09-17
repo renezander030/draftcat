@@ -12,3 +12,4 @@ state.db-shm
 state.db-wal
 aiops-architecture-diagram.py
 draftyard
+/npm/bin/

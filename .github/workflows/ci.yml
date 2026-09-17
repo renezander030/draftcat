@@ -11,8 +11,13 @@ jobs:
         with: { fetch-depth: 0 }   # needed for only-new-issues / --new-from-rev
       - uses: actions/setup-go@v5
         with: { go-version: "1.25" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
       - run: go build ./...
       - run: go test -count=1 -short -timeout 60s ./...
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm pack --dry-run
       # Config validation gates on ERRORS (exit 1). It is intentionally NOT
       # --strict: many warnings are environment-dependent (empty API-key env
       # vars at lint time) and advisory, so they must not fail CI.
