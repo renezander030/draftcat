@@ -45,6 +45,18 @@ roles:
   classifier: gpt-4o-mini
   drafter: gpt-4o-mini
 
+# Ordered checks applied before model input is sent and after output returns.
+# A matching rule can fail closed or enter the normal operator approval gate.
+# model_policy:
+#   max_preview_chars: 800
+#   rules:
+#     - id: credentials-in-input
+#       phase: input             # input | output | both
+#       roles: [drafter]         # optional; empty means every role
+#       pattern: '(?i)(api[_ -]?key|password)'
+#       action: review           # deny | review
+#       reason: Credentials require an explicit operator decision.
+
 budgets:
   per_step_tokens: 2048
   per_pipeline_tokens: 10000
@@ -67,9 +79,14 @@ observability:
 #   addr: 127.0.0.1:8088
 #   secret_env: DRAFTCAT_WEBHOOK_SECRET   # required when enabled (bearer token)
 #   max_body_bytes: 65536
+#   require_signature: true               # also signs gate POST bodies when enabled
+# GET /healthz reports liveness. GET /readyz checks SQLite. Accepted triggers
+# return an admission_id for authenticated GET /hooks/status/<admission_id>.
 
-# Tool-call gate for an agent's MCP/SDK calls — POST /gate/tool-call on the
-# webhook listener (requires webhook.enabled). Anything not listed is denied.
+# Tool-call gate for an agent's MCP/SDK calls - POST /gate/tool-call on the
+# webhook listener (requires webhook.enabled). Every route requires the webhook
+# bearer token. Send a stable action_id and consume an allowed binding once at
+# POST /gate/tool-call/<action_id>/consume before executing the side effect.
 # See docs/tool-gate.md.
 # tool_gate:
 #   enabled: true
@@ -82,8 +99,8 @@ observability:
 #       risk: high
 #       require_approval: true
 #       args:
-#         to: {glob: "*@example.com"}           # arguments inside the rule → ask as usual
-#       on_mismatch: deny                       # outside it → refuse without asking
+#         to: {glob: "*@example.com"}           # arguments inside the rule: ask as usual
+#       on_mismatch: deny                       # outside it: refuse without asking
 
 pipelines:
   # Uses skill reference instead of inline prompt

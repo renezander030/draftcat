@@ -539,6 +539,9 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 	if !ok {
 		return nil, fmt.Errorf("unknown model: %s", modelName)
 	}
+	if err := enforceModelPolicy(ctx, cfg, role, "input", prompt); err != nil {
+		return nil, err
+	}
 
 	reqBody := map[string]interface{}{
 		"model": modelCfg.Model,
@@ -635,6 +638,9 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 	}
 	if len(result.Choices) == 0 {
 		return nil, fmt.Errorf("LLM returned no choices")
+	}
+	if err := enforceModelPolicy(ctx, cfg, role, "output", result.Choices[0].Message.Content); err != nil {
+		return nil, err
 	}
 
 	// The configured rates are the fallback. When the provider states what it
@@ -1704,24 +1710,10 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				sum := sha256.Sum256([]byte(payload))
 				payloadHash := hex.EncodeToString(sum[:])
 
-				// One timestamp feeds both the signature and the row — reading
-				// time.Now() twice could straddle a second boundary and produce a
-				// receipt that never verifies.
-				var nonce, sig string
-				if len(approvalSecret) > 0 {
-					n, nerr := approval.NewNonce()
-					if nerr != nil {
-						log.Printf("[pipeline:%s][step:%s] approval nonce failed, recording unsigned: %v", pipeline.Name, step.Name, nerr)
-					} else {
-						nonce = n
-						sig = approval.Sign(approvalSecret, approval.Fields{
-							Pipeline: pipeline.Name, Step: step.Name, DecidedAt: decidedAt.Unix(),
-							Decision: decision, OperatorID: opID, PayloadHash: payloadHash,
-							QuorumN: quorumN, QuorumGot: got,
-						}, nonce)
-					}
-				}
-				if e := state.RecordApprovalForRun(runID, pipeline.Name, step.Name, decidedAt, decision, opID, payloadHash, quorumN, got, nonce, sig); e != nil {
+				envelope := newApprovalEnvelope(approvalSecret, runID, pipeline.Name, step,
+					decidedAt, decidedAt.Add(approvalTimeout), decision, opID, payloadHash,
+					quorumN, got, "human-approval")
+				if e := state.RecordApprovalV2(envelope); e != nil {
 					log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
 				}
 			}
@@ -1754,8 +1746,11 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				log.Printf("[pipeline:%s][step:%s] released by approval_policy (%s) — no operator prompt", pipeline.Name, step.Name, reason)
 				obs.RecordApproval(pipeline.Name, step.Name, "policy_approve")
 				if state != nil {
-					if e := state.RecordApprovalRow(runID, pipeline.Name, step.Name, time.Now(),
-						"policy_approve", 0, ph, quorumN, quorumN, "", "", reason); e != nil {
+					decidedAt := time.Now()
+					envelope := newApprovalEnvelope(approvalSecret, runID, pipeline.Name, step,
+						decidedAt, decidedAt.Add(approvalTimeout), "policy_approve", 0, ph,
+						quorumN, quorumN, reason)
+					if e := state.RecordApprovalV2(envelope); e != nil {
 						log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
 					}
 				}
@@ -2666,6 +2661,8 @@ func main() {
 			os.Exit(runRunsCmd(os.Args[2:]))
 		case "pending":
 			os.Exit(runPendingCmd(os.Args[2:]))
+		case "receipts":
+			os.Exit(runReceiptsCmd(os.Args[2:]))
 		case "hitl":
 			os.Exit(runHitlCmd(os.Args[2:]))
 		case "-h", "--help", "help":
@@ -2677,6 +2674,7 @@ func main() {
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
+			fmt.Println("  draftcat receipts <list|show|export>   inspect and export verification-ready receipts")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat zk-receipt <command>          prove an approval without revealing its private fields")
 			fmt.Println("  draftcat fhe-vote <command>             count encrypted approval votes without reading them")
@@ -2864,6 +2862,9 @@ func main() {
 	// engine starts, so no gate is left in an unknown state and no stale button
 	// looks live. Needs the bot, hence its position after it.
 	reconcileInterruptedApprovals(state, opChan)
+	if err := state.InterruptWebhookAdmissions(time.Now()); err != nil {
+		log.Printf("[webhook] reconcile admissions: %v", err)
+	}
 
 	// Observability — structured span emission (off unless opted in).
 	if cfg.Observ.Spans || os.Getenv("DRAFTCAT_TRACE") != "" {
@@ -3299,15 +3300,92 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	hookable := webhookPipelines(cfg)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if state == nil || state.Ping(ctx) != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"status\":\"ready\"}\n"))
+	})
 	// Tool-call gate: an agent harness asks permission for one tool call.
 	// Mounted on the same server as the webhook trigger so enabling it opens no
 	// additional port. Default-deny lives in the handler.
 	if cfg.ToolGate.Enabled {
 		gate := newToolGate(cfg, gateChannel(bot))
-		mux.HandleFunc(toolGatePath, gate.HandleCall)
-		mux.HandleFunc(toolGatePath+"/", gate.HandleStatus)
+		gateAuth := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				const prefix = "Bearer "
+				got := r.Header.Get("Authorization")
+				if !strings.HasPrefix(got, prefix) ||
+					subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				if r.Method == http.MethodPost {
+					body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					sigHeader := r.Header.Get(webhookSigHeader)
+					if sigHeader != "" || cfg.Webhook.RequireSignature {
+						if err := verifyWebhookSignature(sigHeader, body, secret, maxSkew, time.Now()); err != nil {
+							log.Printf("[tool-gate][security] signature rejected: %v", err)
+							http.Error(w, "unauthorized", http.StatusUnauthorized)
+							return
+						}
+					}
+				}
+				next.ServeHTTP(w, r)
+			})
+		}
+		mux.Handle(toolGatePath, gateAuth(http.HandlerFunc(gate.HandleCall)))
+		mux.Handle(toolGatePath+"/", gateAuth(http.HandlerFunc(gate.HandleStatus)))
 		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
 	}
+
+	mux.HandleFunc("/hooks/status/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		const prefix = "Bearer "
+		got := r.Header.Get("Authorization")
+		if !strings.HasPrefix(got, prefix) ||
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/hooks/status/")
+		if !validActionID(id) || state == nil {
+			http.Error(w, "admission not found", http.StatusNotFound)
+			return
+		}
+		a, err := state.WebhookAdmission(id)
+		if err != nil {
+			http.Error(w, "admission not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"admission_id": a.ID, "pipeline": a.Pipeline, "body_hash": a.BodyHash,
+			"status": a.Status, "error": a.Error,
+			"created_at": a.CreatedAt.UTC().Format(time.RFC3339),
+			"updated_at": a.UpdatedAt.UTC().Format(time.RFC3339),
+		})
+	})
 
 	mux.HandleFunc("/hooks/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -3353,8 +3431,24 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			return
 		}
 
+		admissionID := "wh_" + strings.TrimPrefix(newToolTicketID(), "tc_")
+		bodySum := sha256.Sum256(body)
+		bodyHash := "sha256:" + hex.EncodeToString(bodySum[:])
+		now := time.Now()
+		if state != nil {
+			if err := state.BeginWebhookAdmission(statestore.WebhookAdmission{
+				ID: admissionID, Pipeline: name, BodyHash: bodyHash, CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				sched.SetRunning(name, false)
+				log.Printf("[webhook] durable admission failed: %v", err)
+				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			_ = state.FinishWebhookAdmission(admissionID, "running", "", now)
+		}
+
 		log.Printf("[webhook] triggering pipeline %s (%d body bytes)", name, len(body))
-		go func(p config.PipelineConfig, body []byte) {
+		go func(p config.PipelineConfig, body []byte, admissionID string) {
 			defer sched.SetRunning(p.Name, false)
 			seed := map[string]interface{}{"webhook_body": string(body)}
 			if strings.TrimSpace(string(body)) != "" {
@@ -3363,12 +3457,22 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			if err := runPipeline(cfg, p, budget, gateChannel(bot), skills, seed); err != nil {
 				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
 				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))
+				if state != nil {
+					_ = state.FinishWebhookAdmission(admissionID, "error", err.Error(), time.Now())
+				}
+			} else if state != nil {
+				_ = state.FinishWebhookAdmission(admissionID, "completed", "", time.Now())
 			}
 			sched.MarkRun(p.Name)
-		}(p, body)
+		}(p, body, admissionID)
 
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("accepted\n"))
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"admission_id": admissionID,
+			"status":       "accepted",
+			"poll":         "/hooks/status/" + admissionID,
+		})
 	})
 	return mux
 }

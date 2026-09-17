@@ -72,7 +72,14 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     nonce        TEXT    NOT NULL DEFAULT '', -- per-row random; anti-replay
     signature    TEXT    NOT NULL DEFAULT '', -- HMAC receipt over the row's fields (empty = unsigned)
     run_id       TEXT    NOT NULL DEFAULT '', -- the pipeline run this decision released
-    policy       TEXT    NOT NULL DEFAULT ''  -- rule that released it when decision='policy_approve'
+    policy       TEXT    NOT NULL DEFAULT '', -- rule that released it when decision='policy_approve'
+    receipt_version INTEGER NOT NULL DEFAULT 1,
+    receipt_id   TEXT    NOT NULL DEFAULT '',
+    action_id    TEXT    NOT NULL DEFAULT '',
+    policy_hash  TEXT    NOT NULL DEFAULT '',
+    binding_hash TEXT    NOT NULL DEFAULT '',
+    expires_at   INTEGER NOT NULL DEFAULT 0,
+    lifecycle    TEXT    NOT NULL DEFAULT 'decided'
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
@@ -87,6 +94,34 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     status       TEXT    NOT NULL            -- pending|resolved|interrupted
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status, opened_at);
+CREATE TABLE IF NOT EXISTS tool_actions (
+    action_id    TEXT PRIMARY KEY,
+    tool         TEXT NOT NULL,
+    agent        TEXT NOT NULL DEFAULT '',
+    run_id       TEXT NOT NULL DEFAULT '',
+    args_hash    TEXT NOT NULL,
+    policy_hash  TEXT NOT NULL,
+    binding_hash TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    decision     TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL DEFAULT '',
+    decided_by   TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    consumed_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tool_actions_status ON tool_actions(status, updated_at);
+CREATE TABLE IF NOT EXISTS webhook_admissions (
+    id          TEXT PRIMARY KEY,
+    pipeline    TEXT NOT NULL,
+    body_hash   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    error_text  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(status, created_at);
 `
 	if _, err := db.ExecContext(context.Background(), schema); err != nil {
 		return err
@@ -105,6 +140,13 @@ CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_approvals(status, opene
 		`ALTER TABLE action_approvals ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE pipeline_runs ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE action_approvals ADD COLUMN policy TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE action_approvals ADD COLUMN receipt_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN action_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN policy_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN binding_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE action_approvals ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE action_approvals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'decided'`,
 	} {
 		if _, err := db.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -266,6 +308,11 @@ func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
 }
 
 type ApprovalRecord struct {
+	ID          int64
+	Version     int
+	ReceiptID   string
+	RunID       string
+	ActionID    string
 	Pipeline    string
 	Step        string
 	DecidedAt   time.Time
@@ -276,6 +323,34 @@ type ApprovalRecord struct {
 	QuorumGot   int
 	Nonce       string
 	Signature   string
+	Policy      string
+	PolicyHash  string
+	BindingHash string
+	ExpiresAt   time.Time
+	Lifecycle   string
+}
+
+// ApprovalEnvelope contains every immutable field written into a v2 receipt.
+// Payloads remain represented only by hashes.
+type ApprovalEnvelope struct {
+	ReceiptID   string
+	RunID       string
+	ActionID    string
+	Pipeline    string
+	Step        string
+	DecidedAt   time.Time
+	Decision    string
+	OperatorID  int64
+	PayloadHash string
+	QuorumN     int
+	QuorumGot   int
+	Nonce       string
+	Signature   string
+	Policy      string
+	PolicyHash  string
+	BindingHash string
+	ExpiresAt   time.Time
+	Lifecycle   string
 }
 
 // RecordApproval appends one approval-decision row. Called on every terminal
@@ -313,11 +388,52 @@ func (s *StateStore) RecordApprovalRow(runID, pipeline, step string, decidedAt t
 	return err
 }
 
+// RecordApprovalV2 appends a versioned, action-bound receipt. Legacy writers
+// continue through RecordApprovalRow and retain v1 verification semantics.
+func (s *StateStore) RecordApprovalV2(e ApprovalEnvelope) error {
+	lifecycle := e.Lifecycle
+	if lifecycle == "" {
+		lifecycle = "decided"
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO action_approvals
+		 (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got,
+		  nonce, signature, run_id, policy, receipt_version, receipt_id, action_id, policy_hash,
+		  binding_hash, expires_at, lifecycle)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?)`,
+		e.Pipeline, e.Step, e.DecidedAt.Unix(), e.Decision, e.OperatorID, e.PayloadHash,
+		e.QuorumN, e.QuorumGot, e.Nonce, e.Signature, e.RunID, e.Policy, e.ReceiptID,
+		e.ActionID, e.PolicyHash, e.BindingHash, e.ExpiresAt.Unix(), lifecycle,
+	)
+	return err
+}
+
+const approvalColumns = `id, receipt_version, receipt_id, run_id, action_id,
+	 pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got,
+	 nonce, signature, policy, policy_hash, binding_hash, expires_at, lifecycle`
+
+func scanApproval(scan func(...interface{}) error) (ApprovalRecord, error) {
+	var r ApprovalRecord
+	var decided, expires int64
+	err := scan(&r.ID, &r.Version, &r.ReceiptID, &r.RunID, &r.ActionID,
+		&r.Pipeline, &r.Step, &decided, &r.Decision, &r.OperatorID, &r.PayloadHash,
+		&r.QuorumN, &r.QuorumGot, &r.Nonce, &r.Signature, &r.Policy, &r.PolicyHash,
+		&r.BindingHash, &expires, &r.Lifecycle)
+	if err != nil {
+		return r, err
+	}
+	r.DecidedAt = time.Unix(decided, 0)
+	if expires > 0 {
+		r.ExpiresAt = time.Unix(expires, 0)
+	}
+	return r, nil
+}
+
 // ApprovalsForRun returns every approval decision recorded against one run, in
 // decision order. This is the join the audit trail previously could not make.
 func (s *StateStore) ApprovalsForRun(runID string) ([]ApprovalRecord, error) {
 	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature
+		`SELECT `+approvalColumns+`
 		 FROM action_approvals WHERE run_id=? ORDER BY decided_at ASC, id ASC`,
 		runID,
 	)
@@ -327,12 +443,10 @@ func (s *StateStore) ApprovalsForRun(runID string) ([]ApprovalRecord, error) {
 	defer func() { _ = rows.Close() }()
 	var out []ApprovalRecord
 	for rows.Next() {
-		var r ApprovalRecord
-		var ts int64
-		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot, &r.Nonce, &r.Signature); err != nil {
+		r, err := scanApproval(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		r.DecidedAt = time.Unix(ts, 0)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -342,7 +456,7 @@ func (s *StateStore) ApprovalsForRun(runID string) ([]ApprovalRecord, error) {
 // newest-first.
 func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRecord, error) {
 	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature
+		`SELECT `+approvalColumns+`
 		 FROM action_approvals WHERE pipeline=? ORDER BY decided_at DESC, id DESC LIMIT ?`,
 		pipeline, n,
 	)
@@ -352,21 +466,77 @@ func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRec
 	defer func() { _ = rows.Close() }()
 	var out []ApprovalRecord
 	for rows.Next() {
-		var r ApprovalRecord
-		var ts int64
-		if err := rows.Scan(&r.Pipeline, &r.Step, &ts, &r.Decision, &r.OperatorID, &r.PayloadHash, &r.QuorumN, &r.QuorumGot, &r.Nonce, &r.Signature); err != nil {
+		r, err := scanApproval(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
-		r.DecidedAt = time.Unix(ts, 0)
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// AllApprovals returns the newest receipt rows across every pipeline.
+func (s *StateStore) AllApprovals(n int) ([]ApprovalRecord, error) {
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT `+approvalColumns+` FROM action_approvals ORDER BY decided_at DESC, id DESC LIMIT ?`, n)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ApprovalRecord
+	for rows.Next() {
+		r, err := scanApproval(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ApprovalByReceiptID looks up one receipt by its stable public id.
+func (s *StateStore) ApprovalByReceiptID(id string) (ApprovalRecord, error) {
+	row := s.db.QueryRowContext(context.Background(),
+		`SELECT `+approvalColumns+` FROM action_approvals WHERE receipt_id=? OR (receipt_id='' AND CAST(id AS TEXT)=?) ORDER BY id DESC LIMIT 1`, id, id)
+	return scanApproval(row.Scan)
 }
 
 // ApprovalVerification pairs an audit row with the result of checking its receipt.
 type ApprovalVerification struct {
 	Record ApprovalRecord
 	Status string // "ok" | "tampered" | "unsigned"
+}
+
+// VerifyApprovalRecord checks one receipt and preserves the explicit unsigned
+// state for rows written without a signing secret.
+func VerifyApprovalRecord(secret []byte, r ApprovalRecord) string {
+	if r.Signature == "" {
+		return "unsigned"
+	}
+	ok := false
+	if r.Version >= 2 {
+		expires := int64(0)
+		if !r.ExpiresAt.IsZero() {
+			expires = r.ExpiresAt.Unix()
+		}
+		ok = approval.VerifyV2(secret, approval.FieldsV2{
+			ReceiptID: r.ReceiptID, RunID: r.RunID, ActionID: r.ActionID,
+			Pipeline: r.Pipeline, Step: r.Step, DecidedAt: r.DecidedAt.Unix(),
+			Decision: r.Decision, OperatorID: r.OperatorID, PayloadHash: r.PayloadHash,
+			Policy: r.Policy, PolicyHash: r.PolicyHash, BindingHash: r.BindingHash,
+			ExpiresAt: expires, QuorumN: r.QuorumN, QuorumGot: r.QuorumGot,
+		}, r.Nonce, r.Signature)
+	} else {
+		ok = approval.Verify(secret, approval.Fields{
+			Pipeline: r.Pipeline, Step: r.Step, DecidedAt: r.DecidedAt.Unix(),
+			Decision: r.Decision, OperatorID: r.OperatorID, PayloadHash: r.PayloadHash,
+			QuorumN: r.QuorumN, QuorumGot: r.QuorumGot,
+		}, r.Nonce, r.Signature)
+	}
+	if ok {
+		return "ok"
+	}
+	return "tampered"
 }
 
 // VerifyApprovals re-checks the receipts on the last n approval rows for a
@@ -382,19 +552,7 @@ func (s *StateStore) VerifyApprovals(secret []byte, pipeline string, n int) ([]A
 	}
 	out := make([]ApprovalVerification, 0, len(recs))
 	for _, r := range recs {
-		status := "unsigned"
-		if r.Signature != "" {
-			f := approval.Fields{
-				Pipeline: r.Pipeline, Step: r.Step, DecidedAt: r.DecidedAt.Unix(),
-				Decision: r.Decision, OperatorID: r.OperatorID, PayloadHash: r.PayloadHash,
-				QuorumN: r.QuorumN, QuorumGot: r.QuorumGot,
-			}
-			if approval.Verify(secret, f, r.Nonce, r.Signature) {
-				status = "ok"
-			} else {
-				status = "tampered"
-			}
-		}
+		status := VerifyApprovalRecord(secret, r)
 		out = append(out, ApprovalVerification{Record: r, Status: status})
 	}
 	return out, nil
@@ -535,6 +693,217 @@ func (s *StateStore) MarkInterrupted(id int64) error {
 	_, err := s.db.ExecContext(context.Background(),
 		`UPDATE pending_approvals SET status='interrupted' WHERE id=? AND status='pending'`, id)
 	return err
+}
+
+// ToolAction is the durable state machine behind an execution permit.
+type ToolAction struct {
+	ActionID    string
+	Tool        string
+	Agent       string
+	RunID       string
+	ArgsHash    string
+	PolicyHash  string
+	BindingHash string
+	Status      string
+	Decision    string
+	Reason      string
+	DecidedBy   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	ExpiresAt   time.Time
+	ConsumedAt  time.Time
+}
+
+func scanToolAction(scan func(...interface{}) error) (ToolAction, error) {
+	var a ToolAction
+	var created, updated, expires, consumed int64
+	err := scan(&a.ActionID, &a.Tool, &a.Agent, &a.RunID, &a.ArgsHash, &a.PolicyHash,
+		&a.BindingHash, &a.Status, &a.Decision, &a.Reason, &a.DecidedBy,
+		&created, &updated, &expires, &consumed)
+	if err != nil {
+		return a, err
+	}
+	a.CreatedAt, a.UpdatedAt, a.ExpiresAt = time.Unix(created, 0), time.Unix(updated, 0), time.Unix(expires, 0)
+	if consumed > 0 {
+		a.ConsumedAt = time.Unix(consumed, 0)
+	}
+	return a, nil
+}
+
+const toolActionColumns = `action_id, tool, agent, run_id, args_hash, policy_hash,
+	 binding_hash, status, decision, reason, decided_by, created_at, updated_at, expires_at, consumed_at`
+
+// ReserveToolAction atomically creates an action identity or returns the
+// existing record for an idempotent retry. A mismatched binding is an error.
+func (s *StateStore) ReserveToolAction(a ToolAction) (ToolAction, bool, error) {
+	if s == nil || s.db == nil {
+		return a, true, nil
+	}
+	res, err := s.db.ExecContext(context.Background(),
+		`INSERT OR IGNORE INTO tool_actions
+		 (action_id, tool, agent, run_id, args_hash, policy_hash, binding_hash, status,
+		  decision, reason, decided_by, created_at, updated_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?, ?)`,
+		a.ActionID, a.Tool, a.Agent, a.RunID, a.ArgsHash, a.PolicyHash, a.BindingHash,
+		a.CreatedAt.Unix(), a.UpdatedAt.Unix(), a.ExpiresAt.Unix())
+	if err != nil {
+		return ToolAction{}, false, err
+	}
+	n, _ := res.RowsAffected()
+	existing, err := s.ToolAction(a.ActionID)
+	if err != nil {
+		return ToolAction{}, false, err
+	}
+	if existing.BindingHash != a.BindingHash {
+		return existing, false, fmt.Errorf("action_id %q is already bound to different action data", a.ActionID)
+	}
+	return existing, n == 1, nil
+}
+
+// ToolAction returns one durable permit state.
+func (s *StateStore) ToolAction(id string) (ToolAction, error) {
+	if s == nil || s.db == nil {
+		return ToolAction{}, sql.ErrNoRows
+	}
+	row := s.db.QueryRowContext(context.Background(),
+		`SELECT `+toolActionColumns+` FROM tool_actions WHERE action_id=?`, id)
+	return scanToolAction(row.Scan)
+}
+
+// DecideToolAction transitions a pending action to allowed or denied.
+func (s *StateStore) DecideToolAction(id, status, decision, reason, decidedBy string, at time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE tool_actions SET status=?, decision=?, reason=?, decided_by=?, updated_at=?
+		 WHERE action_id=? AND status='pending'`, status, decision, reason, decidedBy, at.Unix(), id)
+	return err
+}
+
+// ConsumeToolAction atomically spends one allowed permit. Only the first
+// matching caller before expiry succeeds.
+func (s *StateStore) ConsumeToolAction(id, bindingHash string, at time.Time) (ToolAction, bool, error) {
+	if s == nil || s.db == nil {
+		return ToolAction{}, false, nil
+	}
+	res, err := s.db.ExecContext(context.Background(),
+		`UPDATE tool_actions SET status='consumed', consumed_at=?, updated_at=?
+		 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at>=?`,
+		at.Unix(), at.Unix(), id, bindingHash, at.Unix())
+	if err != nil {
+		return ToolAction{}, false, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		if _, err := s.db.ExecContext(context.Background(),
+			`UPDATE tool_actions SET status='expired', decision='deny',
+			 reason='permit expired before consumption', updated_at=?
+			 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at<?`,
+			at.Unix(), id, bindingHash, at.Unix()); err != nil {
+			return ToolAction{}, false, err
+		}
+	}
+	a, err := s.ToolAction(id)
+	return a, n == 1, err
+}
+
+// ExpireToolActions closes pending work that cannot safely resume after a
+// restart and allowed permits whose signed validity window has elapsed. A
+// still-valid allowed permit remains consumable because its complete binding
+// is durable.
+func (s *StateStore) ExpireToolActions(at time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(context.Background(),
+		`UPDATE tool_actions SET status='expired', decision='deny',
+		 reason='process restarted before decision', updated_at=? WHERE status='pending'`, at.Unix()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err = tx.ExecContext(context.Background(),
+		`UPDATE tool_actions SET status='expired', decision='deny',
+		 reason='permit expired before consumption', updated_at=?
+		 WHERE status='allowed' AND expires_at<?`, at.Unix(), at.Unix()); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// WebhookAdmission is the durable evidence that an HTTP trigger was accepted.
+type WebhookAdmission struct {
+	ID        string
+	Pipeline  string
+	BodyHash  string
+	Status    string
+	Error     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// BeginWebhookAdmission writes the accepted record before the handler returns 202.
+func (s *StateStore) BeginWebhookAdmission(a WebhookAdmission) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("state store unavailable")
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO webhook_admissions (id, pipeline, body_hash, status, created_at, updated_at)
+		 VALUES (?, ?, ?, 'accepted', ?, ?)`, a.ID, a.Pipeline, a.BodyHash, a.CreatedAt.Unix(), a.UpdatedAt.Unix())
+	return err
+}
+
+// FinishWebhookAdmission records the terminal pipeline outcome.
+func (s *StateStore) FinishWebhookAdmission(id, status, errorText string, at time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE webhook_admissions SET status=?, error_text=?, updated_at=? WHERE id=?`,
+		status, errorText, at.Unix(), id)
+	return err
+}
+
+// WebhookAdmission returns the status exposed by the authenticated poll route.
+func (s *StateStore) WebhookAdmission(id string) (WebhookAdmission, error) {
+	if s == nil || s.db == nil {
+		return WebhookAdmission{}, sql.ErrNoRows
+	}
+	var a WebhookAdmission
+	var created, updated int64
+	err := s.db.QueryRowContext(context.Background(),
+		`SELECT id, pipeline, body_hash, status, error_text, created_at, updated_at
+		 FROM webhook_admissions WHERE id=?`, id).Scan(
+		&a.ID, &a.Pipeline, &a.BodyHash, &a.Status, &a.Error, &created, &updated)
+	if err != nil {
+		return a, err
+	}
+	a.CreatedAt, a.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
+	return a, nil
+}
+
+// InterruptWebhookAdmissions makes accepted work visible after a restart.
+func (s *StateStore) InterruptWebhookAdmissions(at time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE webhook_admissions SET status='interrupted', error_text='process restarted before completion', updated_at=?
+		 WHERE status IN ('accepted','running')`, at.Unix())
+	return err
+}
+
+// Ping checks whether the state store can serve durable decisions.
+func (s *StateStore) Ping(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("state store unavailable")
+	}
+	return s.db.PingContext(ctx)
 }
 
 func (s *StateStore) Close() error {

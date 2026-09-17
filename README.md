@@ -65,9 +65,9 @@ Sometimes a customer, auditor, or partner needs evidence that a human approved a
 
 This is an **experimental cryptographic preview**, not a production compliance claim. It uses an embedded BN254/Groth16 circuit and a development single-party setup; the circuit has not received an independent audit. Use it to evaluate the disclosure model, then replace the setup through a ceremony before relying on it in production. See [zero-knowledge approval proofs](docs/zk-approval-proofs.md) for the trust model, exact statement, and limitations.
 
-> **New in v0.6.0:** the gate holds under load. The [tool-call gate](docs/tool-gate.md) answers asynchronously (`mode: async`, `wait:`) so a harness with a short HTTP timeout never loses a decision, and a tool call waiting on a human is durable across a restart. Rules constrain arguments (`args:` — glob, regex, `one_of`, `min`/`max`) and never widen on a mismatch. A repeat guard stops an agent that loops on one call from paging you, the operator hears about denials the gate made on its own, `/pending` and `draftcat pending` list every open gate, `/status` shows spend against caps, cost caps enforce the provider's real charge, rate limits back off instead of failing the run — and one Telegram update pump fixes taps that were silently lost while two gates were open at once.
+> **New in v0.7.0:** execution decisions now carry their proof. Every tool-gate route is authenticated, each request has a stable action identity and exact policy binding, and an allowed decision becomes an atomic consume-once permit before the side effect runs. Webhook acceptance is durable before HTTP 202 and can be polled after handoff. Versioned receipts bind action, payload, policy, and expiry, with `draftcat receipts list|show|export` for verification-ready JSONL. Ordered `model_policy` rules can deny or send matching model input/output to a human, while `/healthz` and `/readyz` give orchestrators a safe listener contract.
 >
-> **In v0.5.0:** approvals reach any operator surface via the [`hitl/v0` protocol](docs/hitl-protocol.md) — Microsoft Teams through a Power Automate flow in your own tenant, with no bot and no Azure app registration. Plus a tool-call gate for an agent's MCP/SDK calls (`POST /gate/tool-call`), risk tiers with pre-declared `approval_policy` exemptions, run-correlated audit rows, spend shown at the moment of decision, and `escalate_after` reminders before a gate times out.
+> **In v0.6.0:** the gate holds under load. The [tool-call gate](docs/tool-gate.md) answers asynchronously (`mode: async`, `wait:`) so a harness with a short HTTP timeout never loses a decision, and a tool call waiting on a human is durable across a restart. Rules constrain arguments (`args:` - glob, regex, `one_of`, `min`/`max`) and never widen on a mismatch. A repeat guard stops an agent that loops on one call from paging you, the operator hears about denials the gate made on its own, `/pending` and `draftcat pending` list every open gate, `/status` shows spend against caps, cost caps enforce the provider's real charge, rate limits back off instead of failing the run - and one Telegram update pump fixes taps that were silently lost while two gates were open at once.
 
 ![Demo](demo.gif)
 
@@ -106,7 +106,7 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money. On OpenRouter the caps are enforced on the charge the provider reports for each call (cached and reasoning tokens included); elsewhere on your configured per-1k rates. The approval prompt shows what the run has spent, and `/status` shows the day against every cap.
 - **Human-in-the-loop** — every outbound action requires an explicit operator decision, made live or declared in advance.
 - **Any operator channel** — the [`hitl/v0` protocol](docs/hitl-protocol.md) keeps draftcat as the gate and lets an untrusted relay own presentation. Teams runs through a Power Automate flow in your own tenant: no bot, no Azure app registration, no admin consent. Check yours with `draftcat hitl verify <relay-url>`.
-- **Tool-call gate** — `POST /gate/tool-call` puts an agent's MCP or SDK calls through the same gate as a pipeline step. Denies by default; the approval binds to a hash of the exact arguments. Rules can constrain the arguments themselves (`args:`) and a mismatch only ever tightens — ask a human, or refuse. A decision that needs a human can be collected asynchronously (`mode: async`, `wait:`, `GET /gate/tool-call/<id>`), and the open gate is durable across a restart. See [`docs/tool-gate.md`](docs/tool-gate.md).
+- **Consume-once tool permits** - `POST /gate/tool-call` puts an agent's MCP or SDK call through the same gate as a pipeline step. Bearer authentication covers ask, poll, and consume. A stable `action_id` makes retries idempotent; the binding covers the exact arguments, policy, and expiry; only the first successful `POST /gate/tool-call/<id>/consume` carries `permit: execute`. See [`docs/tool-gate.md`](docs/tool-gate.md).
 - **Repeat guard** — inside `repeat_window` an identical tool call (same agent, tool, arguments) gets the gate's remembered answer instead of a new prompt: a denied call stays denied, an in-flight call joins the open prompt, and `max_repeats` stops a looping agent from paging you.
 - **Denial notices** — a refusal the gate makes on its own (unlisted tool, argument outside a rule, repeat guard) is reported to the operator channel, one notice per agent, tool and reason per window, so nothing is refused silently.
 - **Open gates** — `/pending` on the channel and `draftcat pending` on the host list every approval waiting on a human, pipeline steps and tool calls alike, with how long each has waited and how long it has left.
@@ -114,9 +114,12 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Escalation** — `escalate_after` re-notifies before a gate times out; `escalate_to` widens who is told, never who may decide.
 - **Durable, run-correlated gates** — every gate is written to SQLite before the draft goes out, so an approval in flight survives a restart, and each decision records the run it released.
 - **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
+- **Model I/O policy** - ordered `model_policy` regex rules check exact input before it reaches the provider and output before it leaves Draftcat. A match can deny or enter the existing human approval gate, and the decision is written as a versioned receipt.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
 - **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
-- **Checked action receipts** — approval decisions can be tied to a payload hash and verified later; see [`docs/action-receipts.md`](docs/action-receipts.md).
+- **Checked action receipts** - v2 receipts bind immutable action ID, payload hash, policy digest, validity window, run, and decision. List, inspect, or stream JSONL from SQLite with `draftcat receipts`; see [`docs/action-receipts.md`](docs/action-receipts.md).
+- **Durable webhook admission** - Draftcat writes a body-hash-only admission row before returning HTTP 202. The response includes `admission_id` and an authenticated poll URL; unfinished admissions become `interrupted` after restart.
+- **Health contract** - `GET /healthz` reports process liveness and `GET /readyz` succeeds only while the SQLite decision store is available.
 - **Private approval proofs** — share proof that a direct human approval met quorum without sharing the action, approver, or counts; see [`docs/zk-approval-proofs.md`](docs/zk-approval-proofs.md).
 - **Encrypted approval tally** — combine three or more encrypted votes without letting the collector read any individual vote; see [`docs/fhe-vote-tally.md`](docs/fhe-vote-tally.md).
 - **Rate limiting** — per-user, per-minute caps on operator interactions.
@@ -192,6 +195,14 @@ curl -X POST https://draftcat.yourco.eu/hooks/<pipeline> \
 ```
 
 The POST only **starts** a gated pipeline — the approval step still runs, so inbound can never make the LLM fire a customer-facing action.
+Draftcat writes the admission to SQLite before returning `202`:
+
+```json
+{"admission_id":"wh_...","status":"accepted","poll":"/hooks/status/wh_..."}
+```
+
+Poll that path with the same bearer token. `GET /healthz` is a liveness check;
+`GET /readyz` verifies that the decision store is reachable.
 
 ## How it works
 
@@ -283,6 +294,41 @@ tool_gate:
       on_mismatch: deny               # outside it: refuse without asking
 ```
 
+Every gate request uses the webhook bearer token. Send a stable `action_id`,
+then consume an allowed binding exactly once before running the side effect:
+
+```bash
+curl -X POST http://127.0.0.1:8088/gate/tool-call \
+  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"action_id":"send-invoice-4821","tool":"send_email","args":{"to":"billing@example.com"}}'
+
+curl -X POST http://127.0.0.1:8088/gate/tool-call/send-invoice-4821/consume \
+  -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"binding_hash":"sha256:..."}'
+```
+
+Model input and output policy is ordered and deterministic. `deny` fails the
+LLM call closed; `review` pauses at the configured operator channel:
+
+```yaml
+model_policy:
+  max_preview_chars: 800
+  rules:
+    - id: credentials-in-input
+      phase: input
+      pattern: '(?i)(api[_ -]?key|password)'
+      action: review
+      reason: Credentials require an explicit operator decision.
+    - id: unsupported-claim
+      phase: output
+      roles: [drafter]
+      pattern: '(?i)guaranteed results'
+      action: deny
+      reason: Do not send unsupported guarantees.
+```
+
 Skills are YAML prompt templates in `skills/` with an `output_schema` the engine enforces. With `-tags voice`, a `voice:` block configures the webhook receivers, Dograh endpoints, and pre-call lookup — see [docs/voice.md](docs/voice.md).
 
 ## Commands
@@ -293,6 +339,9 @@ draftcat validate [--strict]   # lint config + skills
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat pending               # approval gates waiting on a human right now (--json)
+draftcat receipts list         # approval receipts and verification status (--json)
+draftcat receipts show <id>    # one versioned receipt
+draftcat receipts export       # JSONL to stdout (--out path writes mode 0600)
 draftcat audit-verify          # verify signed approval receipts
 draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
@@ -328,7 +377,7 @@ curl -X POST http://127.0.0.1:8088/hooks/invoice-due-diligence \
   -H "Authorization: Bearer $DRAFTCAT_WEBHOOK_SECRET" -d '{"path": "/inbox/invoice.pdf"}'
 ```
 
-The body reaches the pipeline as `{{webhook_body}}` / `{{input}}`; bearer auth is constant-time, and a second trigger while the pipeline is running gets `409`. A webhook only *starts* a pipeline — the approval gate still runs, so an inbound request can never make the LLM fire an outbound action.
+The body reaches the pipeline as `{{webhook_body}}` / `{{input}}`; bearer auth is constant-time, and a second trigger while the pipeline is running gets `409`. Before `202`, Draftcat stores an admission ID, pipeline, body hash, and status in SQLite. `GET /hooks/status/<admission_id>` returns the authenticated status without retaining the request body. A webhook only *starts* a pipeline - the approval gate still runs, so an inbound request can never make the LLM fire an outbound action.
 
 **Signed requests.** Bind each trigger to its exact body and a timestamp with an HMAC receipt, on top of the bearer token:
 

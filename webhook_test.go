@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/renezander030/draftcat/internal/config"
+	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
 func TestSchedulerTryStart(t *testing.T) {
@@ -135,4 +138,108 @@ func TestWebhookAcceptsValid(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Error("pipeline did not finish / release running flag within timeout")
+}
+
+func TestListenerHealthAndReadiness(t *testing.T) {
+	prev := state
+	state = nil
+	t.Cleanup(func() { state = prev })
+	h, _ := testHandler(t)
+	for path, want := range map[string]int{"/healthz": http.StatusOK, "/readyz": http.StatusServiceUnavailable} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != want {
+			t.Fatalf("%s = %d, want %d", path, rr.Code, want)
+		}
+	}
+	st, err := statestore.OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state = st
+	t.Cleanup(func() { _ = st.Close() })
+	h, _ = testHandler(t)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", rr.Code)
+	}
+}
+
+func TestToolGateRoutesRequireBearer(t *testing.T) {
+	prev := state
+	state = nil
+	t.Cleanup(func() { state = prev })
+	cfg := &config.Config{Timeouts: config.TimeoutConfig{OperatorApproval: "1m"}}
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.SetSecret("s3cret")
+	cfg.ToolGate = config.ToolGateConfig{Enabled: true, Tools: []config.ToolRule{{Name: "read_calendar"}}}
+	h := newWebhookHandler(cfg, newScheduler(nil), &BudgetTracker{dayStart: time.Now()}, &TGBot{}, nil)
+	body := `{"action_id":"read-1","tool":"read_calendar"}`
+	if rr := post(h, toolGatePath, "", body); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated gate = %d, want 401", rr.Code)
+	}
+	if rr := post(h, toolGatePath, "Bearer s3cret", body); rr.Code != http.StatusOK {
+		t.Fatalf("authenticated gate = %d (%s), want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestToolGatePostUsesConfiguredBodySignature(t *testing.T) {
+	st := newTempStateStore(t)
+	prev := state
+	state = st
+	t.Cleanup(func() { state = prev })
+	cfg := &config.Config{Timeouts: config.TimeoutConfig{OperatorApproval: "1m"}}
+	cfg.Webhook.Enabled = true
+	cfg.Webhook.RequireSignature = true
+	cfg.Webhook.SetSecret("s3cret")
+	cfg.ToolGate = config.ToolGateConfig{Enabled: true, Tools: []config.ToolRule{{Name: "read_calendar"}}}
+	h := newWebhookHandler(cfg, newScheduler(nil), &BudgetTracker{dayStart: time.Now()}, &TGBot{}, nil)
+	body := `{"action_id":"read-signed","tool":"read_calendar"}`
+	if rr := post(h, toolGatePath, "Bearer s3cret", body); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned gate POST = %d, want 401", rr.Code)
+	}
+	req := httptest.NewRequest(http.MethodPost, toolGatePath, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer s3cret")
+	req.Header.Set(webhookSigHeader, signBody([]byte("s3cret"), time.Now().Unix(), []byte(body)))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("signed gate POST = %d (%s), want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestWebhookWritesAdmissionBeforeAccepted(t *testing.T) {
+	st, err := statestore.OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := state
+	state = st
+	t.Cleanup(func() { state = prev; _ = st.Close() })
+	h, _ := testHandler(t)
+	rr := post(h, "/hooks/ping", "Bearer s3cret", `{"hello":"world"}`)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		AdmissionID string `json:"admission_id"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil || body.AdmissionID == "" {
+		t.Fatalf("response=%q err=%v", rr.Body.String(), err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		a, err := st.WebhookAdmission(body.AdmissionID)
+		if err != nil || a.BodyHash == "" {
+			t.Fatalf("admission=%+v err=%v", a, err)
+		}
+		if a.Status == "completed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admission stayed %q", a.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

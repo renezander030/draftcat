@@ -16,10 +16,12 @@ a persisted fact that can be inspected later.
 5. The approved action executes.
 6. A receipt can be exported for audit or incident review.
 
-## Current integrity layer
+## Integrity layer
 
-The approval package signs immutable decision fields with HMAC-SHA256:
+New decisions use receipt schema v2. The approval package signs immutable
+decision fields with HMAC-SHA256:
 
+- receipt, run, and action IDs
 - pipeline
 - step
 - decision time
@@ -28,10 +30,14 @@ The approval package signs immutable decision fields with HMAC-SHA256:
 - payload hash
 - quorum requirement
 - quorum result
+- policy and policy digest
+- binding digest
+- permit expiry and lifecycle
 - nonce
 
 See [`internal/approval/receipt.go`](../internal/approval/receipt.go). If any
-covered field changes after signing, verification fails.
+covered field changes after signing, verification fails. Existing v1 receipts
+continue to verify with their original canonical field set.
 
 ## Receipt shape
 
@@ -48,39 +54,58 @@ Example:
 
 ```json
 {
-  "receipt_id": "act_20260704_001",
+  "version": 2,
+  "receipt_id": "rcpt_9d4d...",
   "run_id": "run_abc123",
+  "action_id": "run_abc123:lead_reply:send_email",
   "pipeline": "lead_reply",
   "step": "send_email",
-  "action_type": "outbound_message",
-  "status": "executed",
-  "proposed_by": "agent",
-  "approved_by": "operator:12345",
-  "approved_at": "2026-07-04T09:30:00Z",
-  "executed_at": "2026-07-04T09:31:00Z",
-  "schema_version": 1,
+  "decision": "approve",
+  "operator_id": 12345,
+  "decided_at": "2026-09-17T09:30:00Z",
   "payload_hash": "sha256:...",
-  "signature_status": "valid",
-  "policy_checks": [
-    {"id": "recipient_allowlist", "status": "pass"},
-    {"id": "budget_limit", "status": "pass"}
-  ],
-  "human_decision": {
-    "decision": "edit_then_approve",
-    "notes": "Tightened the CTA and removed an unsupported claim."
-  }
+  "policy": "human-approval",
+  "policy_hash": "sha256:...",
+  "binding_hash": "sha256:...",
+  "expires_at": "2026-09-17T13:30:00Z",
+  "lifecycle": "decided",
+  "quorum_n": 1,
+  "quorum_got": 1,
+  "nonce": "...",
+  "signature": "...",
+  "verification": "ok"
 }
 ```
 
-## CLI direction
+The SQLite row stores hashes and identifiers, not the customer payload.
 
-A small receipt surface should be enough for operators and auditors:
+## CLI
+
+List recent receipts across all pipelines, or narrow to one pipeline:
 
 ```bash
-draftcat receipts list --run run_abc123
-draftcat receipts show act_20260704_001
-draftcat receipts export --format jsonl --out receipts.jsonl
+draftcat receipts list --limit 100
+draftcat receipts list --pipeline lead_reply --json
 ```
+
+Inspect one receipt by its stable ID (legacy rows also accept their numeric row
+ID):
+
+```bash
+draftcat receipts show rcpt_9d4d...
+```
+
+Export newline-delimited JSON in chronological order. Stdout makes it easy to
+pipe into an auditor or log shipper; `--out` creates a mode `0600` file:
+
+```bash
+draftcat receipts export --pipeline lead_reply > receipts.jsonl
+draftcat receipts export --out receipts.jsonl
+```
+
+Set `DRAFTCAT_APPROVAL_SECRET` while reading to receive `verification: ok` or
+`tampered`. Signed rows without the key report `unverified`; unsigned rows
+report `unsigned` explicitly.
 
 ## Design rule
 

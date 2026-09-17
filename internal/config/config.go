@@ -22,21 +22,22 @@ import (
 )
 
 type Config struct {
-	Telegram  TelegramConfig         `yaml:"telegram"`
-	Relay     RelayConfig            `yaml:"relay"`
-	Gmail     gmailapi.GmailConfig   `yaml:"gmail"`
-	GHL       ghlapi.GHLConfig       `yaml:"gohighlevel"`
-	State     StateConfig            `yaml:"state"`
-	Provider  ProviderConfig         `yaml:"provider"`
-	Models    map[string]ModelConfig `yaml:"models"`
-	Roles     map[string]string      `yaml:"roles"`
-	Budgets   BudgetConfig           `yaml:"budgets"`
-	Timeouts  TimeoutConfig          `yaml:"timeouts"`
-	Policy    ApprovalPolicy         `yaml:"approval_policy"`
-	ToolGate  ToolGateConfig         `yaml:"tool_gate"`
-	Webhook   WebhookConfig          `yaml:"webhook"`
-	Observ    ObservabilityConfig    `yaml:"observability"`
-	Pipelines []PipelineConfig       `yaml:"pipelines"`
+	Telegram    TelegramConfig         `yaml:"telegram"`
+	Relay       RelayConfig            `yaml:"relay"`
+	Gmail       gmailapi.GmailConfig   `yaml:"gmail"`
+	GHL         ghlapi.GHLConfig       `yaml:"gohighlevel"`
+	State       StateConfig            `yaml:"state"`
+	Provider    ProviderConfig         `yaml:"provider"`
+	Models      map[string]ModelConfig `yaml:"models"`
+	Roles       map[string]string      `yaml:"roles"`
+	Budgets     BudgetConfig           `yaml:"budgets"`
+	Timeouts    TimeoutConfig          `yaml:"timeouts"`
+	Policy      ApprovalPolicy         `yaml:"approval_policy"`
+	ModelPolicy ModelPolicyConfig      `yaml:"model_policy"`
+	ToolGate    ToolGateConfig         `yaml:"tool_gate"`
+	Webhook     WebhookConfig          `yaml:"webhook"`
+	Observ      ObservabilityConfig    `yaml:"observability"`
+	Pipelines   []PipelineConfig       `yaml:"pipelines"`
 	// Voice is parsed unconditionally as raw YAML. Decoded into voice.Config
 	// only when draftcat is built with -tags voice. Lean builds ignore it.
 	Voice yaml.Node `yaml:"voice"`
@@ -192,6 +193,61 @@ type ModelConfig struct {
 	MaxTokens int     `yaml:"max_tokens"`
 	CostIn    float64 `yaml:"cost_per_1k_input"`
 	CostOut   float64 `yaml:"cost_per_1k_output"`
+}
+
+// ModelPolicyConfig applies deterministic checks immediately before model
+// input is sent and immediately after model output is received.
+type ModelPolicyConfig struct {
+	Rules           []ModelPolicyRule `yaml:"rules"`
+	MaxPreviewChars int               `yaml:"max_preview_chars"`
+}
+
+// ModelPolicyRule is an ordered regex rule. Action is deny or review.
+type ModelPolicyRule struct {
+	ID      string   `yaml:"id"`
+	Phase   string   `yaml:"phase"` // input | output | both
+	Roles   []string `yaml:"roles"`
+	Pattern string   `yaml:"pattern"`
+	Action  string   `yaml:"action"` // deny | review
+	Reason  string   `yaml:"reason"`
+}
+
+func (p ModelPolicyConfig) PreviewLimit() int {
+	if p.MaxPreviewChars > 0 {
+		return p.MaxPreviewChars
+	}
+	return 800
+}
+
+// Match returns the first applicable rule, keeping evaluation deterministic.
+func (p ModelPolicyConfig) Match(role, phase, text string) (*ModelPolicyRule, error) {
+	for i := range p.Rules {
+		r := &p.Rules[i]
+		rPhase := strings.ToLower(strings.TrimSpace(r.Phase))
+		if rPhase != "both" && rPhase != phase {
+			continue
+		}
+		if len(r.Roles) > 0 {
+			matchedRole := false
+			for _, candidate := range r.Roles {
+				if candidate == role {
+					matchedRole = true
+					break
+				}
+			}
+			if !matchedRole {
+				continue
+			}
+		}
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			return nil, fmt.Errorf("model policy rule %q: %w", r.ID, err)
+		}
+		if re.MatchString(text) {
+			return r, nil
+		}
+	}
+	return nil, nil
 }
 
 type BudgetConfig struct {

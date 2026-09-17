@@ -111,3 +111,32 @@ func TestEmptySignatureFails(t *testing.T) {
 		t.Fatal("empty signature verified")
 	}
 }
+
+func TestV2BindsActionPolicyAndExpiry(t *testing.T) {
+	secret := []byte("test-secret")
+	f := FieldsV2{
+		ReceiptID: "rcpt_1", RunID: "run_1", ActionID: "send_1",
+		Pipeline: "sales", Step: "send", DecidedAt: 1_750_000_000,
+		Decision: "approve", OperatorID: 42, PayloadHash: "sha256:payload",
+		Policy: "human-approval", PolicyHash: "sha256:policy",
+		BindingHash: "sha256:binding", ExpiresAt: 1_750_003_600,
+		QuorumN: 1, QuorumGot: 1,
+	}
+	nonce := "fixed"
+	sig := SignV2(secret, f, nonce)
+	if !VerifyV2(secret, f, nonce, sig) {
+		t.Fatal("valid v2 receipt did not verify")
+	}
+	for name, mutate := range map[string]func(*FieldsV2){
+		"action":  func(x *FieldsV2) { x.ActionID = "send_2" },
+		"policy":  func(x *FieldsV2) { x.PolicyHash = "sha256:changed" },
+		"binding": func(x *FieldsV2) { x.BindingHash = "sha256:changed" },
+		"expiry":  func(x *FieldsV2) { x.ExpiresAt++ },
+	} {
+		changed := f
+		mutate(&changed)
+		if VerifyV2(secret, changed, nonce, sig) {
+			t.Errorf("v2 receipt still verified after %s drift", name)
+		}
+	}
+}

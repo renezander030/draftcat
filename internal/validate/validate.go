@@ -235,6 +235,7 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	}
 	checkRelay(cfg, rep)
 	checkApprovalPolicy(cfg, rep)
+	checkModelPolicy(cfg, rep)
 	checkToolGate(cfg, rep)
 	if len(cfg.Telegram.Security.AllowedUsers) == 0 {
 		rep.warnf("telegram.security.allowed_users", "empty — channel will accept no operator")
@@ -248,6 +249,42 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	}
 	if cfg.Observ.OTLP.Enabled && cfg.Observ.OTLP.Endpoint == "" {
 		rep.errf("observability.otlp.endpoint", "must be set when observability.otlp.enabled (nothing to export to)")
+	}
+}
+
+func checkModelPolicy(cfg *config.Config, rep *validateReport) {
+	seen := map[string]bool{}
+	for i, rule := range cfg.ModelPolicy.Rules {
+		p := fmt.Sprintf("model_policy.rules[%d]", i)
+		if strings.TrimSpace(rule.ID) == "" {
+			rep.errf(p+".id", "rule id is required")
+		} else if seen[rule.ID] {
+			rep.errf(p+".id", "duplicate rule id %q", rule.ID)
+		}
+		seen[rule.ID] = true
+		switch strings.ToLower(strings.TrimSpace(rule.Phase)) {
+		case "input", "output", "both":
+		default:
+			rep.errf(p+".phase", "must be input, output, or both")
+		}
+		switch strings.ToLower(strings.TrimSpace(rule.Action)) {
+		case "deny", "review":
+		default:
+			rep.errf(p+".action", "must be deny or review")
+		}
+		if rule.Pattern == "" {
+			rep.errf(p+".pattern", "pattern is required")
+		} else if _, err := regexp.Compile(rule.Pattern); err != nil {
+			rep.errf(p+".pattern", "does not compile: %v", err)
+		}
+		for _, role := range rule.Roles {
+			if _, ok := cfg.Roles[role]; !ok {
+				rep.errf(p+".roles", "role %q is not declared in roles", role)
+			}
+		}
+	}
+	if cfg.ModelPolicy.MaxPreviewChars < 0 {
+		rep.errf("model_policy.max_preview_chars", "must be 0 (default) or positive")
 	}
 }
 
