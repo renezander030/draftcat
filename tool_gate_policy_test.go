@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -68,6 +69,18 @@ func getGate(t *testing.T, g *toolGate, id, query string) (int, ToolCallResponse
 	t.Helper()
 	rec := httptest.NewRecorder()
 	g.HandleStatus(rec, httptest.NewRequest(http.MethodGet, toolGatePath+"/"+id+query, nil))
+	var resp ToolCallResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	return rec.Code, resp
+}
+
+func consumeGate(t *testing.T, g *toolGate, id, binding string) (int, ToolCallResponse) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	body := `{"binding_hash":` + strconv.Quote(binding) + `}`
+	g.HandleStatus(rec, httptest.NewRequest(http.MethodPost, toolGatePath+"/"+id+"/consume", strings.NewReader(body)))
 	var resp ToolCallResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode %q: %v", rec.Body.String(), err)
@@ -346,6 +359,36 @@ func TestToolGate_BadModeIsRejected(t *testing.T) {
 	g := newToolGate(gateCfg(config.ToolRule{Name: "x"}), nil)
 	if code, _ := postGate(t, g, `{"tool":"x","mode":"later"}`); code != http.StatusBadRequest {
 		t.Fatalf("mode=later returned %d, want 400", code)
+	}
+}
+
+func TestToolGate_ActionBindingIdempotencyAndConsumeOnce(t *testing.T) {
+	st, err := statestore.OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := state
+	state = st
+	t.Cleanup(func() { state = prev; _ = st.Close() })
+
+	g := newToolGate(gateCfg(config.ToolRule{Name: "send_email"}), nil)
+	body := `{"action_id":"send-42","tool":"send_email","agent":"a","args":{"to":"anna@example.com"}}`
+	_, first := postGate(t, g, body)
+	if first.State != "allowed" || first.BindingHash == "" || first.Consume == "" {
+		t.Fatalf("decision = %+v", first)
+	}
+	_, retry := postGate(t, g, body)
+	if retry.ActionID != first.ActionID || retry.BindingHash != first.BindingHash {
+		t.Fatalf("retry changed binding: first=%+v retry=%+v", first, retry)
+	}
+	if code, drift := postGate(t, g, `{"action_id":"send-42","tool":"send_email","args":{"to":"mallory@example.com"}}`); code != http.StatusConflict || drift.Decision != "deny" {
+		t.Fatalf("drift code=%d response=%+v", code, drift)
+	}
+	if code, permit := consumeGate(t, g, first.ActionID, first.BindingHash); code != http.StatusOK || permit.Permit != "execute" || permit.State != "consumed" {
+		t.Fatalf("first consume code=%d response=%+v", code, permit)
+	}
+	if code, permit := consumeGate(t, g, first.ActionID, first.BindingHash); code != http.StatusConflict || permit.Permit != "" {
+		t.Fatalf("second consume code=%d response=%+v", code, permit)
 	}
 }
 

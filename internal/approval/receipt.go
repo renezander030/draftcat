@@ -41,6 +41,28 @@ type Fields struct {
 	QuorumGot   int
 }
 
+// FieldsV2 is the canonical receipt envelope for decisions written by v0.7.0
+// and later. It keeps the v1 fields and binds the decision to an immutable
+// action identity, the policy/configuration that evaluated it, and its
+// validity window. Versioned signing lets old receipts continue to verify.
+type FieldsV2 struct {
+	ReceiptID   string
+	RunID       string
+	ActionID    string
+	Pipeline    string
+	Step        string
+	DecidedAt   int64
+	Decision    string
+	OperatorID  int64
+	PayloadHash string
+	Policy      string
+	PolicyHash  string
+	BindingHash string
+	ExpiresAt   int64
+	QuorumN     int
+	QuorumGot   int
+}
+
 // canonical serializes (fields, nonce) into an unambiguous byte string. Each
 // value is length-prefixed so no combination of field values can collide with a
 // different set of fields — e.g. pipeline="a", step="b|c" must not sign the same
@@ -54,6 +76,36 @@ func canonical(f Fields, nonce string) []byte {
 		f.Decision,
 		strconv.FormatInt(f.OperatorID, 10),
 		f.PayloadHash,
+		strconv.Itoa(f.QuorumN),
+		strconv.Itoa(f.QuorumGot),
+		nonce,
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteByte(':')
+		b.WriteString(p)
+		b.WriteByte('|')
+	}
+	return []byte(b.String())
+}
+
+func canonicalV2(f FieldsV2, nonce string) []byte {
+	parts := []string{
+		"2",
+		f.ReceiptID,
+		f.RunID,
+		f.ActionID,
+		f.Pipeline,
+		f.Step,
+		strconv.FormatInt(f.DecidedAt, 10),
+		f.Decision,
+		strconv.FormatInt(f.OperatorID, 10),
+		f.PayloadHash,
+		f.Policy,
+		f.PolicyHash,
+		f.BindingHash,
+		strconv.FormatInt(f.ExpiresAt, 10),
 		strconv.Itoa(f.QuorumN),
 		strconv.Itoa(f.QuorumGot),
 		nonce,
@@ -92,5 +144,18 @@ func Sign(secret []byte, f Fields, nonce string) string {
 // with a different key, or never signed.
 func Verify(secret []byte, f Fields, nonce, sig string) bool {
 	want := Sign(secret, f, nonce)
+	return subtle.ConstantTimeCompare([]byte(want), []byte(sig)) == 1
+}
+
+// SignV2 returns the HMAC-SHA256 signature for a v2 receipt envelope.
+func SignV2(secret []byte, f FieldsV2, nonce string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(canonicalV2(f, nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyV2 verifies a v2 receipt in constant time.
+func VerifyV2(secret []byte, f FieldsV2, nonce, sig string) bool {
+	want := SignV2(secret, f, nonce)
 	return subtle.ConstantTimeCompare([]byte(want), []byte(sig)) == 1
 }

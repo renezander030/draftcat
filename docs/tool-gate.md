@@ -3,7 +3,9 @@
 `POST /gate/tool-call` puts one tool call an agent is about to make through the
 same gate a pipeline step goes through: allowlist, risk tier, human approval,
 audit row. It is served on the webhook listener, so `tool_gate.enabled` requires
-`webhook.enabled`.
+`webhook.enabled`. Every ask, poll, and consume request requires the webhook
+bearer token. If `webhook.require_signature` is enabled, gate POST bodies also
+require `X-Draftcat-Signature`.
 
 Two properties matter more than convenience, and everything below preserves
 them:
@@ -13,14 +15,19 @@ them:
 - **The arguments are part of the approval.** The gate hashes the exact
   arguments proposed and the human approves *those*. A harness that then calls
   the tool with different arguments leaves an audit trail that does not match.
+- **One decision releases one execution.** An allowed decision is not itself an
+  execution permit. The caller atomically consumes its exact binding, and only
+  that first response carries `"permit":"execute"`.
 
 ## Asking
 
 ```
 POST /gate/tool-call
 Content-Type: application/json
+Authorization: Bearer <DRAFTCAT_WEBHOOK_SECRET>
 
 {
+	"action_id": "send-invoice-2026-114",
   "tool":   "send_email",
   "args":   {"to": "anna@example.com", "subject": "Invoice 2026-114"},
   "agent":  "harness-1",
@@ -28,26 +35,31 @@ Content-Type: application/json
 }
 ```
 
-| Field    | Meaning |
-|----------|---------|
+| Field       | Meaning |
+|-------------|---------|
+| `action_id` | Stable caller identity for this intended side effect. Matching retries return the existing state; changed data under the same ID gets `409`. Omitted clients receive a generated ID, but cannot safely retry across a restart without persisting it. |
 | `tool`   | Required. Looked up in `tool_gate.tools`. |
 | `args`   | The exact arguments the harness intends to call with. Hashed into the decision, never stored. |
 | `agent`  | Free-form caller name, shown to the operator and used to key the repeat guard. |
 | `run_id` | Optional. Ties the decision to a pipeline run in the audit trail. |
 | `mode`   | `sync` (default) or `async` — see *Collecting a decision*. |
 | `wait`   | A duration such as `30s`. Bounds a sync hold; see below. |
+| `expires_at` | Optional RFC3339 deadline that can narrow, never extend, the approval window. |
 
 Every answer has the same shape:
 
 ```json
-{"decision": "allow", "reason": "operator approved", "args_hash": "sha256:9f2b...",
- "decided_by": "operator", "approval_id": "tc_5c1e..."}
+{"action_id":"send-invoice-2026-114","decision":"allow","state":"allowed",
+ "args_hash":"sha256:9f2b...","policy_hash":"sha256:41a0...",
+ "binding_hash":"sha256:acd1...","decided_by":"operator",
+ "consume":"/gate/tool-call/send-invoice-2026-114/consume","expires_at":"2026-09-17T18:00:00Z"}
 ```
 
 `decision` is `allow`, `deny` or `pending`. `decided_by` says who settled it:
 `allowlist` (the rule itself), `policy` (an argument rule), `operator` (a
 human), or `repeat-guard`. `rule` names the config that produced a decision the
 gate made on its own, so a denial can be traced without opening the audit log.
+`state` is `pending`, `allowed`, `denied`, `expired`, or `consumed`.
 
 ## What the rule decides
 
@@ -118,17 +130,38 @@ server-side.
 
 **Async.** `"mode": "async"` answers `202 pending` immediately.
 
-Either way the harness collects the decision from
+Either way the harness collects the decision from (using the bearer token):
 
 ```
 GET /gate/tool-call/<approval_id>            # 200 pending | allow | deny
 GET /gate/tool-call/<approval_id>?wait=30s   # long-poll, capped at 100s
 ```
 
-An unknown id answers `404` with `decision: deny`. That is the fail-closed
-answer for "the gate restarted, or the id is stale": there is no decision to
-hand over, so the harness must ask again. Decided tickets stay collectable for
-an hour.
+An unknown id answers `404` with `decision: deny`. Durable action state remains
+queryable after restart. Work that was still pending when the process stopped
+becomes `expired`; it is never resumed from an unprovable in-memory point.
+
+## Consuming an allowed decision
+
+Do not execute on `state: allowed`. Atomically consume the exact binding first:
+
+```
+POST /gate/tool-call/send-invoice-2026-114/consume
+Authorization: Bearer <DRAFTCAT_WEBHOOK_SECRET>
+Content-Type: application/json
+
+{"binding_hash":"sha256:acd1..."}
+```
+
+The first matching request before expiry returns `200` with
+`"state":"consumed","permit":"execute"`. That response authorizes exactly one
+execution of the bound action. A second consume, the wrong binding, a denial,
+or an expired permit returns `409` without `permit: execute`.
+
+The action ledger is in SQLite. A retry using the same `action_id`, tool,
+arguments, caller, run, policy, and expiry returns its current state without a
+second prompt. Reusing the ID after any of those bound facts changes is a `409`
+conflict and requires a new action ID and a fresh decision.
 
 A tool call waiting on a human is written to `pending_approvals` before the
 prompt goes out, exactly like a pipeline gate. It shows up in `/pending` and
@@ -176,11 +209,11 @@ the notices off.
 
 ## Audit
 
-Every decision writes an `action_approvals` row with `pipeline = tool-gate`,
+Every decision writes a v2 `action_approvals` receipt with `pipeline = tool-gate`,
 `step = <tool>`, the argument hash as the payload hash, and the reason or rule
-in the `policy` column: `unlisted`, `args mismatch: …`, `allowlisted risk=…`,
-`repeat-guard: …`, `operator approved`. `draftcat runs --json` and
-`draftcat audit-verify` see them like any other gate decision.
+in the `policy` column. The signed envelope also carries the stable action ID,
+policy digest, exact binding, run ID, and expiry. `draftcat receipts list`,
+`show`, and `export` read the rows directly from SQLite.
 
 ## Configuration reference
 
