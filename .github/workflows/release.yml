@@ -12,6 +12,57 @@ permissions:
   packages: write
 
 jobs:
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, platform: linux, arch: x64, extension: "" }
+          - { goos: linux, goarch: arm64, platform: linux, arch: arm64, extension: "" }
+          - { goos: darwin, goarch: amd64, platform: darwin, arch: x64, extension: "" }
+          - { goos: darwin, goarch: arm64, platform: darwin, arch: arm64, extension: "" }
+          - { goos: windows, goarch: amd64, platform: win32, arch: x64, extension: ".exe" }
+          - { goos: windows, goarch: arm64, platform: win32, arch: arm64, extension: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25" }
+      - name: Build native binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          asset="draftcat-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$asset" .
+          gzip -n "$asset"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: draftcat-${{ matrix.platform }}-${{ matrix.arch }}
+          path: draftcat-*.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: draftcat-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum draftcat-*.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --title "$GITHUB_REF_NAME" draftcat-*.gz SHA256SUMS
+
   image:
     runs-on: ubuntu-latest
     steps:

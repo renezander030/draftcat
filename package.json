@@ -1,0 +1,50 @@
+{
+  "name": "draftcat",
+  "version": "0.7.0",
+  "description": "Governed AI pipelines with human approval gates",
+  "license": "MIT",
+  "author": "Rene Zander",
+  "homepage": "https://github.com/renezander030/draftcat#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renezander030/draftcat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/renezander030/draftcat/issues"
+  },
+  "keywords": [
+    "ai",
+    "approval",
+    "governance",
+    "human-in-the-loop",
+    "llm"
+  ],
+  "bin": {
+    "draftcat": "npm/draftcat.js"
+  },
+  "files": [
+    "npm/draftcat.js",
+    "npm/install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node npm/install.js",
+    "test": "node --test npm/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
