@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,7 +31,11 @@ func OpenStateStore(path string) (*StateStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state store %s: %w", path, err)
 	}
+	// Keep the connection-level pragmas on every operation in this store.
+	// SQLite permits one writer; separate store handles can share the WAL.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;`); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("state store pragmas: %w", err)
 	}
 	if err := initStateSchema(db); err != nil {
@@ -39,7 +45,39 @@ func OpenStateStore(path string) (*StateStore, error) {
 	return &StateStore{db: db}, nil
 }
 
+// OpenStateStoreReadOnly inspects an existing store without creating or migrating it.
+// Older stores must first be opened by the engine to apply their migrations.
+func OpenStateStoreReadOnly(path string) (*StateStore, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	uriPath := filepath.ToSlash(absolute)
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	u := url.URL{Scheme: "file", Path: uriPath}
+	q := u.Query()
+	q.Set("mode", "ro")
+	q.Set("_pragma", "busy_timeout(5000)")
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &StateStore{db: db}, nil
+}
+
 func initStateSchema(db *sql.DB) error {
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	const schema = `
 CREATE TABLE IF NOT EXISTS seen_items (
     pipeline TEXT NOT NULL,
@@ -58,7 +96,6 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     run_id      TEXT NOT NULL DEFAULT ''       -- minted at run start; joins to action_approvals
 );
 CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON pipeline_runs(pipeline, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_runs_runid ON pipeline_runs(run_id);
 CREATE TABLE IF NOT EXISTS action_approvals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline     TEXT    NOT NULL,
@@ -82,7 +119,6 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     lifecycle    TEXT    NOT NULL DEFAULT 'decided'
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
-CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline     TEXT    NOT NULL,
@@ -116,6 +152,7 @@ CREATE TABLE IF NOT EXISTS webhook_admissions (
     id          TEXT PRIMARY KEY,
     pipeline    TEXT NOT NULL,
     body_hash   TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL,
     error_text  TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL,
@@ -123,7 +160,7 @@ CREATE TABLE IF NOT EXISTS webhook_admissions (
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(status, created_at);
 `
-	if _, err := db.ExecContext(context.Background(), schema); err != nil {
+	if _, err := tx.ExecContext(context.Background(), schema); err != nil {
 		return err
 	}
 	// Migrate stores created before signed receipts existed: add the columns if
@@ -147,12 +184,33 @@ CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(s
 		`ALTER TABLE action_approvals ADD COLUMN binding_hash TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE action_approvals ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE action_approvals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'decided'`,
+		`ALTER TABLE webhook_admissions ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''`,
 	} {
-		if _, err := db.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		if _, err := tx.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
 		}
 	}
-	return nil
+	if _, err := tx.ExecContext(context.Background(), `
+ CREATE INDEX IF NOT EXISTS idx_runs_runid ON pipeline_runs(run_id);
+ CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
+ CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_idempotency ON webhook_admissions(pipeline, idempotency_key) WHERE idempotency_key <> '';
+ `); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// TryMarkSeen atomically claims one item. Exactly one concurrent caller wins.
+func (s *StateStore) TryMarkSeen(pipeline, scope, id string, at time.Time) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("state store unavailable")
+	}
+	res, err := s.db.ExecContext(context.Background(), `INSERT OR IGNORE INTO seen_items (pipeline, scope, item_id, seen_at) VALUES (?, ?, ?, ?)`, pipeline, scope, id, at.Unix())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // FilterUnseen returns the subset of ids not previously marked as seen for
@@ -222,6 +280,11 @@ func (s *StateStore) MarkSeen(pipeline, scope string, ids []string) error {
 // RecordRun appends a pipeline run record. Failures here are surfaced but
 // must not halt the engine — observability is best-effort.
 func (s *StateStore) RecordRun(pipeline string, started, ended time.Time, runErr error) error {
+	return s.RecordRunForID("", pipeline, started, ended, runErr)
+}
+
+// RecordRunForID records the exact identity carried by this run's approvals.
+func (s *StateStore) RecordRunForID(runID, pipeline string, started, ended time.Time, runErr error) error {
 	status := "ok"
 	var errText string
 	if runErr != nil {
@@ -229,8 +292,8 @@ func (s *StateStore) RecordRun(pipeline string, started, ended time.Time, runErr
 		errText = runErr.Error()
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO pipeline_runs (pipeline, started_at, ended_at, status, error_text) VALUES (?, ?, ?, ?, ?)`,
-		pipeline, started.Unix(), ended.Unix(), status, errText,
+		`INSERT INTO pipeline_runs (run_id, pipeline, started_at, ended_at, status, error_text) VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, pipeline, started.Unix(), ended.Unix(), status, errText,
 	)
 	return err
 }
@@ -238,6 +301,7 @@ func (s *StateStore) RecordRun(pipeline string, started, ended time.Time, runErr
 // RecentRuns returns the last n runs for a pipeline, newest first. Used by
 // the /status operator command.
 type RunRecord struct {
+	RunID     string
 	Pipeline  string
 	StartedAt time.Time
 	EndedAt   time.Time
@@ -247,7 +311,7 @@ type RunRecord struct {
 
 func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`,
+		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`,
 		pipeline, n,
 	)
 	if err != nil {
@@ -258,7 +322,7 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var st, en int64
-		if err := rows.Scan(&r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
+		if err := rows.Scan(&r.RunID, &r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
 			return nil, err
 		}
 		r.StartedAt = time.Unix(st, 0)
@@ -287,7 +351,7 @@ func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT pipeline, started_at, ended_at, status, COALESCE(error_text,'')
+		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'')
 		   FROM pipeline_runs ORDER BY started_at DESC LIMIT ?`, n)
 	if err != nil {
 		return nil, err
@@ -297,7 +361,7 @@ func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
 	for rows.Next() {
 		var r RunRecord
 		var st, en int64
-		if err := rows.Scan(&r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
+		if err := rows.Scan(&r.RunID, &r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
 			return nil, err
 		}
 		r.StartedAt = time.Unix(st, 0)
@@ -838,24 +902,57 @@ func (s *StateStore) ExpireToolActions(at time.Time) error {
 
 // WebhookAdmission is the durable evidence that an HTTP trigger was accepted.
 type WebhookAdmission struct {
-	ID        string
-	Pipeline  string
-	BodyHash  string
-	Status    string
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	IdempotencyKey string // SHA-256 of the caller key, never its raw value.
+	ID             string
+	Pipeline       string
+	BodyHash       string
+	Status         string
+	Error          string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // BeginWebhookAdmission writes the accepted record before the handler returns 202.
 func (s *StateStore) BeginWebhookAdmission(a WebhookAdmission) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("state store unavailable")
-	}
-	_, err := s.db.ExecContext(context.Background(),
-		`INSERT INTO webhook_admissions (id, pipeline, body_hash, status, created_at, updated_at)
-		 VALUES (?, ?, ?, 'accepted', ?, ?)`, a.ID, a.Pipeline, a.BodyHash, a.CreatedAt.Unix(), a.UpdatedAt.Unix())
+	_, _, err := s.AdmitWebhook(a)
 	return err
+}
+
+// AdmitWebhook atomically reserves a pipeline-scoped retry identity.
+func (s *StateStore) AdmitWebhook(a WebhookAdmission) (WebhookAdmission, bool, error) {
+	if s == nil || s.db == nil {
+		return a, false, fmt.Errorf("state store unavailable")
+	}
+	res, err := s.db.ExecContext(context.Background(), `INSERT OR IGNORE INTO webhook_admissions
+ (id, pipeline, body_hash, idempotency_key, status, created_at, updated_at)
+ VALUES (?, ?, ?, ?, 'accepted', ?, ?)`, a.ID, a.Pipeline, a.BodyHash, a.IdempotencyKey, a.CreatedAt.Unix(), a.UpdatedAt.Unix())
+	if err != nil {
+		return a, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return a, false, err
+	}
+	var saved WebhookAdmission
+	if a.IdempotencyKey == "" {
+		saved, err = s.WebhookAdmission(a.ID)
+	} else {
+		saved, err = s.WebhookAdmissionForKey(a.Pipeline, a.IdempotencyKey)
+	}
+	if err != nil {
+		return saved, false, err
+	}
+	if saved.Pipeline != a.Pipeline || saved.BodyHash != a.BodyHash {
+		return saved, false, fmt.Errorf("idempotency key is already bound to another request body")
+	}
+	return saved, n == 1, nil
+}
+
+func (s *StateStore) WebhookAdmissionForKey(pipeline, key string) (WebhookAdmission, error) {
+	if s == nil || s.db == nil {
+		return WebhookAdmission{}, sql.ErrNoRows
+	}
+	return scanWebhookAdmission(s.db.QueryRowContext(context.Background(), `SELECT id, pipeline, body_hash, idempotency_key, status, error_text, created_at, updated_at FROM webhook_admissions WHERE pipeline=? AND idempotency_key=?`, pipeline, key).Scan)
 }
 
 // FinishWebhookAdmission records the terminal pipeline outcome.
@@ -874,17 +971,24 @@ func (s *StateStore) WebhookAdmission(id string) (WebhookAdmission, error) {
 	if s == nil || s.db == nil {
 		return WebhookAdmission{}, sql.ErrNoRows
 	}
+	return scanWebhookAdmission(s.db.QueryRowContext(context.Background(), `SELECT id, pipeline, body_hash, idempotency_key, status, error_text, created_at, updated_at FROM webhook_admissions WHERE id=?`, id).Scan)
+}
+
+func scanWebhookAdmission(scan func(...interface{}) error) (WebhookAdmission, error) {
 	var a WebhookAdmission
 	var created, updated int64
-	err := s.db.QueryRowContext(context.Background(),
-		`SELECT id, pipeline, body_hash, status, error_text, created_at, updated_at
-		 FROM webhook_admissions WHERE id=?`, id).Scan(
-		&a.ID, &a.Pipeline, &a.BodyHash, &a.Status, &a.Error, &created, &updated)
+	err := scan(&a.ID, &a.Pipeline, &a.BodyHash, &a.IdempotencyKey, &a.Status, &a.Error, &created, &updated)
 	if err != nil {
 		return a, err
 	}
 	a.CreatedAt, a.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 	return a, nil
+}
+
+// RevokeToolAction closes an allowed permit whose policy no longer applies.
+func (s *StateStore) RevokeToolAction(id, policy string, at time.Time) error {
+	_, err := s.db.ExecContext(context.Background(), `UPDATE tool_actions SET status='expired', decision='deny', reason='policy changed; request a new approval', updated_at=? WHERE action_id=? AND policy_hash=? AND status='allowed'`, at.Unix(), id, policy)
+	return err
 }
 
 // InterruptWebhookAdmissions makes accepted work visible after a restart.

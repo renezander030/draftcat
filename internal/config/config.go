@@ -8,6 +8,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
 	"path"
 	"regexp"
 	"sort"
@@ -573,7 +575,7 @@ type ToolRule struct {
 }
 
 // ArgConstraint is one condition on one argument. Every non-empty field must
-// hold. Values are compared in their string form (numbers without exponent,
+// hold. Values are compared in their string form (JSON number spelling is retained,
 // booleans as true/false, anything structured as compact JSON) except min/max,
 // which need a number.
 type ArgConstraint struct {
@@ -631,14 +633,14 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 		}
 	}
 	if c.Max != nil || c.Min != nil {
-		f, ok := argNumber(v)
+		f, ok := exactArgNumber(v)
 		if !ok {
 			return false, fmt.Sprintf("%q is not a number", clip(s))
 		}
-		if c.Max != nil && f > *c.Max {
+		if c.Max != nil && (math.IsNaN(*c.Max) || math.IsInf(*c.Max, 0) || f.Cmp(exactBound(*c.Max)) > 0) {
 			return false, fmt.Sprintf("%s exceeds max %s", s, strconv.FormatFloat(*c.Max, 'f', -1, 64))
 		}
-		if c.Min != nil && f < *c.Min {
+		if c.Min != nil && (math.IsNaN(*c.Min) || math.IsInf(*c.Min, 0) || f.Cmp(exactBound(*c.Min)) < 0) {
 			return false, fmt.Sprintf("%s is below min %s", s, strconv.FormatFloat(*c.Min, 'f', -1, 64))
 		}
 	}
@@ -673,25 +675,25 @@ func ArgString(v interface{}) string {
 	}
 }
 
-func argNumber(v interface{}) (float64, bool) {
-	switch x := v.(type) {
-	case float64:
-		return x, true
-	case float32:
-		return float64(x), true
-	case int:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	case json.Number:
-		f, err := x.Float64()
-		return f, err == nil
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		return f, err == nil
-	default:
-		return 0, false
+func exactBound(v float64) *big.Rat {
+	r, _ := new(big.Rat).SetString(strconv.FormatFloat(v, 'g', -1, 64))
+	return r
+}
+
+func exactArgNumber(v interface{}) (*big.Rat, bool) {
+	s := strings.TrimSpace(ArgString(v))
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		exponent, err := strconv.Atoi(s[i+1:])
+		if err != nil || exponent < -4096 || exponent > 4096 {
+			return nil, false
+		}
 	}
+	// Bound exponent work and reject NaN/Inf while retaining exact decimal digits.
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, false
+	}
+	return new(big.Rat).SetString(s)
 }
 
 func clip(s string) string {

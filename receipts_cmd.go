@@ -65,7 +65,7 @@ func receiptView(r statestore.ApprovalRecord, secret []byte) receiptJSON {
 
 func runReceiptsCmd(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: draftcat receipts <list|show|export> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: draftcat receipts <list|show|export|verify> [options]")
 		return 2
 	}
 	switch args[0] {
@@ -75,11 +75,14 @@ func runReceiptsCmd(args []string) int {
 		return runReceiptsShow(args[1:])
 	case "export":
 		return runReceiptsExport(args[1:])
+	case "verify":
+		return runReceiptsVerify(args[1:])
 	case "-h", "--help", "help":
-		fmt.Println("Usage: draftcat receipts <list|show|export> [options]")
+		fmt.Println("Usage: draftcat receipts <list|show|export|verify> [options]")
 		fmt.Println("  list   [--pipeline name] [--limit N] [--json] [--config path]")
 		fmt.Println("  show   <receipt-id> [--config path]")
 		fmt.Println("  export [--pipeline name] [--limit N] [--out path] [--config path]")
+		fmt.Println("  verify <file.jsonl|-> [--json]  check signed fields without opening SQLite")
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "receipts: unknown command %q\n", args[0])

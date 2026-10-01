@@ -44,7 +44,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -261,13 +260,12 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		http.Error(w, "unreadable body", http.StatusBadRequest)
+	body, ok := readRequestBody(w, r, 1<<20)
+	if !ok {
 		return
 	}
 	var req ToolCallRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeStrictJSON(body, &req); err != nil {
 		http.Error(w, "malformed json", http.StatusBadRequest)
 		return
 	}
@@ -305,7 +303,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 
 	argsHash := hashToolArgs(req.Args)
 	rule, listed := g.cfg.ToolGate.Lookup(req.Tool)
-	policyHash := hashToolPolicy(req.Tool, rule, listed)
+	policyHash := g.policyHash(req.Tool, rule, listed)
 	expires := g.now().Add(g.approvalWindow())
 	if strings.TrimSpace(req.ExpiresAt) != "" {
 		requested, err := time.Parse(time.RFC3339, req.ExpiresAt)
@@ -541,12 +539,40 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	var body struct {
 		BindingHash string `json:"binding_hash"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+	raw, ok := readRequestBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := decodeStrictJSON(raw, &body); err != nil {
 		http.Error(w, "malformed json", http.StatusBadRequest)
 		return
 	}
 	now := g.now()
 	if state != nil {
+		saved, err := state.ToolAction(id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeToolDecision(w, http.StatusNotFound, ToolCallResponse{ActionID: id, Decision: "deny", State: "denied", Reason: "unknown action id"})
+			} else {
+				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+			}
+			return
+		}
+		if saved.BindingHash != body.BindingHash {
+			writeToolDecision(w, http.StatusConflict, responseFromToolAction(saved))
+			return
+		}
+		rule, listed := g.cfg.ToolGate.Lookup(saved.Tool)
+		if saved.PolicyHash != g.policyHash(saved.Tool, rule, listed) {
+			if err := state.RevokeToolAction(id, saved.PolicyHash, now); err != nil {
+				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			resp := responseFromToolAction(saved)
+			resp.Decision, resp.State, resp.Permit, resp.Consume, resp.Reason = "deny", "expired", "", "", "policy changed; request a new approval"
+			writeToolDecision(w, http.StatusConflict, resp)
+			return
+		}
 		a, consumed, err := state.ConsumeToolAction(id, body.BindingHash, now)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -577,6 +603,13 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	g.mu.Unlock()
 	if tk == nil {
 		writeToolDecision(w, http.StatusNotFound, ToolCallResponse{ActionID: id, Decision: "deny", State: "denied", Reason: "unknown action id"})
+		return
+	}
+	rule, listed := g.cfg.ToolGate.Lookup(tk.Tool)
+	if tk.PolicyHash != g.policyHash(tk.Tool, rule, listed) {
+		resp, _ := tk.result()
+		resp.Decision, resp.State, resp.Permit, resp.Consume, resp.Reason = "deny", "expired", "", "", "policy changed; request a new approval"
+		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
 	resp, ok := tk.consume(body.BindingHash, now)
@@ -836,6 +869,18 @@ func validActionID(id string) bool {
 		return false
 	}
 	return true
+}
+
+func (g *toolGate) policyHash(tool string, rule config.ToolRule, listed bool) string {
+	b, _ := json.Marshal(struct {
+		ToolPolicy     string
+		Enabled        bool
+		ApprovalWindow int64
+		Telegram       config.TelegramConfig
+		Relay          config.RelayConfig
+	}{hashToolPolicy(tool, rule, listed), g.cfg.ToolGate.Enabled, int64(g.approvalWindow()), g.cfg.Telegram, g.cfg.Relay})
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func hashToolPolicy(tool string, rule config.ToolRule, listed bool) string {

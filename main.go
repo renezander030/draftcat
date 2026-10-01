@@ -6,8 +6,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/renezander030/draftcat/internal/config"
 	skillsapi "github.com/renezander030/draftcat/internal/skills"
@@ -1253,7 +1255,16 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *BudgetTracker, ch OperatorChannel, skills *skillsapi.SkillRegistry, seed map[string]interface{}) (err error) {
 	// One identity for this run, minted before any work happens so every
 	// approval and audit row produced below can be joined back to it.
-	runID := newRunID(time.Now())
+	startedAt := time.Now()
+	runID := newRunID(startedAt)
+	runStore := state
+	defer func() {
+		if runStore != nil {
+			if recordErr := runStore.RecordRunForID(runID, pipeline.Name, startedAt, time.Now(), err); recordErr != nil {
+				log.Printf("[pipeline:%s] record run: %v", pipeline.Name, recordErr)
+			}
+		}
+	}()
 	log.Printf("[pipeline:%s] starting (run %s)", pipeline.Name, runID)
 	budget.tokensUsedPipeline = 0
 	budget.costPipeline = 0
@@ -2615,7 +2626,7 @@ func runAuditVerify(args []string) int {
 		statePath = "./state.db"
 	}
 
-	st, err := statestore.OpenStateStore(statePath)
+	st, err := statestore.OpenStateStoreReadOnly(statePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open state store %s: %v\n", statePath, err)
 		return 1
@@ -2647,6 +2658,9 @@ func main() {
 	// Subcommand dispatch. The bare form `draftcat [config.yaml] [skills/]` still runs the engine.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "version", "--version", "-v":
+			fmt.Println("draftcat " + version)
+			return
 		case "validate":
 			os.Exit(validate.Run(os.Args[2:]))
 		case "test":
@@ -2674,7 +2688,7 @@ func main() {
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
-			fmt.Println("  draftcat receipts <list|show|export>   inspect and export verification-ready receipts")
+			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat zk-receipt <command>          prove an approval without revealing its private fields")
 			fmt.Println("  draftcat fhe-vote <command>             count encrypted approval votes without reading them")
@@ -3217,56 +3231,66 @@ const webhookSigHeader = "X-Draftcat-Signature"
 // Errors are deliberately specific for the log and generic for the caller — the
 // handler returns a bare 401 so a prober learns nothing about which check failed.
 func verifyWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) error {
+	sig, err := authenticateWebhookSignature(header, body, secret, maxSkewSeconds, now)
+	if err != nil {
+		return err
+	}
+	return claimWebhookSignature(sig, now)
+}
+
+func claimWebhookSignature(sig string, now time.Time) error {
+	if state != nil {
+		won, err := state.TryMarkSeen(webhookReplayScope, "sig", sig, now)
+		if err != nil {
+			return fmt.Errorf("replay record failed: %w", err)
+		}
+		if !won {
+			return fmt.Errorf("signature already used (replay)")
+		}
+	}
+	return nil
+}
+
+func authenticateWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) (string, error) {
 	if header == "" {
-		return fmt.Errorf("missing %s header", webhookSigHeader)
+		return "", fmt.Errorf("missing %s header", webhookSigHeader)
 	}
 	var tsPart, sigPart string
 	for _, field := range strings.Split(header, ",") {
 		field = strings.TrimSpace(field)
 		switch {
 		case strings.HasPrefix(field, "t="):
+			if tsPart != "" {
+				return "", fmt.Errorf("duplicate timestamp")
+			}
 			tsPart = strings.TrimPrefix(field, "t=")
 		case strings.HasPrefix(field, "v1="):
+			if sigPart != "" {
+				return "", fmt.Errorf("duplicate signature")
+			}
 			sigPart = strings.TrimPrefix(field, "v1=")
 		}
 	}
 	if tsPart == "" || sigPart == "" {
-		return fmt.Errorf("malformed signature header (want t=<unix>,v1=<hex>)")
+		return "", fmt.Errorf("malformed signature header")
 	}
 	ts, err := strconv.ParseInt(tsPart, 10, 64)
 	if err != nil {
-		return fmt.Errorf("unparseable timestamp %q", tsPart)
+		return "", fmt.Errorf("unparseable timestamp")
 	}
-	if skew := now.Unix() - ts; skew > maxSkewSeconds || skew < -maxSkewSeconds {
-		return fmt.Errorf("timestamp outside %ds window (skew %ds)", maxSkewSeconds, skew)
+	// Compare bounds instead of subtracting an attacker-controlled timestamp.
+	if ts < now.Unix()-maxSkewSeconds || ts > now.Unix()+maxSkewSeconds {
+		return "", fmt.Errorf("timestamp outside %ds window", maxSkewSeconds)
 	}
-
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(tsPart))
 	mac.Write([]byte("."))
 	mac.Write(body)
 	want := hex.EncodeToString(mac.Sum(nil))
 	if subtle.ConstantTimeCompare([]byte(want), []byte(sigPart)) != 1 {
-		return fmt.Errorf("signature mismatch")
+		return "", fmt.Errorf("signature mismatch")
 	}
-
-	// Replay guard. Within the skew window a valid signature is otherwise
-	// reusable, so each one is spent exactly once. Reuses the existing dedup
-	// table rather than adding a second store. With no state store configured
-	// the signature still authenticates — we just cannot promise single-use.
-	if state != nil {
-		unseen, ferr := state.FilterUnseen(webhookReplayScope, "sig", []string{sigPart})
-		if ferr != nil {
-			return fmt.Errorf("replay check failed: %w", ferr)
-		}
-		if len(unseen) == 0 {
-			return fmt.Errorf("signature already used (replay)")
-		}
-		if merr := state.MarkSeen(webhookReplayScope, "sig", []string{sigPart}); merr != nil {
-			return fmt.Errorf("replay record failed: %w", merr)
-		}
-	}
-	return nil
+	return sigPart, nil
 }
 
 // webhookReplayScope namespaces spent webhook signatures in seen_items. The
@@ -3298,6 +3322,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		maxSkew = 300
 	}
 	hookable := webhookPipelines(cfg)
+	var admissionMu sync.Mutex
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -3337,7 +3362,10 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 					return
 				}
 				if r.Method == http.MethodPost {
-					body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+					body, ok := readRequestBody(w, r, maxBody)
+					if !ok {
+						return
+					}
 					r.Body = io.NopCloser(bytes.NewReader(body))
 					sigHeader := r.Header.Get(webhookSigHeader)
 					if sigHeader != "" || cfg.Webhook.RequireSignature {
@@ -3403,16 +3431,21 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 
 		// The body must be read before the signature can be checked, since the
 		// signature covers it — that binding is the point.
-		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		body, ok := readRequestBody(w, r, maxBody)
+		if !ok {
+			return
+		}
 
 		// A signature is verified whenever it is present, and demanded when
 		// require_signature is on. Verifying an unrequested-but-present header
 		// means a signer that starts emitting bad signatures fails loudly
 		// instead of being silently ignored.
 		sigHeader := r.Header.Get(webhookSigHeader)
+		var signature string
 		if sigHeader != "" || cfg.Webhook.RequireSignature {
-			if err := verifyWebhookSignature(sigHeader, body, secret, maxSkew, time.Now()); err != nil {
-				log.Printf("[webhook][security] signature rejected: %v", err)
+			var err error
+			signature, err = authenticateWebhookSignature(sigHeader, body, secret, maxSkew, time.Now())
+			if err != nil {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -3425,26 +3458,76 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			return
 		}
 
+		key := r.Header.Get("Idempotency-Key")
+		if key != "" && !validActionID(key) {
+			http.Error(w, "Idempotency-Key must be 1-128 URL-safe characters", http.StatusBadRequest)
+			return
+		}
+		keyHash := ""
+		if key != "" {
+			if state == nil {
+				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			sum := sha256.Sum256([]byte(key))
+			keyHash = hex.EncodeToString(sum[:])
+		}
+		bodySum := sha256.Sum256(body)
+		bodyHash := "sha256:" + hex.EncodeToString(bodySum[:])
+		admissionMu.Lock()
+		defer admissionMu.Unlock()
+		if keyHash != "" {
+			existing, err := state.WebhookAdmissionForKey(name, keyHash)
+			if err == nil {
+				if existing.BodyHash != bodyHash {
+					http.Error(w, "idempotency key is already bound to another request body", http.StatusConflict)
+					return
+				}
+				writeWebhookAdmission(w, existing)
+				return
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		ok, reason := sched.TryStart(name)
 		if !ok {
 			http.Error(w, reason, http.StatusConflict)
 			return
 		}
-
+		if signature != "" {
+			if err := claimWebhookSignature(signature, time.Now()); err != nil {
+				sched.SetRunning(name, false)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
 		admissionID := "wh_" + strings.TrimPrefix(newToolTicketID(), "tc_")
-		bodySum := sha256.Sum256(body)
-		bodyHash := "sha256:" + hex.EncodeToString(bodySum[:])
 		now := time.Now()
+		admission := statestore.WebhookAdmission{ID: admissionID, Pipeline: name, BodyHash: bodyHash, IdempotencyKey: keyHash, Status: "accepted", CreatedAt: now, UpdatedAt: now}
 		if state != nil {
-			if err := state.BeginWebhookAdmission(statestore.WebhookAdmission{
-				ID: admissionID, Pipeline: name, BodyHash: bodyHash, CreatedAt: now, UpdatedAt: now,
-			}); err != nil {
+			saved, created, err := state.AdmitWebhook(admission)
+			if err != nil {
 				sched.SetRunning(name, false)
 				log.Printf("[webhook] durable admission failed: %v", err)
+				if saved.ID != "" {
+					http.Error(w, "idempotency key is already bound to another request body", http.StatusConflict)
+				} else {
+					http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+				}
+				return
+			}
+			if !created {
+				sched.SetRunning(name, false)
+				writeWebhookAdmission(w, saved)
+				return
+			}
+			if err := state.FinishWebhookAdmission(admissionID, "running", "", now); err != nil {
+				sched.SetRunning(name, false)
 				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
 				return
 			}
-			_ = state.FinishWebhookAdmission(admissionID, "running", "", now)
 		}
 
 		log.Printf("[webhook] triggering pipeline %s (%d body bytes)", name, len(body))
@@ -3466,15 +3549,15 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			sched.MarkRun(p.Name)
 		}(p, body, admissionID)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"admission_id": admissionID,
-			"status":       "accepted",
-			"poll":         "/hooks/status/" + admissionID,
-		})
+		writeWebhookAdmission(w, admission)
 	})
 	return mux
+}
+
+func writeWebhookAdmission(w http.ResponseWriter, a statestore.WebhookAdmission) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"admission_id": a.ID, "status": a.Status, "poll": "/hooks/status/" + a.ID})
 }
 
 func resolveEnv(names ...string) string {

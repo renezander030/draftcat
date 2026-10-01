@@ -32,7 +32,7 @@ decision fields with HMAC-SHA256:
 - quorum result
 - policy and policy digest
 - binding digest
-- permit expiry and lifecycle
+- permit expiry
 - nonce
 
 See [`internal/approval/receipt.go`](../internal/approval/receipt.go). If any
@@ -106,6 +106,17 @@ draftcat receipts export --out receipts.jsonl
 Set `DRAFTCAT_APPROVAL_SECRET` while reading to receive `verification: ok` or
 `tampered`. Signed rows without the key report `unverified`; unsigned rows
 report `unsigned` explicitly.
+
+Verify exported records without opening SQLite:
+
+```bash
+draftcat receipts verify receipts.jsonl --json
+cat receipts.jsonl | draftcat receipts verify -
+```
+
+This requires `DRAFTCAT_APPROVAL_SECRET`, checks each signed v1/v2 field set,
+and returns nonzero for unsigned or tampered rows. It does not certify export
+completeness or unsigned `lifecycle` metadata. See the [reliability guide](reliability.md).
 
 ## Design rule
 

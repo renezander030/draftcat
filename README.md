@@ -65,6 +65,8 @@ Sometimes a customer, auditor, or partner needs evidence that a human approved a
 
 This is an **experimental cryptographic preview**, not a production compliance claim. It uses an embedded BN254/Groth16 circuit and a development single-party setup; the circuit has not received an independent audit. Use it to evaluate the disclosure model, then replace the setup through a ceremony before relying on it in production. See [zero-knowledge approval proofs](docs/zk-approval-proofs.md) for the trust model, exact statement, and limitations.
 
+> **New in v0.8.0:** webhook retries can carry a durable `Idempotency-Key`, signed replay identities are claimed atomically, and tool permits recheck their policy before execution. Requests reject oversized or ambiguous data and retain exact numbers. Older state stores upgrade safely; completed and failed runs carry exact approval identities. Audit commands read without modifying the database, and `draftcat receipts verify` checks exported JSONL offline. See the [upgrade and reliability guide](docs/reliability.md).
+>
 > **New in v0.7.0:** execution decisions now carry their proof. Every tool-gate route is authenticated, each request has a stable action identity and exact policy binding, and an allowed decision becomes an atomic consume-once permit before the side effect runs. Webhook acceptance is durable before HTTP 202 and can be polled after handoff. Versioned receipts bind action, payload, policy, and expiry, with `draftcat receipts list|show|export` for verification-ready JSONL. Ordered `model_policy` rules can deny or send matching model input/output to a human, while `/healthz` and `/readyz` give orchestrators a safe listener contract.
 >
 > **In v0.6.0:** the gate holds under load. The [tool-call gate](docs/tool-gate.md) answers asynchronously (`mode: async`, `wait:`) so a harness with a short HTTP timeout never loses a decision, and a tool call waiting on a human is durable across a restart. Rules constrain arguments (`args:` - glob, regex, `one_of`, `min`/`max`) and never widen on a mismatch. A repeat guard stops an agent that loops on one call from paging you, the operator hears about denials the gate made on its own, `/pending` and `draftcat pending` list every open gate, `/status` shows spend against caps, cost caps enforce the provider's real charge, rate limits back off instead of failing the run - and one Telegram update pump fixes taps that were silently lost while two gates were open at once.
@@ -137,6 +139,12 @@ draftcat --help
 ```
 
 The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required.
+
+With a Go toolchain, install the CLI from the module:
+
+```bash
+go install github.com/renezander030/draftcat@latest
+```
 
 Or build from source:
 
