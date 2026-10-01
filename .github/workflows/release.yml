@@ -11,8 +11,33 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  verify:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: Check release version
+        run: |
+          test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+          test "$(go run . --version)" = "draftcat ${GITHUB_REF_NAME#v}"
+      - run: go test -short -count=1 -timeout 60s ./...
+      - run: go test -short -tags voice -count=1 -timeout 60s ./...
+      - run: go run . validate
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm pack --dry-run
+
   binaries:
+    needs: verify
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     strategy:
@@ -27,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: "1.25" }
+        with: { go-version-file: go.mod }
       - name: Build native binary
         env:
           GOOS: ${{ matrix.goos }}
@@ -35,7 +60,7 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           asset="draftcat-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
-          go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$asset" .
+          go build -trimpath -buildvcs=false -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "$asset" .
           gzip -n "$asset"
       - uses: actions/upload-artifact@v4
         with:
@@ -61,9 +86,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum draftcat-*.gz > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --title "$GITHUB_REF_NAME" draftcat-*.gz SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber draftcat-*.gz SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --title "$GITHUB_REF_NAME" draftcat-*.gz SHA256SUMS
+          fi
 
   image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,3 +122,27 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Smoke-test the published native asset
+        run: |
+          node npm/install.js
+          test "$(node npm/draftcat.js --version)" = "draftcat ${GITHUB_REF_NAME#v}"
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

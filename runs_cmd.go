@@ -33,6 +33,7 @@ import (
 // was decided, by whom.
 
 type runJSON struct {
+	RunID     string         `json:"run_id,omitempty"`
 	Pipeline  string         `json:"pipeline"`
 	StartedAt string         `json:"started_at"`
 	EndedAt   string         `json:"ended_at"`
@@ -120,6 +121,7 @@ func runRunsCmd(args []string) int {
 	out := make([]runJSON, 0, len(runs))
 	for _, r := range runs {
 		out = append(out, runJSON{
+			RunID:     r.RunID,
 			Pipeline:  r.Pipeline,
 			StartedAt: r.StartedAt.Format(time.RFC3339),
 			EndedAt:   r.EndedAt.Format(time.RFC3339),
@@ -170,18 +172,22 @@ func runRunsCmd(args []string) int {
 	return 0
 }
 
-// approvalsDuring attaches the approval decisions recorded inside a run's
-// window. There is no run_id on action_approvals, but the scheduler refuses to
-// start a pipeline that is already running, so runs of one pipeline never
-// overlap and the timestamp window is an unambiguous join.
+// approvalsDuring joins by exact run ID. Historical rows without an identity
+// retain the legacy timestamp join, restricted to other identity-less rows.
 func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approvalJSON {
-	recs, err := st.ApprovalsForPipeline(r.Pipeline, 1000)
+	var recs []statestore.ApprovalRecord
+	var err error
+	if r.RunID != "" {
+		recs, err = st.ApprovalsForRun(r.RunID)
+	} else {
+		recs, err = st.ApprovalsForPipeline(r.Pipeline, 1000)
+	}
 	if err != nil {
 		return nil
 	}
 	var out []approvalJSON
 	for _, a := range recs {
-		if a.DecidedAt.Before(r.StartedAt) || a.DecidedAt.After(r.EndedAt) {
+		if r.RunID == "" && (a.RunID != "" || a.DecidedAt.Before(r.StartedAt) || a.DecidedAt.After(r.EndedAt)) {
 			continue
 		}
 		out = append(out, approvalJSON{
@@ -199,7 +205,7 @@ func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approv
 }
 
 // openStateForCmd resolves the state path exactly like the engine does — env
-// override, then config, then ./state.db — and opens it read-only enough for a
+// override, then config, then ./state.db — and opens it read-only for a
 // reporting command.
 func openStateForCmd(configPath string) (*statestore.StateStore, func(), int) {
 	statePath := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
@@ -217,7 +223,7 @@ func openStateForCmd(configPath string) (*statestore.StateStore, func(), int) {
 	if statePath == "" {
 		statePath = "./state.db"
 	}
-	st, err := statestore.OpenStateStore(statePath)
+	st, err := statestore.OpenStateStoreReadOnly(statePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runs: open state store %s: %v\n", statePath, err)
 		return nil, func() {}, 1
