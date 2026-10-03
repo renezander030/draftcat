@@ -148,6 +148,30 @@ CREATE TABLE IF NOT EXISTS tool_actions (
     consumed_at  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tool_actions_status ON tool_actions(status, updated_at);
+CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
+    action_id    TEXT PRIMARY KEY REFERENCES tool_actions(action_id),
+    binding_hash TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+    result_hash  TEXT NOT NULL DEFAULT '',
+    completed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budget_days (
+    day          TEXT PRIMARY KEY,
+    tokens       INTEGER NOT NULL DEFAULT 0,
+    cost         REAL NOT NULL DEFAULT 0,
+    calls        INTEGER NOT NULL DEFAULT 0,
+    call_minutes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS budget_calls (
+    call_id      TEXT PRIMARY KEY,
+    day          TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    tokens       INTEGER NOT NULL DEFAULT 0,
+    cost         REAL NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    settled_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_budget_calls_status ON budget_calls(status);
 CREATE TABLE IF NOT EXISTS webhook_admissions (
     id          TEXT PRIMARY KEY,
     pipeline    TEXT NOT NULL,
@@ -853,7 +877,7 @@ func (s *StateStore) ConsumeToolAction(id, bindingHash string, at time.Time) (To
 	}
 	res, err := s.db.ExecContext(context.Background(),
 		`UPDATE tool_actions SET status='consumed', consumed_at=?, updated_at=?
-		 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at>=?`,
+		 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at>?`,
 		at.Unix(), at.Unix(), id, bindingHash, at.Unix())
 	if err != nil {
 		return ToolAction{}, false, err
@@ -863,7 +887,7 @@ func (s *StateStore) ConsumeToolAction(id, bindingHash string, at time.Time) (To
 		if _, err := s.db.ExecContext(context.Background(),
 			`UPDATE tool_actions SET status='expired', decision='deny',
 			 reason='permit expired before consumption', updated_at=?
-			 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at<?`,
+			 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at<=?`,
 			at.Unix(), id, bindingHash, at.Unix()); err != nil {
 			return ToolAction{}, false, err
 		}
@@ -893,7 +917,7 @@ func (s *StateStore) ExpireToolActions(at time.Time) error {
 	if _, err = tx.ExecContext(context.Background(),
 		`UPDATE tool_actions SET status='expired', decision='deny',
 		 reason='permit expired before consumption', updated_at=?
-		 WHERE status='allowed' AND expires_at<?`, at.Unix(), at.Unix()); err != nil {
+		 WHERE status='allowed' AND expires_at<=?`, at.Unix(), at.Unix()); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

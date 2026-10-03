@@ -8,15 +8,16 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/renezander030/draftcat/internal/outputschema"
 	"gopkg.in/yaml.v3"
 )
 
 type SkillDef struct {
-	Name         string                 `yaml:"name"`
-	Description  string                 `yaml:"description"`
-	Role         string                 `yaml:"role"`
-	Prompt       string                 `yaml:"prompt"`
-	OutputSchema map[string]interface{} `yaml:"output_schema"`
+	Name         string              `yaml:"name"`
+	Description  string              `yaml:"description"`
+	Role         string              `yaml:"role"`
+	Prompt       string              `yaml:"prompt"`
+	OutputSchema outputschema.Schema `yaml:"output_schema"`
 }
 
 // SkillRegistry loads and holds all skills from the skills/ directory.

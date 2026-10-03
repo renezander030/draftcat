@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/renezander030/draftcat/internal/outputschema"
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -157,7 +158,7 @@ type ProviderConfig struct {
 	// OpenAI-compatible endpoint (those reject unknown request fields).
 	UsageAccounting *bool `yaml:"usage_accounting"`
 	// MaxRetries bounds how many times one call is retried on a transient
-	// failure (429, 408, 5xx, network error). 0 = default (3).
+	// rate-limit rejection (429 without declared usage). 0 = default (3).
 	MaxRetries int `yaml:"max_retries"`
 	apiKey     string
 }
@@ -352,16 +353,16 @@ type PipelineConfig struct {
 }
 
 type StepConfig struct {
-	Name         string                 `yaml:"name"`
-	Type         string                 `yaml:"type"`   // deterministic, ai, approval
-	Action       string                 `yaml:"action"` // deterministic action name
-	Role         string                 `yaml:"role"`
-	Skill        string                 `yaml:"skill"` // reference to skills/<name>.yaml
-	Prompt       string                 `yaml:"prompt"`
-	Vars         map[string]string      `yaml:"vars"` // variables injected into skill prompt
-	Mode         string                 `yaml:"mode"`
-	Channel      string                 `yaml:"channel"`
-	OutputSchema map[string]interface{} `yaml:"output_schema"`
+	Name         string              `yaml:"name"`
+	Type         string              `yaml:"type"`   // deterministic, ai, approval
+	Action       string              `yaml:"action"` // deterministic action name
+	Role         string              `yaml:"role"`
+	Skill        string              `yaml:"skill"` // reference to skills/<name>.yaml
+	Prompt       string              `yaml:"prompt"`
+	Vars         map[string]string   `yaml:"vars"` // variables injected into skill prompt
+	Mode         string              `yaml:"mode"`
+	Channel      string              `yaml:"channel"`
+	OutputSchema outputschema.Schema `yaml:"output_schema"`
 	// Quorum is the number of distinct human operators that must approve this
 	// approval step before the action is released. 0 or 1 = single approver
 	// (default, unchanged behavior). Only the telegram channel implements N>=2.

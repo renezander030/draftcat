@@ -189,98 +189,6 @@ func (s *Scheduler) GetDue() []string {
 
 // --- Guardrails ---
 
-type BudgetTracker struct {
-	tokensUsedToday    int
-	tokensUsedPipeline int
-	callsToday         int
-	callMinutesToday   int
-	costToday          float64
-	costPipeline       float64
-	dayStart           time.Time
-	// Cost caps are held on the tracker rather than passed per call so that
-	// check() enforces them everywhere it is already called. Wiring them at
-	// each of the eight LLM call sites instead would mean a new call site added
-	// later silently spends without a cap — the failure mode is invisible until
-	// the bill arrives. 0 = no cap.
-	dayCostLimit      float64
-	pipelineCostLimit float64
-}
-
-func (b *BudgetTracker) resetIfNewDay() {
-	if b.dayStart.Day() != time.Now().Day() {
-		b.tokensUsedToday = 0
-		b.callsToday = 0
-		b.callMinutesToday = 0
-		b.costToday = 0
-		b.dayStart = time.Now()
-	}
-}
-
-func (b *BudgetTracker) check(limit int, requested int) error {
-	b.resetIfNewDay()
-	if b.tokensUsedToday+requested > limit {
-		return fmt.Errorf("BUDGET_BLOCKED: daily token limit %d would be exceeded (used: %d, requested: %d)", limit, b.tokensUsedToday, requested)
-	}
-	// Money caps ride the same pre-call gate as token caps.
-	return b.CheckCost(b.dayCostLimit, b.pipelineCostLimit)
-}
-
-func (b *BudgetTracker) record(tokens int) {
-	b.tokensUsedToday += tokens
-	b.tokensUsedPipeline += tokens
-}
-
-func (b *BudgetTracker) CheckCalls(limit int) error {
-	b.resetIfNewDay()
-	if limit > 0 && b.callsToday+1 > limit {
-		return fmt.Errorf("BUDGET_BLOCKED: daily call limit %d would be exceeded (used: %d)", limit, b.callsToday)
-	}
-	return nil
-}
-
-func (b *BudgetTracker) CheckCallMinutes(limit, requestedMinutes int) error {
-	b.resetIfNewDay()
-	if limit > 0 && b.callMinutesToday+requestedMinutes > limit {
-		return fmt.Errorf("BUDGET_BLOCKED: daily call-minute limit %d would be exceeded (used: %d, requested: %d)", limit, b.callMinutesToday, requestedMinutes)
-	}
-	return nil
-}
-
-func (b *BudgetTracker) RecordCall(durationMinutes int) {
-	b.resetIfNewDay()
-	b.callsToday++
-	b.callMinutesToday += durationMinutes
-}
-
-// CheckCost blocks the next LLM call once spend has already reached a cap.
-// Token caps answer "how much did it think"; this answers the question the
-// person paying actually asks — "what is this costing me today". The per-call
-// cost was already computed from the model rates (see callLLM) and then thrown
-// away; now it accumulates and enforces.
-//
-// Deliberately checked BETWEEN calls rather than estimated ahead of one: a
-// pre-call estimate needs the response token count, which does not exist yet,
-// and guessing it either blocks legitimate work or lets the real overshoot
-// through anyway. So a single in-flight call may exceed the cap by at most one
-// step, bounded by per_step_tokens. Limits <= 0 mean "no cap".
-func (b *BudgetTracker) CheckCost(dayLimit, pipelineLimit float64) error {
-	b.resetIfNewDay()
-	if dayLimit > 0 && b.costToday >= dayLimit {
-		return fmt.Errorf("BUDGET_BLOCKED: daily cost limit %.4f reached (spent: %.4f)", dayLimit, b.costToday)
-	}
-	if pipelineLimit > 0 && b.costPipeline >= pipelineLimit {
-		return fmt.Errorf("BUDGET_BLOCKED: per-pipeline cost limit %.4f reached (spent: %.4f)", pipelineLimit, b.costPipeline)
-	}
-	return nil
-}
-
-// RecordCost accumulates the cost of one completed LLM call.
-func (b *BudgetTracker) RecordCost(cost float64) {
-	b.resetIfNewDay()
-	b.costToday += cost
-	b.costPipeline += cost
-}
-
 // --- Input Security ---
 // Applied to ALL operator input before it reaches any AI step.
 // This is not optional — the engine validates channel security config at startup.
@@ -485,11 +393,10 @@ var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
-// llmRetryable reports whether a status is worth another attempt: rate limits,
-// request timeouts and server-side failures. Any other 4xx is the caller's
-// mistake, and retrying it only spends the budget again.
+// llmRetryable identifies an explicit rate-limit rejection. Timeouts and server
+// errors can follow a paid response, so they require reconciliation first.
 func llmRetryable(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500
+	return status == http.StatusTooManyRequests
 }
 
 // retryDelay is how long to wait before the given retry (1-based). A
@@ -532,7 +439,10 @@ func retryDelay(retry int, retryAfter string, now time.Time) time.Duration {
 	return base + jitter
 }
 
-func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string) (*CompletionResponse, error) {
+func providerCallLLM(ctx context.Context, cfg *config.Config, role string, prompt string, maxTokens int) (*CompletionResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, providerError(err, false)
+	}
 	modelName, ok := cfg.Roles[role]
 	if !ok {
 		return nil, fmt.Errorf("unknown role: %s", role)
@@ -541,16 +451,13 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 	if !ok {
 		return nil, fmt.Errorf("unknown model: %s", modelName)
 	}
-	if err := enforceModelPolicy(ctx, cfg, role, "input", prompt); err != nil {
-		return nil, err
-	}
 
 	reqBody := map[string]interface{}{
 		"model": modelCfg.Model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"max_tokens": modelCfg.MaxTokens,
+		"max_tokens": maxTokens,
 	}
 	// OpenRouter reports the real charge (usage.cost) and the cached/reasoning
 	// token breakdown when asked. Other OpenAI-compatible servers reject
@@ -576,7 +483,7 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
-				return nil, fmt.Errorf("LLM call abandoned during backoff: %w (last error: %w)", ctx.Err(), lastErr)
+				return nil, providerError(fmt.Errorf("LLM call abandoned during backoff: %w", ctx.Err()), false)
 			}
 		}
 		attempts++
@@ -584,7 +491,7 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 
 		req, err := http.NewRequestWithContext(ctx, "POST", cfg.Provider.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return nil, providerError(err, false)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+cfg.Provider.APIKey())
@@ -592,28 +499,31 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		start := time.Now()
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("LLM request failed: %w", err)
-			if ctx.Err() != nil {
-				return nil, lastErr
-			}
-			continue
+			// Dispatch may have reached the provider. Repeating an ambiguous
+			// request would spend again without accounting for the first one.
+			return nil, providerError(fmt.Errorf("LLM request failed; usage may require reconciliation: %w", err), true)
 		}
 		latency = time.Since(start).Milliseconds()
 
-		respBody, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		respBody, err = readProviderResponse(ctx, resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, providerError(err, true)
+		}
 		if resp.StatusCode == http.StatusOK {
 			lastErr = nil
 			break
 		}
-		lastErr = fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
-		if !llmRetryable(resp.StatusCode) {
-			return nil, lastErr
+		lastErr = fmt.Errorf("LLM API error %d", resp.StatusCode)
+		// Only an explicit rate-limit rejection is safe to retry. A timeout
+		// or server error can follow a paid completion.
+		if !llmRetryable(resp.StatusCode) || providerDeclaresUsage(respBody) {
+			return nil, providerError(lastErr, providerDeclaresUsage(respBody) || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500)
 		}
 		retryAfter = resp.Header.Get("Retry-After")
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("%w (gave up after %d attempt(s))", lastErr, attempts)
+		return nil, providerError(fmt.Errorf("%w (gave up after %d attempt(s))", lastErr, attempts), false)
 	}
 
 	var result struct {
@@ -623,8 +533,8 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens        int      `json:"prompt_tokens"`
-			CompletionTokens    int      `json:"completion_tokens"`
+			PromptTokens        *int     `json:"prompt_tokens"`
+			CompletionTokens    *int     `json:"completion_tokens"`
 			Cost                *float64 `json:"cost"`
 			PromptTokensDetails struct {
 				CachedTokens int `json:"cached_tokens"`
@@ -636,30 +546,35 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse LLM response: %w", err)
+		return nil, providerError(fmt.Errorf("failed to parse LLM response: %w", err), true)
 	}
-	if len(result.Choices) == 0 {
-		return nil, fmt.Errorf("LLM returned no choices")
+	if result.Usage.PromptTokens == nil || result.Usage.CompletionTokens == nil {
+		return nil, providerError(fmt.Errorf("LLM response is missing token usage; reconciliation required"), true)
 	}
-	if err := enforceModelPolicy(ctx, cfg, role, "output", result.Choices[0].Message.Content); err != nil {
-		return nil, err
+	inputTokens, outputTokens := *result.Usage.PromptTokens, *result.Usage.CompletionTokens
+	if inputTokens < 0 || outputTokens < 0 || inputTokens > int(^uint(0)>>1)-outputTokens ||
+		result.Usage.PromptTokensDetails.CachedTokens < 0 || result.Usage.CompletionTokensDetails.ReasoningTokens < 0 ||
+		(result.Usage.Cost != nil && !validCost(*result.Usage.Cost)) {
+		return nil, providerError(fmt.Errorf("LLM response contains invalid usage; reconciliation required"), true)
 	}
 
 	// The configured rates are the fallback. When the provider states what it
 	// actually charged, the caps are enforced on that number — rates alone
 	// undercount reasoning tokens and overcount cached ones.
-	cost := float64(result.Usage.PromptTokens)/1000*modelCfg.CostIn +
-		float64(result.Usage.CompletionTokens)/1000*modelCfg.CostOut
+	cost := float64(inputTokens)/1000*modelCfg.CostIn +
+		float64(outputTokens)/1000*modelCfg.CostOut
 	source := "rates"
 	if usageAccounting && result.Usage.Cost != nil {
 		cost = *result.Usage.Cost
 		source = "provider"
 	}
 
-	return &CompletionResponse{
-		Text:            result.Choices[0].Message.Content,
-		InputTokens:     result.Usage.PromptTokens,
-		OutputTokens:    result.Usage.CompletionTokens,
+	if !validCost(cost) {
+		return nil, providerError(fmt.Errorf("LLM response cost is invalid; reconciliation required"), true)
+	}
+	completion := &CompletionResponse{
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
 		CachedTokens:    result.Usage.PromptTokensDetails.CachedTokens,
 		ReasoningTokens: result.Usage.CompletionTokensDetails.ReasoningTokens,
 		LatencyMs:       latency,
@@ -667,114 +582,12 @@ func callLLM(ctx context.Context, cfg *config.Config, role string, prompt string
 		CostSource:      source,
 		Model:           result.Model,
 		Attempts:        attempts,
-	}, nil
-}
-
-// --- Output Validation ---
-
-func toFloat64(v interface{}) *float64 {
-	switch n := v.(type) {
-	case float64:
-		return &n
-	case int:
-		f := float64(n)
-		return &f
-	case int64:
-		f := float64(n)
-		return &f
-	default:
-		return nil
 	}
-}
-
-// enumContains reports whether val is a member of the allowed set. Numbers are
-// compared by value (YAML decodes enum ints as int, JSON decodes the field as
-// float64), everything else by interface equality.
-func enumContains(allowed []interface{}, val interface{}) bool {
-	vNum := toFloat64(val)
-	for _, a := range allowed {
-		if vNum != nil {
-			if aNum := toFloat64(a); aNum != nil && *aNum == *vNum {
-				return true
-			}
-			continue
-		}
-		if a == val {
-			return true
-		}
+	if len(result.Choices) == 0 {
+		return completion, fmt.Errorf("LLM returned no choices")
 	}
-	return false
-}
-
-func validateOutput(text string, schema map[string]interface{}) (map[string]interface{}, error) {
-	if len(schema) == 0 {
-		return nil, nil
-	}
-
-	// Strip markdown code fences if present
-	cleaned := strings.TrimSpace(text)
-	if strings.HasPrefix(cleaned, "```") {
-		lines := strings.Split(cleaned, "\n")
-		if len(lines) >= 3 {
-			cleaned = strings.Join(lines[1:len(lines)-1], "\n")
-		}
-	}
-
-	var parsed map[string]interface{}
-	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
-		return nil, fmt.Errorf("output is not valid JSON: %w\nRaw: %s", err, text)
-	}
-
-	for key, schemaDef := range schema {
-		val, exists := parsed[key]
-		if !exists {
-			return nil, fmt.Errorf("missing required field: %s", key)
-		}
-
-		if defMap, ok := schemaDef.(map[string]interface{}); ok {
-			if typeName, ok := defMap["type"].(string); ok {
-				switch typeName {
-				case "int", "number":
-					num := toFloat64(val)
-					if num == nil {
-						return nil, fmt.Errorf("field %s: expected number, got %T", key, val)
-					}
-					if minVal, ok := defMap["min"]; ok {
-						if mv := toFloat64(minVal); mv != nil && *num < *mv {
-							return nil, fmt.Errorf("field %s: value %v below min %v", key, *num, *mv)
-						}
-					}
-					if maxVal, ok := defMap["max"]; ok {
-						if mv := toFloat64(maxVal); mv != nil && *num > *mv {
-							return nil, fmt.Errorf("field %s: value %v above max %v", key, *num, *mv)
-						}
-					}
-				case "bool":
-					if _, ok := val.(bool); !ok {
-						return nil, fmt.Errorf("field %s: expected bool, got %T", key, val)
-					}
-				case "string":
-					if _, ok := val.(string); !ok {
-						return nil, fmt.Errorf("field %s: expected string, got %T", key, val)
-					}
-				}
-			}
-
-			// enum: value must be one of the allowed members (works for any type).
-			// Compared after JSON decode, so numbers are float64 on both sides.
-			if rawEnum, ok := defMap["enum"]; ok {
-				allowed, ok := rawEnum.([]interface{})
-				if !ok {
-					return nil, fmt.Errorf("field %s: schema 'enum' must be a list", key)
-				}
-				if !enumContains(allowed, val) {
-					return nil, fmt.Errorf("field %s: value %v not in allowed set %v", key, val, allowed)
-				}
-			}
-		}
-	}
-
-	return parsed, nil
+	completion.Text = result.Choices[0].Message.Content
+	return completion, nil
 }
 
 // --- Operator Channel Interface ---
@@ -1266,8 +1079,7 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 		}
 	}()
 	log.Printf("[pipeline:%s] starting (run %s)", pipeline.Name, runID)
-	budget.tokensUsedPipeline = 0
-	budget.costPipeline = 0
+	budget = budget.newRun(cfg.Budgets.PerPipelineTokens)
 
 	// Observability: one pipeline span (always) + one span per step. Steps that
 	// run to completion emit at the bottom of the loop; a step that halts the
@@ -1285,7 +1097,7 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 		status := "ok"
 		fields := map[string]interface{}{
 			"steps_completed": stepsCompleted,
-			"tokens":          budget.tokensUsedPipeline,
+			"tokens":          budget.snapshot().tokensUsedPipeline,
 		}
 		if err != nil {
 			status = "error"
@@ -1559,11 +1371,6 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			}
 
 		case "ai":
-			// Budget pre-flight
-			if err := budget.check(cfg.Budgets.PerDayTokens, cfg.Budgets.PerStepTokens); err != nil {
-				log.Printf("[pipeline:%s][step:%s] %s", pipeline.Name, step.Name, err)
-				return err
-			}
 
 			// Resolve skill or use inline prompt
 			prompt := step.Prompt
@@ -1571,6 +1378,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			schema := step.OutputSchema
 
 			if step.Skill != "" {
+				if skills == nil {
+					return fmt.Errorf("[step:%s] skill registry unavailable: %s", step.Name, step.Skill)
+				}
 				skill, ok := skills.Get(step.Skill)
 				if !ok {
 					return fmt.Errorf("[step:%s] unknown skill: %s", step.Name, step.Skill)
@@ -1600,15 +1410,13 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			}
 			aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
 
-			resp, err := callLLM(aiCtx, cfg, role, prompt)
+			resp, err := callLLM(aiCtx, cfg, role, prompt, budget)
 			aiCancel()
 			if err != nil {
 				return fmt.Errorf("[step:%s] LLM call failed: %w", step.Name, err)
 			}
 
 			// Record token usage
-			budget.record(resp.InputTokens + resp.OutputTokens)
-			budget.RecordCost(resp.CostUSD)
 			log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
 				pipeline.Name, step.Name, resp.Model,
 				resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
@@ -1624,7 +1432,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					return fmt.Errorf("[step:%s] output validation failed: %w", step.Name, err)
 				}
 				data["ai_output"] = parsed
-				log.Printf("[pipeline:%s][step:%s] output validated: %v", pipeline.Name, step.Name, parsed)
+				log.Printf("[pipeline:%s][step:%s] output validated (%d fields)", pipeline.Name, step.Name, len(parsed))
 			} else {
 				data["ai_output"] = resp.Text
 			}
@@ -1637,15 +1445,15 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 			switch v := aiOutput.(type) {
 			case map[string]interface{}:
-				score, _ := v["score"].(float64)
+				score := outputScore(v["score"])
 				reason, _ := v["reason"].(string)
 				reject, _ := v["reject"].(bool)
 				status := "MATCH"
 				if reject {
 					status = "REJECT"
 				}
-				draftMsg = fmt.Sprintf("[draftcat] %s - Score: %d/5\n\n%s\n\n%v",
-					status, int(score), reason, data["input"])
+				draftMsg = fmt.Sprintf("[draftcat] %s - Score: %s/5\n\n%s\n\n%v",
+					status, score, reason, data["input"])
 			default:
 				draftMsg = fmt.Sprintf("[draftcat] Draft for review:\n\n%v", v)
 			}
@@ -1704,10 +1512,10 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			// only the sha256 of the exact draft shown — never the draft itself.
 			// When a signing secret is set, each row also carries an HMAC receipt
 			// so a later reader can prove the row wasn't altered after the fact.
-			recordAudit := func(decision, payload string, approvers []int64) {
+			recordAudit := func(decision, payload string, approvers []int64) error {
 				obs.RecordApproval(pipeline.Name, step.Name, decision)
 				if state == nil {
-					return
+					return nil
 				}
 				var opID int64
 				got := 0
@@ -1724,9 +1532,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				envelope := newApprovalEnvelope(approvalSecret, runID, pipeline.Name, step,
 					decidedAt, decidedAt.Add(approvalTimeout), decision, opID, payloadHash,
 					quorumN, got, "human-approval")
-				if e := state.RecordApprovalV2(envelope); e != nil {
-					log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
-				}
+				return persistApprovalReceipt(envelope)
 			}
 
 			// maxAdjust bounds rewrite cycles: single-approver keeps today's single
@@ -1747,7 +1553,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			// exemption is written to the audit trail as "policy_approve" with the
 			// rule that fired, so the trail never conflates a policy release with a
 			// human decision.
-			if rule := cfg.Policy.AutoApproves(pipeline.Name, step, budget.costPipeline); rule != nil {
+			if rule := cfg.Policy.AutoApproves(pipeline.Name, step, budget.snapshot().costPipeline); rule != nil {
 				sum := sha256.Sum256([]byte(currentDraft))
 				ph := hex.EncodeToString(sum[:])
 				reason := rule.Reason
@@ -1761,8 +1567,8 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					envelope := newApprovalEnvelope(approvalSecret, runID, pipeline.Name, step,
 						decidedAt, decidedAt.Add(approvalTimeout), "policy_approve", 0, ph,
 						quorumN, quorumN, reason)
-					if e := state.RecordApprovalV2(envelope); e != nil {
-						log.Printf("[pipeline:%s][step:%s] audit write failed: %v", pipeline.Name, step.Name, e)
+					if e := persistApprovalReceipt(envelope); e != nil {
+						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, e)
 					}
 				}
 				data["approved"] = true
@@ -1780,7 +1586,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				pendingID, perr := state.BeginApproval(pipeline.Name, step.Name,
 					hex.EncodeToString(pendingSum[:]), quorumN, openedAt, openedAt.Add(approvalTimeout))
 				if perr != nil {
-					log.Printf("[pipeline:%s][step:%s] pending-approval write failed: %v", pipeline.Name, step.Name, perr)
+					return fmt.Errorf("[step:%s] pending approval unavailable: %w", step.Name, perr)
 				}
 
 				// withStep puts the step name on the context so a channel that
@@ -1793,48 +1599,55 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				// The gate reached a terminal state in-process, whatever it was —
 				// close the pending row so boot does not later call it interrupted.
 				if rerr := state.ResolveApproval(pendingID); rerr != nil {
-					log.Printf("[pipeline:%s][step:%s] pending-approval resolve failed: %v", pipeline.Name, step.Name, rerr)
+					return fmt.Errorf("[step:%s] approval settlement unavailable: %w", step.Name, rerr)
 				}
 
 				if aerr != nil {
-					recordAudit("timeout", currentDraft, nil)
+					if auditErr := recordAudit("timeout", currentDraft, nil); auditErr != nil {
+						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+					}
 					return fmt.Errorf("[step:%s] %w", step.Name, aerr)
 				}
 
 				log.Printf("[pipeline:%s][step:%s] operator decision: %s", pipeline.Name, step.Name, action)
 
 				if action == "approve" {
-					recordAudit("approve", currentDraft, approvers)
+					if auditErr := recordAudit("approve", currentDraft, approvers); auditErr != nil {
+						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+					}
 					data["approved"] = true
 					break
 				}
 				if action == "skip" {
-					recordAudit("skip", currentDraft, nil)
+					if auditErr := recordAudit("skip", currentDraft, nil); auditErr != nil {
+						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+					}
 					data["approved"] = false
 					return nil
 				}
 				if action != "adjust" {
 					// e.g. a quorum "timeout" returned without an error
-					recordAudit("timeout", currentDraft, nil)
+					if auditErr := recordAudit("timeout", currentDraft, nil); auditErr != nil {
+						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+					}
 					return fmt.Errorf("[step:%s] approval not completed (%s)", step.Name, action)
 				}
 
 				// action == "adjust"
-				recordAudit("adjust", currentDraft, nil)
+				if auditErr := recordAudit("adjust", currentDraft, nil); auditErr != nil {
+					return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+				}
 				adjustCycles++
 				log.Printf("[pipeline:%s][step:%s] adjustment: %q", pipeline.Name, step.Name, adjustText)
 				if adjustCycles > maxAdjust {
 					if step.Quorum >= 2 {
 						_ = ch.Send(fmt.Sprintf("Adjustment limit (%d) reached without quorum approval — halting.", maxAdjust))
-						recordAudit("quorum_fail", currentDraft, nil)
+						if auditErr := recordAudit("quorum_fail", currentDraft, nil); auditErr != nil {
+							return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
+						}
 					}
 					data["approved"] = false
 					return nil
-				}
-
-				if err := budget.check(cfg.Budgets.PerDayTokens, cfg.Budgets.PerStepTokens); err != nil {
-					ch.Send(fmt.Sprintf("Budget exceeded, cannot rewrite: %s", err))
-					return err
 				}
 
 				adjustPrompt := fmt.Sprintf("Original output:\n%s\n\nOperator feedback:\n%s\n\nRewrite incorporating the feedback. Respond with ONLY valid JSON in the same format.", data["ai_raw"], adjustText)
@@ -1844,14 +1657,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					aiTimeout = 30 * time.Second
 				}
 				aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
-				resp, rerr := callLLM(aiCtx, cfg, "drafter", adjustPrompt)
+				resp, rerr := callLLM(aiCtx, cfg, "drafter", adjustPrompt, budget)
 				aiCancel()
 				if rerr != nil {
 					_ = ch.Send(fmt.Sprintf("Rewrite failed: %s", rerr))
 					return rerr
 				}
-				budget.record(resp.InputTokens + resp.OutputTokens)
-				budget.RecordCost(resp.CostUSD)
 
 				// Revised draft re-enters the gate (at 0/N for quorum steps).
 				currentDraft = fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
@@ -1867,7 +1678,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 	}
 	allDone = true
 
-	log.Printf("[pipeline:%s] completed. tokens_used=%d", pipeline.Name, budget.tokensUsedPipeline)
+	log.Printf("[pipeline:%s] completed. tokens_used=%d", pipeline.Name, budget.snapshot().tokensUsedPipeline)
 	return nil
 }
 
@@ -2115,20 +1926,14 @@ func handleEmails(args string, bot *TGBot, cfg *config.Config, budget *BudgetTra
 		bot.Send(header + formatted)
 	} else {
 		// Use LLM to summarize
-		if err := budget.check(cfg.Budgets.PerDayTokens, 1024); err != nil {
-			bot.Send(header + formatted[:2000] + "\n\n[truncated]")
-			return
-		}
 		bot.sendTyping()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		resp, err := callLLM(ctx, cfg, "classifier", fmt.Sprintf(
-			"Summarize these emails in a brief list. For each: sender, subject, 1-line summary. Be concise.\n\n%s", formatted))
+			"Summarize these emails in a brief list. For each: sender, subject, 1-line summary. Be concise.\n\n%s", formatted), budget)
 		cancel()
 		if err != nil {
 			bot.Send(header + formatted[:2000] + "\n\n[truncated]")
 		} else {
-			budget.record(resp.InputTokens + resp.OutputTokens)
-			budget.RecordCost(resp.CostUSD)
 			bot.Send(header + resp.Text)
 		}
 	}
@@ -2204,10 +2009,6 @@ func handleReply(args string, bot *TGBot, cfg *config.Config, budget *BudgetTrac
 	} else {
 		// AI drafts a reply
 		bot.sendTyping()
-		if err := budget.check(cfg.Budgets.PerDayTokens, 1024); err != nil {
-			bot.Send("[reply] Budget limit reached.")
-			return
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		prompt := fmt.Sprintf(`Draft a brief, professional reply to this email. Just the reply body, no subject line or headers.
 
@@ -2215,14 +2016,12 @@ From: %s
 Subject: %s
 Body:
 %s`, fullEmail.From, fullEmail.Subject, fullEmail.Body)
-		resp, err := callLLM(ctx, cfg, "drafter", prompt)
+		resp, err := callLLM(ctx, cfg, "drafter", prompt, budget)
 		cancel()
 		if err != nil {
 			bot.Send(fmt.Sprintf("[reply] Draft failed: %s", err))
 			return
 		}
-		budget.record(resp.InputTokens + resp.OutputTokens)
-		budget.RecordCost(resp.CostUSD)
 		replyBody = resp.Text
 	}
 
@@ -2343,25 +2142,18 @@ func handleThread(args string, bot *TGBot, cfg *config.Config, budget *BudgetTra
 	threadText := gmailapi.FormatThreadForPrompt(threadEmails, "rio@ramaris.app")
 
 	// Summarize with LLM
-	if err := budget.check(cfg.Budgets.PerDayTokens, 2048); err != nil {
-		// No budget — send raw
-		bot.Send(fmt.Sprintf("[thread] %d messages in thread:\n\n%s", len(threadEmails), threadText[:min(3500, len(threadText))]))
-		return
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	prompt := fmt.Sprintf(`Summarize this email thread. Show the back-and-forth between sent and received messages. Include key points, decisions, and any action items. Be concise.
 
 Thread (%d messages):
 %s`, len(threadEmails), threadText)
-	resp, err := callLLM(ctx, cfg, "classifier", prompt)
+	resp, err := callLLM(ctx, cfg, "classifier", prompt, budget)
 	cancel()
 	if err != nil {
 		bot.Send(fmt.Sprintf("[thread] %d messages:\n\n%s", len(threadEmails), threadText[:min(3500, len(threadText))]))
 		return
 	}
-	budget.record(resp.InputTokens + resp.OutputTokens)
-	budget.RecordCost(resp.CostUSD)
 	bot.Send(fmt.Sprintf("[thread] %d messages — %s\n\n%s", len(threadEmails), target.Subject, resp.Text))
 }
 
@@ -2544,9 +2336,15 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *conf
 // without waiting for the next approval prompt to tell them — and open gates
 // are counted so a stuck approval is one line away instead of invisible.
 func statusReport(active, paused int, budget *BudgetTracker, cfg *config.Config, open []statestore.PendingApproval, openErr error, now time.Time) string {
+	budget = budget.snapshotAt(now)
 	lines := []string{
 		"[status] Engine running",
 		fmt.Sprintf("Pipelines: %d active, %d paused", active, paused),
+	}
+	if budget.stateErr != nil {
+		lines = append(lines, "Budget ledger unavailable; model calls blocked.")
+	} else if budget.unsettled > 0 {
+		lines = append(lines, fmt.Sprintf("Provider usage unresolved: %d call(s); reconcile before retrying.", budget.unsettled))
 	}
 	if cap := cfg.Budgets.PerDayTokens; cap > 0 {
 		lines = append(lines, fmt.Sprintf("Tokens today: %d / %d (%.0f%% left)",
@@ -2675,6 +2473,8 @@ func main() {
 			os.Exit(runRunsCmd(os.Args[2:]))
 		case "pending":
 			os.Exit(runPendingCmd(os.Args[2:]))
+		case "budget":
+			os.Exit(runBudgetCmd(os.Args[2:]))
 		case "receipts":
 			os.Exit(runReceiptsCmd(os.Args[2:]))
 		case "hitl":
@@ -2687,6 +2487,7 @@ func main() {
 			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
+			fmt.Println("  draftcat budget <status|reconcile>      inspect spend or reconcile uncertain provider usage")
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
@@ -2869,6 +2670,9 @@ func main() {
 		dayCostLimit:      cfg.Budgets.PerDayCost,
 		pipelineCostLimit: cfg.Budgets.PerPipelineCost,
 	}
+	if err := budget.attachStore(state); err != nil {
+		log.Printf("[budget] usage ledger unavailable; model calls blocked: %v", err)
+	}
 	chatHistory := newChatHistory(20) // keep last 20 turns
 
 	// Any approval gate still marked pending was open when this process last
@@ -3022,14 +2826,12 @@ Rules:
 - Questions about what you can do = {"intent":"chat"}
 - IMPORTANT: "from:" means received FROM someone. "to:" means sent TO someone. If the user asks what THEY sent/replied to someone, use "to:<name> in:sent"`, emailCtx, text)
 
-							intentResp, err := callLLM(intentCtx, &cfg, "classifier", intentPrompt)
+							intentResp, err := callLLM(intentCtx, &cfg, "classifier", intentPrompt, budget)
 							intentCancel()
 
 							if err != nil {
 								log.Printf("[intent] classifier error: %v", err)
 							} else {
-								budget.record(intentResp.InputTokens + intentResp.OutputTokens)
-								budget.RecordCost(intentResp.CostUSD)
 								// Parse intent
 								cleaned := strings.TrimSpace(intentResp.Text)
 								if strings.HasPrefix(cleaned, "```") {
@@ -3079,9 +2881,7 @@ Rules:
 						// Regular message — respond via LLM with conversation history
 						chatHistory.Add("user", text)
 
-						if err := budget.check(cfg.Budgets.PerDayTokens, 512); err != nil {
-							bot.Send("Budget limit reached.")
-						} else {
+						{
 							aiCtx, aiCancel := context.WithTimeout(context.Background(), 15*time.Second)
 							var skillList, pipelineList string
 							for _, s := range skillReg.List() {
@@ -3117,14 +2917,12 @@ When the operator asks about emails, you can fetch them directly. When they ask 
 
 Conversation so far:
 %s`, pipelineList, skillList, gmailStatus, history)
-							resp, err := callLLM(aiCtx, &cfg, "drafter", sysPrompt)
+							resp, err := callLLM(aiCtx, &cfg, "drafter", sysPrompt, budget)
 							aiCancel()
 							if err != nil {
 								log.Printf("[msg] LLM error: %v", err)
 								bot.Send("Commands: /help /cron /skills /run /status")
 							} else {
-								budget.record(resp.InputTokens + resp.OutputTokens)
-								budget.RecordCost(resp.CostUSD)
 								log.Printf("[msg] LLM reply (%d tokens, %dms): %s", resp.InputTokens+resp.OutputTokens, resp.LatencyMs, resp.Text[:min(80, len(resp.Text))])
 								chatHistory.Add("assistant", resp.Text)
 								if err := bot.Send(resp.Text); err != nil {

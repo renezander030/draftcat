@@ -65,6 +65,8 @@ Sometimes a customer, auditor, or partner needs evidence that a human approved a
 
 This is an **experimental cryptographic preview**, not a production compliance claim. It uses an embedded BN254/Groth16 circuit and a development single-party setup; the circuit has not received an independent audit. Use it to evaluate the disclosure model, then replace the setup through a ceremony before relying on it in production. See [zero-knowledge approval proofs](docs/zk-approval-proofs.md) for the trust model, exact statement, and limitations.
 
+> **New in v0.9.0:** daily model usage persists in SQLite, parallel pipelines keep separate budget totals, and every engine model call passes one admission gate. Approval records commit before work is released. Unconsumed tool actions can be revoked, consumed actions accept durable caller-reported outcomes, and live or recovered permits share expiration and policy checks. Exact scalar output validation and bounded provider reads complete the release. See the [budget and lifecycle guide](docs/governance-lifecycle.md).
+>
 > **New in v0.8.0:** webhook retries can carry a durable `Idempotency-Key`, signed replay identities are claimed atomically, and tool permits recheck their policy before execution. Requests reject oversized or ambiguous data and retain exact numbers. Older state stores upgrade safely; completed and failed runs carry exact approval identities. Audit commands read without modifying the database, and `draftcat receipts verify` checks exported JSONL offline. See the [upgrade and reliability guide](docs/reliability.md).
 >
 > **New in v0.7.0:** execution decisions now carry their proof. Every tool-gate route is authenticated, each request has a stable action identity and exact policy binding, and an allowed decision becomes an atomic consume-once permit before the side effect runs. Webhook acceptance is durable before HTTP 202 and can be polled after handoff. Versioned receipts bind action, payload, policy, and expiry, with `draftcat receipts list|show|export` for verification-ready JSONL. Ordered `model_policy` rules can deny or send matching model input/output to a human, while `/healthz` and `/readyz` give orchestrators a safe listener contract.
@@ -295,7 +297,7 @@ An approval step can narrow who may decide it:
   approvers: [111111, 222222]   # which ones (subset of allowed_users)
 ```
 
-Cost caps are checked between calls: a call is refused once spend has reached the cap. Pair them with `per_step_tokens` to bound the size of any single call. A transient provider failure (429, 408, 5xx) is retried with backoff — honouring `Retry-After` — before it fails a step; `provider.max_retries` sets the budget.
+Cost caps are checked between calls: a call is refused once spend has reached the cap. Pair them with `per_step_tokens` to bound the size of any single call. Explicit rate-limit rejections (HTTP 429 without declared usage) retry with backoff and honour `Retry-After`; `provider.max_retries` sets the attempt limit. Transport errors, timeouts, server errors, and responses with uncertain billing halt the call and require usage reconciliation before another dispatch. See the [budget recovery guide](docs/governance-lifecycle.md).
 
 The tool-call gate is configured the same way, per tool:
 

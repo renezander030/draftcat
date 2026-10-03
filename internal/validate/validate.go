@@ -15,6 +15,7 @@ import (
 
 	"github.com/renezander030/draftcat/internal/channels"
 	"github.com/renezander030/draftcat/internal/config"
+	"github.com/renezander030/draftcat/internal/outputschema"
 	skillsapi "github.com/renezander030/draftcat/internal/skills"
 )
 
@@ -195,29 +196,7 @@ func loadSkillsForValidate(skillsDir string, rep *validateReport) map[string]*sk
 		if s.Prompt == "" {
 			rep.errf("skills/"+s.Name, "missing 'prompt'")
 		}
-		for field, def := range s.OutputSchema {
-			dm, ok := def.(map[string]interface{})
-			if !ok {
-				rep.warnf("skills/"+s.Name, "output_schema.%s: definition is not a map", field)
-				continue
-			}
-			_, hasEnum := dm["enum"]
-			t, _ := dm["type"].(string)
-			switch t {
-			case "int", "number", "bool", "string":
-			case "":
-				if !hasEnum {
-					rep.warnf("skills/"+s.Name, "output_schema.%s: missing 'type'", field)
-				}
-			default:
-				rep.warnf("skills/"+s.Name, "output_schema.%s: unsupported type %q (validator handles int|number|bool|string)", field, t)
-			}
-			if hasEnum {
-				if _, ok := dm["enum"].([]interface{}); !ok {
-					rep.warnf("skills/"+s.Name, "output_schema.%s: 'enum' must be a list", field)
-				}
-			}
-		}
+		checkOutputSchema(s.OutputSchema, "skills/"+s.Name, rep)
 		if _, dup := skills[s.Name]; dup {
 			rep.errf("skills/"+s.Name, "duplicate skill name (also defined in another file)")
 		}
@@ -383,6 +362,7 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				}
 			case "ai":
 				aiSteps++
+				checkOutputSchema(st.OutputSchema, spath, rep)
 				if st.Skill == "" && st.Prompt == "" {
 					rep.errf(spath, "ai step needs either 'skill' or inline 'prompt'")
 				}
@@ -934,4 +914,12 @@ func min3(a, b, c int) int {
 		a = c
 	}
 	return a
+}
+
+// checkOutputSchema shares the runtime's flat schema contract. An unsupported
+// definition must fail before a pipeline can accept unchecked model output.
+func checkOutputSchema(schema map[string]interface{}, path string, rep *validateReport) {
+	for _, finding := range outputschema.Check(schema) {
+		rep.errf(path+".output_schema."+finding.Field, "%s", finding.Message)
+	}
 }
