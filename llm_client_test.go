@@ -141,8 +141,8 @@ func TestCallLLM_ClientErrorIsNotRetried(t *testing.T) {
 	}
 }
 
-func TestCallLLM_GivesUpAfterTheRetryBudget(t *testing.T) {
-	s := &llmServer{steps: []func(http.ResponseWriter){status(503, "0")}}
+func TestCallLLM_GivesUpAfterTheRateLimitRetryBudget(t *testing.T) {
+	s := &llmServer{steps: []func(http.ResponseWriter){status(429, "0")}}
 	srv := httptest.NewServer(http.HandlerFunc(s.handler))
 	defer srv.Close()
 	cfg := llmCfg(srv.URL, "openrouter")
@@ -200,7 +200,7 @@ func TestRetryDelay_HonorsRetryAfterAndCaps(t *testing.T) {
 }
 
 func TestLLMRetryable(t *testing.T) {
-	for code, want := range map[int]bool{429: true, 408: true, 500: true, 503: true, 400: false, 401: false, 404: false} {
+	for code, want := range map[int]bool{429: true, 408: false, 500: false, 503: false, 400: false, 401: false, 404: false} {
 		if got := llmRetryable(code); got != want {
 			t.Errorf("llmRetryable(%d) = %v, want %v", code, got, want)
 		}

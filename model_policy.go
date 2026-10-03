@@ -35,7 +35,10 @@ func enforceModelPolicy(ctx context.Context, cfg *config.Config, role, phase, te
 	expires := time.Now()
 	if action == "review" {
 		if opChan == nil {
-			recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires)
+			recordErr := recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires)
+			if recordErr != nil {
+				return fmt.Errorf("model policy %q requires review but no operator channel is running (receipt: %w)", rule.ID, recordErr)
+			}
 			return fmt.Errorf("model policy %q requires review but no operator channel is running", rule.ID)
 		}
 		timeout, _ := time.ParseDuration(cfg.Timeouts.OperatorApproval)
@@ -50,7 +53,9 @@ func enforceModelPolicy(ctx context.Context, cfg *config.Config, role, phase, te
 		cancel()
 		if reviewErr == nil && dec.Action == "approve" {
 			decision, operatorID = "approve", dec.ApproverID
-			recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires)
+			if err := recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires); err != nil {
+				return fmt.Errorf("model policy approval receipt unavailable: %w", err)
+			}
 			return nil
 		}
 		if reviewErr != nil {
@@ -59,14 +64,16 @@ func enforceModelPolicy(ctx context.Context, cfg *config.Config, role, phase, te
 			decision = dec.Action
 		}
 	}
-	recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires)
+	if err := recordModelPolicyDecision(ctx, cfg, role, phase, text, rule, decision, operatorID, expires); err != nil {
+		return fmt.Errorf("model policy decision receipt unavailable: %w", err)
+	}
 	return fmt.Errorf("model %s blocked by policy %q: %s", phase, rule.ID, rule.Reason)
 }
 
 func recordModelPolicyDecision(ctx context.Context, cfg *config.Config, role, phase, text string,
-	rule *config.ModelPolicyRule, decision string, operatorID int64, expires time.Time) {
+	rule *config.ModelPolicyRule, decision string, operatorID int64, expires time.Time) error {
 	if state == nil {
-		return
+		return nil
 	}
 	sum := sha256.Sum256([]byte(text))
 	payloadHash := hex.EncodeToString(sum[:])
@@ -75,9 +82,7 @@ func recordModelPolicyDecision(ctx context.Context, cfg *config.Config, role, ph
 	envelope := newApprovalEnvelope([]byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET")),
 		runIDFromContext(ctx), pipelineFromContext(ctx), step, time.Now(), expires,
 		decision, operatorID, payloadHash, 1, boolCount(decision == "approve"), policy)
-	if err := state.RecordApprovalV2(envelope); err != nil {
-		return
-	}
+	return persistApprovalReceipt(envelope)
 }
 
 func boolCount(v bool) int {

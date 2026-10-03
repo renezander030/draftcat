@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- Isolate pipeline token and cost totals and serialize model admission against settled daily usage.
+- Persist daily usage by UTC date and preserve uncertain provider calls across restarts.
+- Govern every engine model request, including classification and rewrites, and charge responses before output policy review.
+- Require durable approval and receipt writes before releasing pipeline, model, or tool actions.
+- Record immutable, action-bound external execution outcomes with authenticated completion and polling.
+- Apply expiration and current policy checks consistently to live and recovered tool permits.
+- Add authenticated revocation of pending and allowed tool actions with conditional transitions against consumption.
+- Validate structured output and configured scalar schemas with exact numeric comparisons and explicit integer semantics.
+- Bound provider response reads and stop automatic retries when billing is uncertain.
+
+`draftcat budget status` inspects daily usage and unsettled calls; `draftcat budget reconcile` records verified provider usage after an interrupted call. See the [budget and lifecycle guide](docs/governance-lifecycle.md) for upgrade behavior, recovery, and caller-attested outcome semantics.
+
 ## 0.8.0
 
 - Add durable, pipeline-scoped `Idempotency-Key` webhook retries. Matching bodies return the original admission; changed bodies are rejected.
