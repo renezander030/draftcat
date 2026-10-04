@@ -359,7 +359,7 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 // --- Action approval audit (append-only) ---
 //
 // action_approvals is the durable "who approved which payload, when" log that
-// backs the GDPR Art. 22 accountability story. It is append-only BY CONVENTION:
+// records action approval evidence. It is append-only BY CONVENTION:
 // only RecordApproval writes to it; no code path issues UPDATE or DELETE. It
 // stores the sha256 of the draft (payload_hash), NEVER the draft itself — the
 // audit log must not become a second copy of customer PII.
@@ -442,8 +442,8 @@ type ApprovalEnvelope struct {
 }
 
 // RecordApproval appends one approval-decision row. Called on every terminal
-// decision (approve/skip/adjust/timeout/quorum_fail). Best-effort: a failure is
-// surfaced to the caller but must not halt the engine. nonce and signature carry
+// decision (approve/skip/adjust/timeout/quorum_fail). A failure is
+// surfaced to the caller; required authorization persistence must block release. nonce and signature carry
 // the receipt; pass "" for both to record an unsigned row (no secret configured).
 func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
 	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
