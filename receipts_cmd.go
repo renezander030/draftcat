@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/renezander030/draftcat/internal/approval"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
@@ -219,9 +220,42 @@ func runReceiptsShow(args []string) int {
 		fmt.Fprintf(os.Stderr, "receipts show: %v\n", err)
 		return 1
 	}
-	b, _ := json.MarshalIndent(receiptView(r, []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))), "", "  ")
+	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	view := struct {
+		receiptJSON
+		Note *noteJSON `json:"note,omitempty"`
+	}{receiptJSON: receiptView(r, secret)}
+	if notes, err := st.ApprovalNotes([]string{r.ReceiptID}); err == nil {
+		if n, ok := notes[r.ReceiptID]; ok {
+			nv := noteView(n, secret)
+			view.Note = &nv
+		}
+	}
+	b, _ := json.MarshalIndent(view, "", "  ")
 	fmt.Println(string(b))
 	return 0
+}
+
+// noteJSON is an operator's reason for a decision, with its own verification.
+type noteJSON struct {
+	OperatorID   int64  `json:"operator_id"`
+	Reason       string `json:"reason"`
+	NotedAt      string `json:"noted_at"`
+	Verification string `json:"verification"`
+}
+
+func noteView(n statestore.ApprovalNote, secret []byte) noteJSON {
+	v := "unsigned"
+	switch {
+	case n.Signature != "" && len(secret) == 0:
+		v = "unverified"
+	case n.Signature != "":
+		v = "tampered"
+		if approval.VerifyNote(secret, approval.NoteFields{ReceiptID: n.ReceiptID, OperatorID: n.OperatorID, Reason: n.Reason, NotedAt: n.NotedAt.Unix()}, n.Nonce, n.Signature) {
+			v = "ok"
+		}
+	}
+	return noteJSON{OperatorID: n.OperatorID, Reason: n.Reason, NotedAt: n.NotedAt.UTC().Format(time.RFC3339), Verification: v}
 }
 
 func runReceiptsExport(args []string) int {

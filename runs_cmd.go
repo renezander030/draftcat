@@ -51,6 +51,8 @@ type approvalJSON struct {
 	QuorumN    int    `json:"quorum_n"`
 	QuorumGot  int    `json:"quorum_got"`
 	Signed     bool   `json:"signed"`
+	Reason     string `json:"reason,omitempty"`
+	ReasonOK   string `json:"reason_verification,omitempty"`
 }
 
 func runRunsCmd(args []string) int {
@@ -167,6 +169,9 @@ func runRunsCmd(args []string) int {
 			}
 			fmt.Printf("    %-20s %-11s by %s (%d/%d)%s\n",
 				a.Step, a.Decision, who, a.QuorumGot, a.QuorumN, receipt)
+			if a.Reason != "" {
+				fmt.Printf("    %-20s reason: %s [%s]\n", "", truncateOneLine(a.Reason, 80), a.ReasonOK)
+			}
 		}
 	}
 	return 0
@@ -185,6 +190,12 @@ func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approv
 	if err != nil {
 		return nil
 	}
+	var ids []string
+	for _, a := range recs {
+		ids = append(ids, a.ReceiptID)
+	}
+	notes, _ := st.ApprovalNotes(ids)
+	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
 	var out []approvalJSON
 	for _, a := range recs {
 		if r.RunID == "" && (a.RunID != "" || a.DecidedAt.Before(r.StartedAt) || a.DecidedAt.After(r.EndedAt)) {
@@ -199,6 +210,10 @@ func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approv
 			QuorumGot:  a.QuorumGot,
 			Signed:     a.Signature != "",
 		})
+		if n, ok := notes[a.ReceiptID]; ok && a.ReceiptID != "" {
+			nv := noteView(n, secret)
+			out[len(out)-1].Reason, out[len(out)-1].ReasonOK = nv.Reason, nv.Verification
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].DecidedAt < out[j].DecidedAt })
 	return out

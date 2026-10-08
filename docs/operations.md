@@ -104,6 +104,27 @@ still complete. Set your service manager's stop timeout above the grace period
 (`TimeoutStopSec=` for systemd, `stop_grace_period:` for Compose). A gate still
 open when the grace period ends is closed out and reported at the next start.
 
+## Reloading the configuration
+
+```bash
+kill -HUP $(pidof draftcat)      # or /reload in the operator chat
+systemctl reload draftcat        # with ExecReload=/bin/kill -HUP $MAINPID
+```
+
+A reload re-reads `config.yaml` and `skills/` and applies `pipelines`, `models`,
+`roles`, `budgets`, `timeouts`, `model_policy` and `approval_policy` to every run
+that starts afterwards. Runs in progress keep the configuration they started
+with. Pause state, failure streaks and run history carry over; a pipeline whose
+schedule changed is replanned from its last run, a removed pipeline stops being
+scheduled, and a new one starts on its schedule.
+
+The file is validated first. A file with errors is refused, the running
+configuration stays in place, and the operator is told why. Sections that built
+long-lived resources at start (`telegram`, `relay`, `provider`, `state`,
+`webhook`, `tool_gate`, `observability`, `gmail`, `gohighlevel`, `voice`) keep
+their running values; the reload message names any of them that changed in the
+file, so you know a restart is needed for those.
+
 ## Spend warnings
 
 ```yaml

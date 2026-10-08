@@ -166,11 +166,16 @@ Reference implementation of both sides: `internal/relay/protocol.go`
     "channel": "teams"
   },
   "adjust_text": null,
+  "reason": null,
   "decided_at": "2026-08-02T09:31:05Z"
 }
 ```
 
 Same headers, same signature scheme, same secret.
+
+A `skip` may carry an optional `reason` (at most 500 bytes). The gate records it
+as a signed note bound to the skip receipt; it is ignored on other decisions and
+relays that omit it keep working unchanged.
 
 `decision` is one of `approve`, `skip`, `adjust`. A relay never sends `timeout`
 — expiry is the gate's call, on the gate's clock. A relay that could declare a

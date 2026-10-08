@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0
+
+- Record why an action was skipped: **Skip with reason...** on Telegram prompts and an optional `reason` on hitl/v0 `skip` decisions. The skip receipt names the operator; the reason is a separately signed note bound to the receipt, shown by `draftcat runs` and `draftcat receipts show` with its own verification.
+- Reload `config.yaml` and `skills/` without a restart on `SIGHUP` or `/reload`. Pipelines, models, roles, budgets, timeouts and policies apply to runs that start afterwards; runs in progress keep their configuration. Invalid files are refused and the running configuration stays in place.
+
+See [skip reasons](docs/action-receipts.md#skip-reasons) and [reloading the configuration](docs/operations.md#reloading-the-configuration).
+
+### Upgrade notes
+
+The state store gains an `approval_notes` table at first start. v2 receipts, exports and proofs are unchanged. Relays that do not send `reason` keep working. Telegram approval prompts carry a second row with **Skip with reason...**.
+
 ## 0.10.0
 
 Operations you can leave running: calendar schedules, a preflight, a clean shutdown and credentials that stay out of every log.

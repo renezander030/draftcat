@@ -159,3 +159,45 @@ func VerifyV2(secret []byte, f FieldsV2, nonce, sig string) bool {
 	want := SignV2(secret, f, nonce)
 	return subtle.ConstantTimeCompare([]byte(want), []byte(sig)) == 1
 }
+
+// NoteFields is a reason an operator attached to a decision. It is bound to
+// the decision's receipt ID rather than folded into the receipt, so v2
+// receipts keep verifying unchanged and the note carries its own signature.
+type NoteFields struct {
+	ReceiptID  string
+	OperatorID int64
+	Reason     string
+	NotedAt    int64
+}
+
+func canonicalNote(f NoteFields, nonce string) []byte {
+	parts := []string{
+		"note/1",
+		f.ReceiptID,
+		strconv.FormatInt(f.OperatorID, 10),
+		f.Reason,
+		strconv.FormatInt(f.NotedAt, 10),
+		nonce,
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteByte(':')
+		b.WriteString(p)
+		b.WriteByte('|')
+	}
+	return []byte(b.String())
+}
+
+// SignNote returns the HMAC-SHA256 signature for a decision note.
+func SignNote(secret []byte, f NoteFields, nonce string) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(canonicalNote(f, nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyNote verifies a decision note in constant time.
+func VerifyNote(secret []byte, f NoteFields, nonce, sig string) bool {
+	want := SignNote(secret, f, nonce)
+	return subtle.ConstantTimeCompare([]byte(want), []byte(sig)) == 1
+}

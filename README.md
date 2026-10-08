@@ -359,6 +359,7 @@ Skills are YAML prompt templates in `skills/` with an `output_schema` the engine
 draftcat                       # run the engine (validates config first; refuses to start on errors)
 draftcat validate [--strict]   # lint config + skills
 draftcat doctor [--json]       # read-only preflight: credentials, operators, state, ports, schedules
+kill -HUP <pid>                # reload pipelines, budgets, policies and skills without a restart (or /reload)
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat pending               # approval gates waiting on a human right now (--json)

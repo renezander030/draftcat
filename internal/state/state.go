@@ -119,6 +119,14 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     lifecycle    TEXT    NOT NULL DEFAULT 'decided'
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_pipeline ON action_approvals(pipeline, decided_at DESC);
+CREATE TABLE IF NOT EXISTS approval_notes (
+    receipt_id  TEXT    NOT NULL PRIMARY KEY, -- the decision receipt this note explains
+    operator_id INTEGER NOT NULL,
+    reason      TEXT    NOT NULL,
+    noted_at    INTEGER NOT NULL,
+    nonce       TEXT    NOT NULL DEFAULT '',
+    signature   TEXT    NOT NULL DEFAULT ''   -- HMAC over the note (empty = unsigned)
+);
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     pipeline     TEXT    NOT NULL,
@@ -1048,4 +1056,68 @@ func (s *StateStore) DB() *sql.DB {
 		return nil
 	}
 	return s.db
+}
+
+// ApprovalNote is an operator's reason for a decision, bound to the
+// decision's receipt ID. Notes are append-only: one per receipt.
+type ApprovalNote struct {
+	ReceiptID  string
+	OperatorID int64
+	Reason     string
+	NotedAt    time.Time
+	Nonce      string
+	Signature  string
+}
+
+// RecordApprovalNote stores the reason for one decision.
+func (s *StateStore) RecordApprovalNote(n ApprovalNote) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("state store unavailable")
+	}
+	_, err := s.db.ExecContext(context.Background(),
+		`INSERT INTO approval_notes (receipt_id, operator_id, reason, noted_at, nonce, signature) VALUES (?, ?, ?, ?, ?, ?)`,
+		n.ReceiptID, n.OperatorID, n.Reason, n.NotedAt.Unix(), n.Nonce, n.Signature)
+	return err
+}
+
+// ApprovalNotes returns the notes for the given receipt IDs, keyed by receipt
+// ID. A store created before notes existed has no table and returns none.
+func (s *StateStore) ApprovalNotes(receiptIDs []string) (map[string]ApprovalNote, error) {
+	out := map[string]ApprovalNote{}
+	if s == nil || s.db == nil || len(receiptIDs) == 0 {
+		return out, nil
+	}
+	var exists int
+	if err := s.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='approval_notes'`).Scan(&exists); err != nil || exists == 0 {
+		return out, err
+	}
+	args := make([]interface{}, 0, len(receiptIDs))
+	marks := make([]string, 0, len(receiptIDs))
+	for _, id := range receiptIDs {
+		if id == "" {
+			continue
+		}
+		args = append(args, id)
+		marks = append(marks, "?")
+	}
+	if len(args) == 0 {
+		return out, nil
+	}
+	// #nosec G202 -- only "?" placeholders are joined into the query.
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT receipt_id, operator_id, reason, noted_at, nonce, signature FROM approval_notes WHERE receipt_id IN (`+strings.Join(marks, ",")+`)`, args...)
+	if err != nil {
+		return out, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var n ApprovalNote
+		var at int64
+		if err := rows.Scan(&n.ReceiptID, &n.OperatorID, &n.Reason, &at, &n.Nonce, &n.Signature); err != nil {
+			return out, err
+		}
+		n.NotedAt = time.Unix(at, 0)
+		out[n.ReceiptID] = n
+	}
+	return out, rows.Err()
 }

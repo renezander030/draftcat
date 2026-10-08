@@ -131,8 +131,14 @@ type Decision struct {
 	PayloadHash string   `json:"payload_hash"`
 	Approver    Approver `json:"approver"`
 	AdjustText  string   `json:"adjust_text,omitempty"`
-	DecidedAt   string   `json:"decided_at"`
+	// Reason is an optional explanation on a skip decision, recorded as a
+	// signed note next to the skip receipt. Ignored on other decisions.
+	Reason    string `json:"reason,omitempty"`
+	DecidedAt string `json:"decided_at"`
 }
+
+// MaxReasonLen bounds a skip reason.
+const MaxReasonLen = 500
 
 type Approver struct {
 	ID      string `json:"id"`
@@ -263,6 +269,9 @@ func VerifyDecision(d *Decision, p *Pending, now time.Time) error {
 	}
 	if d.Decision == ActionAdjust && strings.TrimSpace(d.AdjustText) == "" {
 		return fmt.Errorf("adjust decision carries no adjust_text")
+	}
+	if len(d.Reason) > MaxReasonLen {
+		return fmt.Errorf("reason exceeds %d bytes", MaxReasonLen)
 	}
 	return nil
 }

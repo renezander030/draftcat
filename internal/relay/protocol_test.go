@@ -281,3 +281,16 @@ func TestRequest_JSONRoundtrip(t *testing.T) {
 		t.Fatal("run_id missing from the wire form")
 	}
 }
+
+func TestVerifyDecision_SkipReasonBounded(t *testing.T) {
+	d, p, now := fixture(t)
+	d.Decision = ActionSkip
+	d.Reason = strings.Repeat("x", MaxReasonLen)
+	if err := VerifyDecision(d, p, now); err != nil {
+		t.Fatalf("reason at the limit rejected: %v", err)
+	}
+	d.Reason += "x"
+	if err := VerifyDecision(d, p, now); err == nil {
+		t.Fatal("oversized reason accepted")
+	}
+}

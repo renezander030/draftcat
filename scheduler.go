@@ -33,6 +33,7 @@ type PipelineState struct {
 
 	timer      schedule.Schedule
 	hasTimer   bool
+	removed    bool // dropped from config by a reload while a run was in progress
 	catchUp    bool
 	pauseAfter int
 	timezone   string
@@ -137,6 +138,9 @@ func (s *Scheduler) GetAll() []*PipelineState {
 	defer s.mu.Unlock()
 	var out []*PipelineState
 	for _, ps := range s.pipelines {
+		if ps.removed {
+			continue
+		}
 		cp := *ps
 		out = append(out, &cp)
 	}
@@ -174,7 +178,7 @@ func (s *Scheduler) Resume(name string) bool {
 // allowed while the timer is paused; webhook and timer runs are not.
 func (s *Scheduler) claimLocked(name string, manual bool) (bool, string) {
 	ps, ok := s.pipelines[name]
-	if !ok {
+	if !ok || ps.removed {
 		return false, "unknown pipeline"
 	}
 	if s.draining {
@@ -243,6 +247,10 @@ func (s *Scheduler) Finish(name string, runErr error) bool {
 	if ps.Running {
 		ps.Running = false
 		s.inflight.Done()
+	}
+	if ps.removed {
+		delete(s.pipelines, name)
+		return false
 	}
 	if runErr == nil {
 		ps.Failures = 0
@@ -314,6 +322,56 @@ func (s *Scheduler) ClaimDue() []string {
 		}
 	}
 	return claimed
+}
+
+// Sync applies a reloaded pipeline list. Pause state, failure streaks and run
+// history carry over; a changed schedule or time zone is replanned from the
+// last run. A pipeline that disappeared is dropped, or, while it is running,
+// dropped when that run finishes.
+func (s *Scheduler) Sync(pipelines []config.PipelineConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	seen := map[string]bool{}
+	for _, p := range pipelines {
+		seen[p.Name] = true
+		ps, ok := s.pipelines[p.Name]
+		if !ok {
+			ps = &PipelineState{Name: p.Name}
+			s.pipelines[p.Name] = ps
+		}
+		changed := !ok || ps.removed || ps.Schedule != p.Schedule || ps.timezone != p.Timezone
+		ps.removed = false
+		ps.catchUp = p.CatchUp
+		ps.pauseAfter = p.PauseAfterFailures
+		ps.timezone = p.Timezone
+		if !changed {
+			continue
+		}
+		_ = ps.setSchedule(p.Schedule, now) // validated before the reload is applied
+		if ps.hasTimer && !ps.LastRun.IsZero() {
+			next := ps.timer.Next(ps.LastRun)
+			switch {
+			case next.IsZero():
+			case next.After(now):
+				ps.NextRun = next
+			case ps.timer.IsInterval():
+				ps.NextRun = now // an interval that is already overdue runs at the next tick
+			}
+		}
+	}
+	for name, ps := range s.pipelines {
+		if seen[name] {
+			continue
+		}
+		if ps.Running {
+			ps.removed = true
+			ps.hasTimer = false
+			ps.NextRun = time.Time{}
+			continue
+		}
+		delete(s.pipelines, name)
+	}
 }
 
 // BeginDrain refuses every new run from now on.

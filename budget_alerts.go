@@ -31,13 +31,14 @@ func (b *BudgetTracker) configureAlerts(cfg *config.Config, notify func(string))
 			th = append(th, f)
 		}
 	}
-	if len(th) == 0 || notify == nil || (cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0) {
-		return
-	}
-	sort.Float64s(th)
 	r := b.root()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(th) == 0 || notify == nil || (cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0) {
+		r.alerts = nil
+		return
+	}
+	sort.Float64s(th)
 	r.alerts = &budgetAlerts{
 		thresholds: th,
 		tokenCap:   cfg.Budgets.PerDayTokens,

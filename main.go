@@ -470,15 +470,17 @@ type OperatorChannel interface {
 
 type OperatorDecision struct {
 	Action     string // "approve", "skip", "adjust"
-	Text       string // adjustment text (only if Action == "adjust")
+	Text       string // adjustment text for "adjust"; the operator's reason for "skip" (may be empty)
 	ApproverID int64  // user id that approved (only if Action == "approve"); 0 if unknown
+	DeciderID  int64  // user id that skipped or adjusted; 0 if unknown
 }
 
 // QuorumDecision is the outcome of an N-of-M approval gate.
 type QuorumDecision struct {
 	Action    string  // "approve" | "skip" | "adjust" | "timeout"
-	Text      string  // adjustment text (Action == "adjust")
+	Text      string  // adjustment text (Action == "adjust"); skip reason (Action == "skip", may be empty)
 	Approvers []int64 // distinct user IDs that approved (Action == "approve")
+	DeciderID int64   // user id that skipped or adjusted; 0 if unknown
 }
 
 // --- Quorum decision logic (pure, testable without Telegram) ---
@@ -531,6 +533,24 @@ func sortedIDs(m map[int64]bool) []int64 {
 }
 
 // --- Telegram Channel ---
+
+// skipReasonWait bounds how long a gate waits for the reason after an
+// operator chose "Skip with reason". The skip stands either way.
+var skipReasonWait = 10 * time.Minute
+
+// approvalButtons is the keyboard on every approval message.
+func approvalButtons() [][]map[string]string {
+	return [][]map[string]string{
+		{
+			{"text": "Approve", "callback_data": "approve"},
+			{"text": "Skip", "callback_data": "skip"},
+			{"text": "Adjust...", "callback_data": "adjust"},
+		},
+		{
+			{"text": "Skip with reason...", "callback_data": "skip_reason"},
+		},
+	}
+}
 
 type TGBot struct {
 	token       string
@@ -652,13 +672,7 @@ func (t *TGBot) Name() string { return channels.Telegram }
 // it. It never calls getUpdates itself — two pollers on one Bot API stream
 // each consume the other's taps.
 func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
-	buttons := [][]map[string]string{
-		{
-			{"text": "Approve", "callback_data": "approve"},
-			{"text": "Skip", "callback_data": "skip"},
-			{"text": "Adjust...", "callback_data": "adjust"},
-		},
-	}
+	buttons := approvalButtons()
 
 	msgID, err := t.sendWithButtons(draft, buttons)
 	if err != nil {
@@ -669,9 +683,22 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 	w := t.pump().register(msgID)
 	defer t.pump().release(msgID)
 
+	// textFor is what a text reply means once a button asked for one:
+	// "adjust" (rewrite feedback) or "skip" (the reason for skipping).
+	textFor := ""
+	var textFrom int64
+	var reasonDeadline <-chan time.Time
+
 	for {
 		select {
+		case <-reasonDeadline:
+			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+			return OperatorDecision{Action: "skip", DeciderID: textFrom}, nil
 		case <-ctx.Done():
+			if textFor == "skip" {
+				t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+				return OperatorDecision{Action: "skip", DeciderID: textFrom}, nil
+			}
 			t.editButtons(msgID, draft+"\n\n[Timed out]", nil)
 			return OperatorDecision{}, fmt.Errorf("approval timeout")
 		case u := <-w.ch:
@@ -701,9 +728,17 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 				case "skip":
 					t.answerCallback(cb.ID, "Skipped")
 					t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
-					return OperatorDecision{Action: "skip"}, nil
+					return OperatorDecision{Action: "skip", DeciderID: cb.From.ID}, nil
+				case "skip_reason":
+					t.answerCallback(cb.ID, "Send the reason as a text message")
+					// The skip is decided now; only the reason is outstanding.
+					textFor, textFrom = "skip", cb.From.ID
+					reasonDeadline = time.After(skipReasonWait)
+					w.wantText(true)
+					t.editButtons(msgID, draft+"\n\n[Skipping — waiting for the reason...]", nil)
 				case "adjust":
 					t.answerCallback(cb.ID, "Send your adjustment as a text message")
+					textFor, textFrom = "adjust", cb.From.ID
 					w.wantText(true)
 					t.editButtons(msgID, draft+"\n\n[Waiting for adjustment text...]", nil)
 				}
@@ -732,7 +767,14 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 					continue
 				}
 
-				return OperatorDecision{Action: "adjust", Text: result.Text}, nil
+				if textFor == "skip" {
+					if u.Message.From.ID != textFrom {
+						continue // the reason comes from the operator who chose to skip
+					}
+					t.editButtons(msgID, draft+"\n\n[Skipped: "+result.Text+"]", nil)
+					return OperatorDecision{Action: "skip", Text: result.Text, DeciderID: textFrom}, nil
+				}
+				return OperatorDecision{Action: "adjust", Text: result.Text, DeciderID: u.Message.From.ID}, nil
 			}
 		}
 	}
@@ -750,20 +792,14 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 		if err != nil {
 			return QuorumDecision{Action: "timeout"}, err
 		}
-		qd := QuorumDecision{Action: d.Action, Text: d.Text}
+		qd := QuorumDecision{Action: d.Action, Text: d.Text, DeciderID: d.DeciderID}
 		if d.Action == "approve" && d.ApproverID != 0 {
 			qd.Approvers = []int64{d.ApproverID}
 		}
 		return qd, nil
 	}
 
-	buttons := [][]map[string]string{
-		{
-			{"text": "Approve", "callback_data": "approve"},
-			{"text": "Skip", "callback_data": "skip"},
-			{"text": "Adjust...", "callback_data": "adjust"},
-		},
-	}
+	buttons := approvalButtons()
 	tally := func(got int) string {
 		return fmt.Sprintf("%s\n\nApprovals: %d/%d", draft, got, need)
 	}
@@ -778,13 +814,33 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 	defer t.pump().release(msgID)
 
 	approved := map[int64]bool{}
+	// vetoBy is set once someone chose "Skip with reason": the gate is
+	// decided and only that operator's reason is awaited.
+	var vetoBy int64
+	var reasonDeadline <-chan time.Time
 
 	for {
 		select {
+		case <-reasonDeadline:
+			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+			return QuorumDecision{Action: "skip", DeciderID: vetoBy}, nil
 		case <-ctx.Done():
+			if vetoBy != 0 {
+				t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
+				return QuorumDecision{Action: "skip", DeciderID: vetoBy}, nil
+			}
 			t.editButtons(msgID, fmt.Sprintf("%s\n\n[Timed out — %d/%d approvals not reached]", draft, len(approved), need), nil)
 			return QuorumDecision{Action: "timeout"}, fmt.Errorf("approval timeout")
 		case u := <-w.ch:
+			if vetoBy != 0 {
+				if m := u.Message; m != nil && m.Text != "" && m.Chat.ID == t.chatID && m.From.ID == vetoBy && t.rateLimiter.allow(m.From.ID) {
+					if result := validateOperatorInput(m.Text, t.security); result.Clean {
+						t.editButtons(msgID, draft+"\n\n[Skipped: "+result.Text+"]", nil)
+						return QuorumDecision{Action: "skip", Text: result.Text, DeciderID: vetoBy}, nil
+					}
+				}
+				continue
+			}
 			if u.CallbackQuery == nil {
 				continue
 			}
@@ -807,11 +863,18 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 				// A single veto stops the action. Easy to stop, hard to release.
 				t.answerCallback(cb.ID, "Skipped (veto)")
 				t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
-				return QuorumDecision{Action: "skip"}, nil
+				return QuorumDecision{Action: "skip", DeciderID: cb.From.ID}, nil
+			case "skip_reason":
+				// The veto takes effect now; no approval can land after it.
+				t.answerCallback(cb.ID, "Skipped (veto) — send the reason as a text message")
+				vetoBy = cb.From.ID
+				reasonDeadline = time.After(skipReasonWait)
+				w.wantText(true)
+				t.editButtons(msgID, draft+"\n\n[Skipping — waiting for the reason...]", nil)
 			case "adjust":
 				t.answerCallback(cb.ID, "Send your adjustment as a text message")
 				t.editButtons(msgID, draft+"\n\n[Adjustment requested — rewrite will re-enter the gate at 0/"+strconv.Itoa(need)+"]", nil)
-				return QuorumDecision{Action: "adjust"}, nil
+				return QuorumDecision{Action: "adjust", DeciderID: cb.From.ID}, nil
 			case "approve":
 				if approved[cb.From.ID] {
 					t.answerCallback(cb.ID, "Already counted")
@@ -1339,12 +1402,15 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			// getApproval dispatches to the quorum gate when quorum >= 2, else the
 			// single-approver gate (byte-for-byte today's behavior). It normalises
 			// both into (action, adjustText, approvers, err).
+			var decider int64 // who skipped or adjusted, when the channel knows
 			getApproval := func(cctx context.Context, draft string) (string, string, []int64, error) {
+				decider = 0
 				if step.Quorum >= 2 {
 					qd, qerr := ch.SendForQuorumApproval(cctx, draft, step.Quorum, step.Approvers)
 					if qerr != nil {
 						return "timeout", "", nil, qerr
 					}
+					decider = qd.DeciderID
 					return qd.Action, qd.Text, qd.Approvers, nil
 				}
 				dec, derr := ch.SendForApproval(cctx, draft, step.Approvers)
@@ -1355,6 +1421,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				if dec.Action == "approve" && dec.ApproverID != 0 {
 					aps = []int64{dec.ApproverID}
 				}
+				decider = dec.DeciderID
 				return dec.Action, dec.Text, aps, nil
 			}
 
@@ -1476,7 +1543,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					break
 				}
 				if action == "skip" {
-					if auditErr := recordAudit("skip", currentDraft, nil); auditErr != nil {
+					if auditErr := recordSkip(approvalSecret, runID, pipeline.Name, step, currentDraft, approvalTimeout, quorumN, decider, adjustText); auditErr != nil {
 						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
 					}
 					data["approved"] = false
@@ -1706,8 +1773,12 @@ func handleCommand(cmd string, args string, bot *TGBot, sched *Scheduler, skills
 		handleReauth(bot)
 	case "/authcode":
 		handleAuthCode(args, bot)
+	case "/reload":
+		if reloadHook != nil {
+			_ = bot.Send(reloadHook())
+		}
 	case "/help":
-		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/")
 	}
 }
 
@@ -2397,6 +2468,9 @@ func main() {
 	if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
 		log.Fatalf("failed to parse config: %v", err)
 	}
+	// The file as written, before credentials and defaults are filled in. A
+	// reload compares against it to name the sections that need a restart.
+	bootRaw := cfg
 
 	// Resolve env vars
 	cfg.Telegram.SetToken(resolveEnv(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"))
@@ -2588,7 +2662,7 @@ func main() {
 	// take down the engine.
 	if cfg.Observ.Prometheus.Enabled {
 		obs.EnablePrometheus()
-		obs.SetGaugeSource(func() []obs.Gauge { return engineGauges(sched, budget, &cfg, state) })
+		obs.SetGaugeSource(func() []obs.Gauge { return engineGauges(sched, budget, currentConfig(&cfg), state) })
 		if closer, perr := obs.ServePrometheus(cfg.Observ.Prometheus.Addr, cfg.Observ.Prometheus.Path); perr != nil {
 			log.Printf("[obs] prometheus exporter failed to start: %v", perr)
 		} else {
@@ -2637,6 +2711,15 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// Config reload: SIGHUP or /reload swaps the snapshot new runs use.
+	liveConfig.Store(&cfg)
+	liveSkills.Store(skillReg)
+	reloadHook = func() string {
+		return reloadEngine(configPath, skillsDir, &bootRaw, &cfg, sched, budget, func(m string) { _ = opChan.Send(m) })
+	}
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+
 	// Main event loop — polls for commands and runs scheduled pipelines
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -2648,8 +2731,11 @@ func main() {
 		case sig := <-sigCh:
 			log.Printf("received %s, shutting down", sig)
 			// silent shutdown — no message
-			drainEngine(sched, webhookSrv, shutdownGrace(&cfg))
+			drainEngine(sched, webhookSrv, shutdownGrace(currentConfig(&cfg)))
 			return
+
+		case <-hupCh:
+			_ = bot.Send(reloadHook())
 
 		case <-ticker.C:
 			// 1. Operator commands and callbacks — whatever the update pump
@@ -2675,7 +2761,7 @@ func main() {
 						}
 						log.Printf("[cmd] %s %s (user: %d)", cmd, args, u.Message.From.ID)
 						bot.sendTyping()
-						handleCommand(cmd, args, bot, sched, skillReg, &cfg, budget)
+						handleCommand(cmd, args, bot, sched, currentSkills(skillReg), currentConfig(&cfg), budget)
 					} else if text != "" {
 						log.Printf("[msg] %q (user: %d)", text, u.Message.From.ID)
 						bot.sendTyping()
@@ -2780,7 +2866,7 @@ Rules:
 						{
 							aiCtx, aiCancel := context.WithTimeout(context.Background(), 15*time.Second)
 							var skillList, pipelineList string
-							for _, s := range skillReg.List() {
+							for _, s := range currentSkills(skillReg).List() {
 								skillList += fmt.Sprintf("\n- %s: %s", s.Name, s.Description)
 							}
 							for _, p := range cfg.Pipelines {
@@ -2851,7 +2937,7 @@ Conversation so far:
 								bot.Send(fmt.Sprintf("[cron] Resumed: %s", parts[2]))
 							case "run":
 								bot.answerCallback(cb.ID, "Starting: "+parts[2])
-								handleRun(parts[2], bot, sched, &cfg, budget, skillReg)
+								handleRun(parts[2], bot, sched, currentConfig(&cfg), budget, currentSkills(skillReg))
 							}
 						}
 					}
@@ -2860,14 +2946,15 @@ Conversation so far:
 
 			// 2. Check for scheduled pipelines
 			for _, name := range sched.ClaimDue() {
-				p, ok := pipelineByName(&cfg, name)
+				runCfg, runSkills := currentConfig(&cfg), currentSkills(skillReg)
+				p, ok := pipelineByName(runCfg, name)
 				if !ok {
 					sched.SetRunning(name, false)
 					continue
 				}
 				log.Printf("[scheduler] running due pipeline: %s", name)
 				go func(p config.PipelineConfig) {
-					err := runPipeline(&cfg, p, budget, gateChannel(bot), skillReg, nil)
+					err := runPipeline(runCfg, p, budget, gateChannel(bot), runSkills, nil)
 					if err != nil {
 						log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
 						_ = bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
@@ -3014,7 +3101,6 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	if maxSkew <= 0 {
 		maxSkew = 300
 	}
-	hookable := webhookPipelines(cfg)
 	var admissionMu sync.Mutex
 
 	mux := http.NewServeMux()
@@ -3145,7 +3231,8 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		}
 
 		name := strings.TrimPrefix(r.URL.Path, "/hooks/")
-		p, ok := hookable[name]
+		runCfg, runSkills := currentConfig(cfg), currentSkills(skills)
+		p, ok := webhookPipelines(runCfg)[name]
 		if !ok {
 			http.Error(w, "no webhook-triggerable pipeline named "+name, http.StatusNotFound)
 			return
@@ -3231,7 +3318,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			if strings.TrimSpace(string(body)) != "" {
 				seed["input"] = string(body)
 			}
-			if err := runPipeline(cfg, p, budget, gateChannel(bot), skills, seed); err != nil {
+			if err := runPipeline(runCfg, p, budget, gateChannel(bot), runSkills, seed); err != nil {
 				runErr = err
 				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
 				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))

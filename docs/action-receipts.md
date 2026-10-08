@@ -118,6 +118,29 @@ This requires `DRAFTCAT_APPROVAL_SECRET`, checks each signed v1/v2 field set,
 and returns nonzero for unsigned or tampered rows. It does not certify export
 completeness or unsigned `lifecycle` metadata. See the [reliability guide](reliability.md).
 
+## Skip reasons
+
+An operator can say why an action was skipped: **Skip with reason...** on the
+Telegram prompt, or `reason` on a `skip` decision from a hitl/v0 relay. The skip
+is decided when the button is tapped (on a quorum gate it vetoes at once); the
+reason follows as a text reply and is optional: without one within ten minutes
+the skip stands on its own.
+
+The skip receipt names the operator who skipped. The reason is stored as a
+separate note bound to that receipt ID and signed with the same
+`DRAFTCAT_APPROVAL_SECRET` (`note/1` envelope), so v2 receipts, exports and
+proofs are unchanged and the note carries its own verification:
+
+```bash
+draftcat runs invoices
+#   release-payment      skip        by 111 (0/2) [signed]
+#                        reason: Wrong invoice amount [ok]
+draftcat receipts show rcpt_9d4d...   # includes "note": {reason, operator_id, verification}
+```
+
+Reasons are capped at 500 bytes and pass through credential redaction. They are
+the operator's own words; the draft itself is still stored only as a hash.
+
 ## Design rule
 
 Do not let the model decide whether the approval boundary was satisfied. The

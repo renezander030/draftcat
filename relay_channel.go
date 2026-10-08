@@ -144,7 +144,7 @@ func (r *RelayChannel) SendForApproval(ctx context.Context, draft string, approv
 	if qd.Action == relay.ActionApprove && len(qd.Approvers) > 0 {
 		id = qd.Approvers[0]
 	}
-	return OperatorDecision{Action: qd.Action, Text: qd.Text, ApproverID: id}, nil
+	return OperatorDecision{Action: qd.Action, Text: qd.Text, ApproverID: id, DeciderID: qd.DeciderID}, nil
 }
 
 // SendForQuorumApproval dispatches the draft and blocks until `need` distinct
@@ -352,11 +352,11 @@ func (r *RelayChannel) handleDecision(w http.ResponseWriter, req *http.Request) 
 
 	switch d.Decision {
 	case relay.ActionSkip:
-		gate.resolve(QuorumDecision{Action: "skip"})
+		gate.resolve(QuorumDecision{Action: "skip", Text: strings.TrimSpace(d.Reason), DeciderID: opID})
 		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": true})
 		return
 	case relay.ActionAdjust:
-		gate.resolve(QuorumDecision{Action: "adjust", Text: d.AdjustText})
+		gate.resolve(QuorumDecision{Action: "adjust", Text: d.AdjustText, DeciderID: opID})
 		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": true})
 		return
 	}

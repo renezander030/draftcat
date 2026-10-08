@@ -140,3 +140,25 @@ func TestV2BindsActionPolicyAndExpiry(t *testing.T) {
 		}
 	}
 }
+
+func TestNoteSignatureBindsEveryField(t *testing.T) {
+	secret := []byte("note-secret")
+	f := NoteFields{ReceiptID: "rcpt_1", OperatorID: 42, Reason: "wrong customer", NotedAt: 1760000000}
+	sig := SignNote(secret, f, "n1")
+	if !VerifyNote(secret, f, "n1", sig) {
+		t.Fatal("valid note rejected")
+	}
+	for name, g := range map[string]NoteFields{
+		"receipt":  {ReceiptID: "rcpt_2", OperatorID: 42, Reason: "wrong customer", NotedAt: 1760000000},
+		"operator": {ReceiptID: "rcpt_1", OperatorID: 43, Reason: "wrong customer", NotedAt: 1760000000},
+		"reason":   {ReceiptID: "rcpt_1", OperatorID: 42, Reason: "wrong client", NotedAt: 1760000000},
+		"time":     {ReceiptID: "rcpt_1", OperatorID: 42, Reason: "wrong customer", NotedAt: 1760000001},
+	} {
+		if VerifyNote(secret, g, "n1", sig) {
+			t.Errorf("altered %s still verifies", name)
+		}
+	}
+	if VerifyNote([]byte("other"), f, "n1", sig) || VerifyNote(secret, f, "n2", sig) {
+		t.Error("wrong key or nonce verifies")
+	}
+}
