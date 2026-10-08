@@ -15,6 +15,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/renezander030/draftcat/internal/redact"
 )
 
 var (
@@ -155,5 +157,5 @@ func write(rec map[string]interface{}) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	_, _ = out.Write(append(b, '\n'))
+	_, _ = out.Write(append(redact.Bytes(b), '\n'))
 }

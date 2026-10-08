@@ -271,12 +271,21 @@ type BudgetConfig struct {
 	// step. Pair with per_step_tokens to bound that overshoot.
 	PerDayCost      float64 `yaml:"per_day_cost"`
 	PerPipelineCost float64 `yaml:"per_pipeline_cost"`
+	// AlertAt lists fractions of the daily caps (per_day_tokens, per_day_cost)
+	// at which the operator channel is notified, e.g. [0.5, 0.8, 0.95]. Each
+	// threshold notifies once per UTC day and cap, also across restarts.
+	// Empty = no early warnings.
+	AlertAt []float64 `yaml:"alert_at"`
 }
 
 type TimeoutConfig struct {
 	AICall           string `yaml:"ai_call"`
 	OperatorApproval string `yaml:"operator_approval"`
 	PipelineTotal    string `yaml:"pipeline_total"`
+	// ShutdownGrace is how long SIGINT/SIGTERM waits for running pipelines to
+	// finish before the engine exits. New runs are refused during the wait.
+	// Default 30s; "0s" exits at once.
+	ShutdownGrace string `yaml:"shutdown_grace"`
 }
 
 // WebhookConfig enables the opt-in HTTP trigger server. A pipeline with
@@ -347,9 +356,22 @@ type OTLPConfig struct {
 }
 
 type PipelineConfig struct {
-	Name     string       `yaml:"name"`
-	Schedule string       `yaml:"schedule"`
-	Steps    []StepConfig `yaml:"steps"`
+	Name string `yaml:"name"`
+	// Schedule is "manual", "webhook", an interval ("30m", "24h") or a
+	// calendar schedule: a five-field cron expression ("0 8 * * 1-5") or
+	// @hourly/@daily/@weekly/@monthly. See internal/schedule.
+	Schedule string `yaml:"schedule"`
+	// Timezone is the IANA zone calendar schedules run in ("Europe/Berlin").
+	// Empty = the process's local zone. Ignored for intervals.
+	Timezone string `yaml:"timezone"`
+	// CatchUp runs a calendar slot that passed while the engine was down once
+	// at startup. Intervals always continue from the last recorded run.
+	CatchUp bool `yaml:"catch_up"`
+	// PauseAfterFailures pauses a timer-scheduled pipeline after this many
+	// consecutive failed runs and tells the operator once. 0 = never pause.
+	// /cron resume clears the count.
+	PauseAfterFailures int          `yaml:"pause_after_failures"`
+	Steps              []StepConfig `yaml:"steps"`
 }
 
 type StepConfig struct {

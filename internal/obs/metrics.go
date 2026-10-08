@@ -128,6 +128,7 @@ func resetMetrics() {
 	promOn = false
 	otlpOn = false
 	mu.Unlock()
+	SetGaugeSource(nil)
 	fresh := newRegistry()
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
@@ -192,6 +193,7 @@ func WriteMetrics(w io.Writer) error {
 	reg.aiCost.render(&sb)
 	reg.approvals.render(&sb)
 	reg.mu.Unlock()
+	renderGauges(&sb)
 	_, err := io.WriteString(w, sb.String())
 	return err
 }

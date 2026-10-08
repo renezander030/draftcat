@@ -30,6 +30,7 @@ import (
 
 	"github.com/renezander030/draftcat/internal/channels"
 	"github.com/renezander030/draftcat/internal/config"
+	"github.com/renezander030/draftcat/internal/redact"
 	"github.com/renezander030/draftcat/internal/relay"
 )
 
@@ -125,8 +126,8 @@ func (r *RelayChannel) Send(text string) error {
 		Pipeline:    "-",
 		Step:        "notify",
 		IssuedAt:    time.Now().UTC().Format(time.RFC3339),
-		PayloadHash: relay.HashPayload(text),
-		Draft:       relay.Draft{ContentType: "text/plain", Body: text},
+		PayloadHash: relay.HashPayload(redact.String(text)),
+		Draft:       relay.Draft{ContentType: "text/plain", Body: redact.String(text)},
 		Actions:     []relay.Action{},
 	}
 	_, err := r.dispatch(context.Background(), req)

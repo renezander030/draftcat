@@ -31,6 +31,7 @@ type BudgetTracker struct {
 	dayCostLimit       float64
 	pipelineCostLimit  float64
 	pipelineTokenLimit int
+	alerts             *budgetAlerts
 }
 
 func (b *BudgetTracker) root() *BudgetTracker {
@@ -145,6 +146,9 @@ func (b *BudgetTracker) recordUsageLocked(tokens int, cost float64) {
 	r.costToday += cost
 	b.tokensUsedPipeline += tokens
 	b.costPipeline += cost
+	if r.alerts != nil {
+		r.alerts.observeLocked(r)
+	}
 }
 
 func (b *BudgetTracker) record(tokens int) {

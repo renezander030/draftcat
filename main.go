@@ -36,156 +36,11 @@ import (
 	gmailapi "github.com/renezander030/draftcat/internal/gmail"
 	"github.com/renezander030/draftcat/internal/obs"
 	"github.com/renezander030/draftcat/internal/pdf"
+	"github.com/renezander030/draftcat/internal/redact"
 	statestore "github.com/renezander030/draftcat/internal/state"
 	"github.com/renezander030/draftcat/internal/voicebridge"
 	"github.com/renezander030/draftcat/internal/whatsapp"
 )
-
-// --- Scheduler ---
-
-type PipelineState struct {
-	Name     string
-	Schedule string
-	Paused   bool
-	Running  bool
-	LastRun  time.Time
-	NextRun  time.Time
-}
-
-type Scheduler struct {
-	mu        sync.Mutex
-	pipelines map[string]*PipelineState
-}
-
-// isAutoSchedule reports whether a schedule string drives automatic timer runs.
-// "manual" (operator /run only), "webhook" (HTTP trigger only), and "" are not
-// timer-driven.
-func isAutoSchedule(schedule string) bool {
-	return schedule != "" && schedule != "manual" && schedule != "webhook"
-}
-
-func newScheduler(pipelines []config.PipelineConfig) *Scheduler {
-	s := &Scheduler{pipelines: make(map[string]*PipelineState)}
-	for _, p := range pipelines {
-		ps := &PipelineState{
-			Name:     p.Name,
-			Schedule: p.Schedule,
-		}
-		if isAutoSchedule(p.Schedule) {
-			ps.NextRun = calcNextRun(p.Schedule)
-		}
-		s.pipelines[p.Name] = ps
-	}
-	return s
-}
-
-// calcNextRun parses simple interval schedules like "5m", "1h", "30s"
-func calcNextRun(schedule string) time.Time {
-	d, err := time.ParseDuration(schedule)
-	if err != nil {
-		return time.Time{} // invalid schedule, won't auto-run
-	}
-	return time.Now().Add(d)
-}
-
-func (s *Scheduler) GetAll() []*PipelineState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []*PipelineState
-	for _, ps := range s.pipelines {
-		out = append(out, ps)
-	}
-	return out
-}
-
-func (s *Scheduler) Pause(name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ps, ok := s.pipelines[name]; ok {
-		ps.Paused = true
-		return true
-	}
-	return false
-}
-
-func (s *Scheduler) Resume(name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ps, ok := s.pipelines[name]; ok {
-		ps.Paused = false
-		if isAutoSchedule(ps.Schedule) {
-			ps.NextRun = calcNextRun(ps.Schedule)
-		}
-		return true
-	}
-	return false
-}
-
-// TryStart atomically claims a pipeline for execution. It returns false (with a
-// reason) if the pipeline is unknown, paused, or already running. Used by the
-// webhook trigger to avoid overlapping runs of the same pipeline.
-func (s *Scheduler) TryStart(name string) (bool, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ps, ok := s.pipelines[name]
-	if !ok {
-		return false, "unknown pipeline"
-	}
-	if ps.Paused {
-		return false, "pipeline is paused"
-	}
-	if ps.Running {
-		return false, "pipeline is already running"
-	}
-	ps.Running = true
-	return true, ""
-}
-
-func (s *Scheduler) Reschedule(name string, schedule string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ps, ok := s.pipelines[name]; ok {
-		ps.Schedule = schedule
-		ps.NextRun = calcNextRun(schedule)
-		return true
-	}
-	return false
-}
-
-func (s *Scheduler) MarkRun(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ps, ok := s.pipelines[name]; ok {
-		ps.LastRun = time.Now()
-		if isAutoSchedule(ps.Schedule) {
-			ps.NextRun = calcNextRun(ps.Schedule)
-		}
-	}
-}
-
-func (s *Scheduler) SetRunning(name string, running bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ps, ok := s.pipelines[name]; ok {
-		ps.Running = running
-	}
-}
-
-func (s *Scheduler) GetDue() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var due []string
-	now := time.Now()
-	for name, ps := range s.pipelines {
-		if ps.Paused || ps.Running || !isAutoSchedule(ps.Schedule) {
-			continue
-		}
-		if !ps.NextRun.IsZero() && now.After(ps.NextRun) {
-			due = append(due, name)
-		}
-	}
-	return due
-}
 
 // --- Guardrails ---
 
@@ -708,7 +563,8 @@ func (t *TGBot) apiCall(method string, payload map[string]interface{}) (json.Raw
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return nil, err
+		// The request URL embeds the bot token; transport errors quote it.
+		return nil, redactedError{err}
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
@@ -728,7 +584,7 @@ func (t *TGBot) apiCall(method string, payload map[string]interface{}) (json.Raw
 func (t *TGBot) Send(text string) error {
 	_, err := t.apiCall("sendMessage", map[string]interface{}{
 		"chat_id": t.chatID,
-		"text":    text,
+		"text":    redact.String(text),
 	})
 	if err != nil {
 		log.Printf("[telegram] Send failed: %v", err)
@@ -1045,7 +901,8 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return nil, err
+		// The request URL embeds the bot token; transport errors quote it.
+		return nil, redactedError{err}
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
@@ -1073,7 +930,7 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 	runStore := state
 	defer func() {
 		if runStore != nil {
-			if recordErr := runStore.RecordRunForID(runID, pipeline.Name, startedAt, time.Now(), err); recordErr != nil {
+			if recordErr := runStore.RecordRunForID(runID, pipeline.Name, startedAt, time.Now(), redactErr(err)); recordErr != nil {
 				log.Printf("[pipeline:%s] record run: %v", pipeline.Name, recordErr)
 			}
 		}
@@ -2204,17 +2061,20 @@ func handleCron(args string, bot *TGBot, sched *Scheduler) {
 			status := "active"
 			if ps.Paused {
 				status = "PAUSED"
+				if ps.AutoPaused {
+					status = fmt.Sprintf("PAUSED after %d failures", ps.Failures)
+				}
 			}
 			if ps.Schedule == "manual" || ps.Schedule == "" {
 				status = "manual"
 			}
 			nextStr := "-"
 			if !ps.NextRun.IsZero() && !ps.Paused {
-				nextStr = ps.NextRun.Format("15:04:05")
+				nextStr = ps.NextRun.Format("Mon 02 Jan 15:04 MST")
 			}
 			lastStr := "-"
 			if !ps.LastRun.IsZero() {
-				lastStr = ps.LastRun.Format("15:04:05")
+				lastStr = ps.LastRun.Format("Mon 02 Jan 15:04 MST")
 			}
 			msg += fmt.Sprintf("\n%s [%s]\n  schedule: %s | last: %s | next: %s",
 				ps.Name, status, ps.Schedule, lastStr, nextStr)
@@ -2262,15 +2122,16 @@ func handleCron(args string, bot *TGBot, sched *Scheduler) {
 
 	// /cron set <name> <schedule>
 	if parts[0] == "set" && len(parts) > 2 {
-		if sched.Reschedule(parts[1], parts[2]) {
-			bot.Send(fmt.Sprintf("[cron] Rescheduled %s to %s", parts[1], parts[2]))
+		spec := strings.Join(parts[2:], " ")
+		if err := sched.Reschedule(parts[1], spec); err != nil {
+			_ = bot.Send(fmt.Sprintf("[cron] Not rescheduled: %s", err))
 		} else {
-			bot.Send(fmt.Sprintf("[cron] Unknown pipeline: %s", parts[1]))
+			_ = bot.Send(fmt.Sprintf("[cron] Rescheduled %s to %s", parts[1], spec))
 		}
 		return
 	}
 
-	bot.Send("[cron] Usage: /cron | /cron pause <name> | /cron resume <name> | /cron set <name> <interval>")
+	_ = bot.Send("[cron] Usage: /cron | /cron pause <name> | /cron resume <name> | /cron set <name> <interval or cron expression>")
 }
 
 func handleSkills(bot *TGBot, skills *skillsapi.SkillRegistry) {
@@ -2304,16 +2165,37 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 		bot.Send(fmt.Sprintf("[run] Unknown pipeline: %s", name))
 		return
 	}
+	if ok, reason := sched.TryStartManual(name); !ok {
+		_ = bot.Send(fmt.Sprintf("[run] Not started: %s (%s)", name, reason))
+		return
+	}
 	bot.Send(fmt.Sprintf("[run] Starting: %s", name))
-	sched.SetRunning(name, true)
 	go func() {
-		defer sched.SetRunning(name, false)
-		if err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil); err != nil {
+		err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil)
+		if err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
 			bot.Send(fmt.Sprintf("[run] ERROR in %s: %s", name, err))
 		}
-		sched.MarkRun(name)
+		finishRun(sched, bot, name, err)
 	}()
+}
+
+func pipelineByName(cfg *config.Config, name string) (config.PipelineConfig, bool) {
+	for i := range cfg.Pipelines {
+		if cfg.Pipelines[i].Name == name {
+			return cfg.Pipelines[i], true
+		}
+	}
+	return config.PipelineConfig{}, false
+}
+
+// finishRun releases a run's claim and tells the operator when the failure
+// just paused the pipeline.
+func finishRun(sched *Scheduler, ch interface{ Send(string) error }, name string, err error) {
+	if sched.Finish(name, err) {
+		log.Printf("[scheduler] %s paused after %d consecutive failures", name, sched.failureStreak(name))
+		_ = ch.Send(autoPauseNotice(name, sched.failureStreak(name), err))
+	}
 }
 
 func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *config.Config) {
@@ -2461,6 +2343,8 @@ func main() {
 			return
 		case "validate":
 			os.Exit(validate.Run(os.Args[2:]))
+		case "doctor":
+			os.Exit(runDoctor(os.Args[2:], os.Stdout))
 		case "test":
 			os.Exit(runTestCmd(os.Args[2:]))
 		case "audit-verify":
@@ -2485,6 +2369,7 @@ func main() {
 			fmt.Println("Usage:")
 			fmt.Println("  draftcat [config.yaml] [skills/]       run the engine (default)")
 			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
+			fmt.Println("  draftcat doctor [--json]               read-only preflight: credentials, operators, state, ports, schedules")
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat budget <status|reconcile>      inspect spend or reconcile uncertain provider usage")
@@ -2517,6 +2402,12 @@ func main() {
 	cfg.Telegram.SetToken(resolveEnv(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"))
 	cfg.Relay.SetSecret(resolveEnv(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET"))
 	cfg.Provider.SetAPIKey(resolveEnv(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY"))
+
+	// Every credential the engine holds is registered for redaction before
+	// anything is logged, so log lines, operator notices, run errors and spans
+	// carry a label in its place.
+	registerSecrets(&cfg)
+	log.SetOutput(redact.Writer(os.Stderr))
 
 	if cfg.Telegram.Token() == "" {
 		log.Fatal("Telegram token not set. Set DRAFTCAT_TG_TOKEN env var.")
@@ -2673,6 +2564,7 @@ func main() {
 	if err := budget.attachStore(state); err != nil {
 		log.Printf("[budget] usage ledger unavailable; model calls blocked: %v", err)
 	}
+	budget.configureAlerts(&cfg, func(msg string) { _ = opChan.Send(msg) })
 	chatHistory := newChatHistory(20) // keep last 20 turns
 
 	// Any approval gate still marked pending was open when this process last
@@ -2680,6 +2572,7 @@ func main() {
 	// engine starts, so no gate is left in an unknown state and no stale button
 	// looks live. Needs the bot, hence its position after it.
 	reconcileInterruptedApprovals(state, opChan)
+	restoreSchedules(sched, &cfg, state, bot)
 	if err := state.InterruptWebhookAdmissions(time.Now()); err != nil {
 		log.Printf("[webhook] reconcile admissions: %v", err)
 	}
@@ -2695,6 +2588,7 @@ func main() {
 	// take down the engine.
 	if cfg.Observ.Prometheus.Enabled {
 		obs.EnablePrometheus()
+		obs.SetGaugeSource(func() []obs.Gauge { return engineGauges(sched, budget, &cfg, state) })
 		if closer, perr := obs.ServePrometheus(cfg.Observ.Prometheus.Addr, cfg.Observ.Prometheus.Path); perr != nil {
 			log.Printf("[obs] prometheus exporter failed to start: %v", perr)
 		} else {
@@ -2720,12 +2614,13 @@ func main() {
 	}
 
 	// Webhook trigger server — opt-in; opens no port unless enabled.
+	var webhookSrv *http.Server
 	if cfg.Webhook.Enabled {
 		cfg.Webhook.SetSecret(resolveEnv(cfg.Webhook.SecretEnv))
 		if cfg.Webhook.Secret() == "" {
 			log.Fatalf("webhook.enabled is true but secret env %q is empty — refusing to start an unauthenticated trigger", cfg.Webhook.SecretEnv)
 		}
-		startWebhookServer(&cfg, sched, budget, bot, skillReg)
+		webhookSrv = startWebhookServer(&cfg, sched, budget, bot, skillReg)
 	}
 
 	// Drain updates that arrived while the engine was down, then start the
@@ -2753,6 +2648,7 @@ func main() {
 		case sig := <-sigCh:
 			log.Printf("received %s, shutting down", sig)
 			// silent shutdown — no message
+			drainEngine(sched, webhookSrv, shutdownGrace(&cfg))
 			return
 
 		case <-ticker.C:
@@ -2963,23 +2859,21 @@ Conversation so far:
 			}
 
 			// 2. Check for scheduled pipelines
-			due := sched.GetDue()
-			for _, name := range due {
-				for i := range cfg.Pipelines {
-					if cfg.Pipelines[i].Name == name {
-						log.Printf("[scheduler] running due pipeline: %s", name)
-						sched.SetRunning(name, true)
-						go func(p config.PipelineConfig) {
-							defer sched.SetRunning(p.Name, false)
-							if err := runPipeline(&cfg, p, budget, gateChannel(bot), skillReg, nil); err != nil {
-								log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
-								bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
-							}
-							sched.MarkRun(p.Name)
-						}(cfg.Pipelines[i])
-						break
-					}
+			for _, name := range sched.ClaimDue() {
+				p, ok := pipelineByName(&cfg, name)
+				if !ok {
+					sched.SetRunning(name, false)
+					continue
 				}
+				log.Printf("[scheduler] running due pipeline: %s", name)
+				go func(p config.PipelineConfig) {
+					err := runPipeline(&cfg, p, budget, gateChannel(bot), skillReg, nil)
+					if err != nil {
+						log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
+						_ = bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
+					}
+					finishRun(sched, bot, p.Name, err)
+				}(p)
 			}
 		}
 	}
@@ -2994,7 +2888,7 @@ Conversation so far:
 //
 // The server runs in a background goroutine. A trigger is rejected (409) if the
 // pipeline is already running, preserving the at-most-once-concurrent guarantee.
-func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTracker, bot *TGBot, skills *skillsapi.SkillRegistry) {
+func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTracker, bot *TGBot, skills *skillsapi.SkillRegistry) *http.Server {
 	addr := cfg.Webhook.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8088"
@@ -3011,6 +2905,7 @@ func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTrac
 			log.Printf("[webhook] server stopped: %v", err)
 		}
 	}()
+	return srv
 }
 
 // webhookSigHeader carries the body-bound HMAC receipt on inbound triggers.
@@ -3330,21 +3225,22 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 
 		log.Printf("[webhook] triggering pipeline %s (%d body bytes)", name, len(body))
 		go func(p config.PipelineConfig, body []byte, admissionID string) {
-			defer sched.SetRunning(p.Name, false)
+			var runErr error
+			defer func() { finishRun(sched, bot, p.Name, runErr) }()
 			seed := map[string]interface{}{"webhook_body": string(body)}
 			if strings.TrimSpace(string(body)) != "" {
 				seed["input"] = string(body)
 			}
 			if err := runPipeline(cfg, p, budget, gateChannel(bot), skills, seed); err != nil {
+				runErr = err
 				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
 				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))
 				if state != nil {
-					_ = state.FinishWebhookAdmission(admissionID, "error", err.Error(), time.Now())
+					_ = state.FinishWebhookAdmission(admissionID, "error", redact.String(err.Error()), time.Now())
 				}
 			} else if state != nil {
 				_ = state.FinishWebhookAdmission(admissionID, "completed", "", time.Now())
 			}
-			sched.MarkRun(p.Name)
 		}(p, body, admissionID)
 
 		writeWebhookAdmission(w, admission)
