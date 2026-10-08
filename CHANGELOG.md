@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.0
+
+Operations you can leave running: calendar schedules, a preflight, a clean shutdown and credentials that stay out of every log.
+
+- Add `draftcat doctor`, a read-only preflight of config, credentials, operator access, the state store, listener ports and schedules, with a fix for each finding and `--json` output. Exits 1 when a check fails.
+- Schedule pipelines with five-field cron expressions and `@hourly`/`@daily`/`@weekly`/`@monthly`, evaluated in a per-pipeline `timezone`. `catch_up: true` runs a slot missed during downtime once at start.
+- Continue interval schedules from the recorded run history across restarts.
+- Admit every pipeline run, whether from the timer, `/run`, the Run-now button or a webhook, through one claim, keeping one run per pipeline in progress.
+- Pause a timer pipeline after `pause_after_failures` consecutive failed runs and notify the operator once; the streak is restored at start and `/cron resume` clears it.
+- Drain on `SIGINT`/`SIGTERM`: refuse new runs, close the webhook listener and wait up to `timeouts.shutdown_grace` (default 30s) for running pipelines.
+- Notify the operator at `budgets.alert_at` fractions of the daily token and cost caps, once per threshold and UTC day, also across restarts.
+- Replace configured credentials with `[REDACTED:<VARIABLE>]` in logs, operator notifications, stored run and webhook errors, JSON spans and OTLP exports.
+- Export current-state Prometheus gauges: running pipelines, paused pipelines, failure streaks, open approvals, and today's tokens and spend against the caps.
+
+`/cron set` accepts cron expressions. See [running Draftcat unattended](docs/operations.md).
+
+### Upgrade notes
+
+All new settings are optional. Configurations without them behave as before, except that interval pipelines continue from their last recorded run instead of starting a fresh interval at boot, and the engine waits up to 30 seconds for running pipelines on shutdown (`timeouts.shutdown_grace: 0s` restores an immediate exit). An operator `/run` of a pipeline that is already running is refused instead of starting a second run.
+
 ## 0.9.0
 
 - Isolate pipeline token and cost totals and serialize model admission against settled daily usage.

@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/renezander030/draftcat/internal/redact"
 )
 
 // otlpSpan is the engine-neutral span record handed to the exporter.
@@ -99,6 +101,7 @@ func (e *otlpExporter) export(ctx context.Context, spans []otlpSpan) error {
 	if err != nil {
 		return err
 	}
+	body = redact.Bytes(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err

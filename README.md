@@ -164,7 +164,7 @@ cp secrets.yaml.example secrets.yaml
 docker compose up
 ```
 
-Pipelines live in `config.yaml`, prompts in `skills/`. A SQLite store opens at `./state.db` on first boot. To add the EU-resident **voice AI** plugin: `go build -tags voice -o draftcat .` — the lean binary is unchanged when the tag is off.
+Pipelines live in `config.yaml`, prompts in `skills/`. Run `draftcat doctor` to check credentials, operators, the state store and schedules before the first start. A SQLite store opens at `./state.db` on first boot. To add the EU-resident **voice AI** plugin: `go build -tags voice -o draftcat .` — the lean binary is unchanged when the tag is off.
 
 ## Deploy — where it runs
 
@@ -282,6 +282,7 @@ budgets:
   per_day_tokens:      100000
   per_day_cost:        5.00     # money cap, same unit as your model rates (0 = off)
   per_pipeline_cost:   0.50
+  alert_at:            [0.5, 0.8]   # tell the operator at 50% and 80% of a daily cap
 
 observability: {spans: false}   # or DRAFTCAT_TRACE=1
 state:         {path: ./state.db}
@@ -357,6 +358,7 @@ Skills are YAML prompt templates in `skills/` with an `output_schema` the engine
 ```bash
 draftcat                       # run the engine (validates config first; refuses to start on errors)
 draftcat validate [--strict]   # lint config + skills
+draftcat doctor [--json]       # read-only preflight: credentials, operators, state, ports, schedules
 draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat pending               # approval gates waiting on a human right now (--json)
@@ -387,7 +389,9 @@ Approval rows can be made tamper-evident with signed receipts, so a later audit
 can verify which operator approved which payload hash. See
 [`docs/action-receipts.md`](docs/action-receipts.md).
 
-A pipeline's `schedule` decides when it runs — an interval (`1h`), `manual` (operator `/run` only), or `webhook`. The `webhook` server is opt-in and opens no port unless enabled:
+A pipeline's `schedule` decides when it runs — an interval (`1h`), a cron expression in the pipeline's time zone (`"0 8 * * 1-5"` with `timezone: Europe/Berlin`), `@daily`-style shortcuts, `manual` (operator `/run` only), or `webhook`. Schedules continue from the recorded run history across restarts, `pause_after_failures` stops a pipeline that keeps failing, and `SIGTERM` lets running pipelines finish within `timeouts.shutdown_grace`. See [running Draftcat unattended](docs/operations.md).
+
+The `webhook` server is opt-in and opens no port unless enabled:
 
 ```yaml
 webhook: {enabled: true, addr: 127.0.0.1:8088, secret_env: DRAFTCAT_WEBHOOK_SECRET}

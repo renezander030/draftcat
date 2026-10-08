@@ -61,11 +61,13 @@ budgets:
   per_step_tokens: 2048
   per_pipeline_tokens: 10000
   per_day_tokens: 100000
+  # alert_at: [0.5, 0.8, 0.95]   # notify the operator at these fractions of a daily cap
 
 timeouts:
   ai_call: 30s
   operator_approval: 4h
   pipeline_total: 5m
+  # shutdown_grace: 30s        # SIGTERM waits this long for running pipelines
 
 # Structured span emission for auditing/observability. Off by default; the
 # DRAFTCAT_TRACE env var also enables it. One JSON line per pipeline + per step.
@@ -159,7 +161,9 @@ pipelines:
 
   # Stale opportunity recovery — drafts follow-ups for dormant deals
   - name: opportunity-recovery
-    schedule: 24h
+    schedule: 24h                  # or a cron expression, e.g. "0 9 * * 1-5"
+    # timezone: Europe/Berlin      # zone for cron schedules (default: host zone)
+    # pause_after_failures: 3      # pause after 3 failed runs in a row
     steps:
       - name: fetch-stale
         type: deterministic

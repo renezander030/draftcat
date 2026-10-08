@@ -16,6 +16,7 @@ import (
 	"github.com/renezander030/draftcat/internal/channels"
 	"github.com/renezander030/draftcat/internal/config"
 	"github.com/renezander030/draftcat/internal/outputschema"
+	"github.com/renezander030/draftcat/internal/schedule"
 	skillsapi "github.com/renezander030/draftcat/internal/skills"
 )
 
@@ -134,6 +135,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	skills := loadSkillsForValidate(skillsDir, rep)
 	checkConfigSecurity(cfg, rep)
 	checkTimeouts(cfg, rep)
+	checkBudgetAlerts(cfg, rep)
 	checkRolesToModels(cfg, rep)
 	checkEnvVars(cfg, rep)
 	checkPipelines(cfg, skills, skillsDir, rep)
@@ -272,13 +274,34 @@ func checkTimeouts(cfg *config.Config, rep *validateReport) {
 		"timeouts.ai_call":           cfg.Timeouts.AICall,
 		"timeouts.operator_approval": cfg.Timeouts.OperatorApproval,
 		"timeouts.pipeline_total":    cfg.Timeouts.PipelineTotal,
+		"timeouts.shutdown_grace":    cfg.Timeouts.ShutdownGrace,
 	} {
 		if val == "" {
 			continue
 		}
-		if _, err := time.ParseDuration(val); err != nil {
+		if d, err := time.ParseDuration(val); err != nil {
 			rep.errf(label, "invalid duration %q: %v", val, err)
+		} else if d < 0 {
+			rep.errf(label, "duration %q must not be negative", val)
 		}
+	}
+}
+
+func checkBudgetAlerts(cfg *config.Config, rep *validateReport) {
+	seen := map[float64]bool{}
+	for i, f := range cfg.Budgets.AlertAt {
+		p := fmt.Sprintf("budgets.alert_at[%d]", i)
+		if !(f > 0 && f < 1) {
+			rep.errf(p, "%v is not a fraction between 0 and 1 (e.g. 0.8 for 80%%)", f)
+			continue
+		}
+		if seen[f] {
+			rep.warnf(p, "duplicate threshold %v", f)
+		}
+		seen[f] = true
+	}
+	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 {
+		rep.warnf("budgets.alert_at", "set per_day_tokens or per_day_cost; alerts are fractions of a daily cap")
 	}
 }
 
@@ -329,9 +352,25 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				rep.warnf(path+".schedule", "schedule 'webhook' but webhook.enabled is false — this pipeline can never be triggered")
 			}
 		default:
-			if _, err := time.ParseDuration(p.Schedule); err != nil {
-				rep.errf(path+".schedule", "invalid duration %q (use e.g. '30m', '1h', 'manual', or 'webhook')", p.Schedule)
+			sc, err := schedule.Parse(p.Schedule, p.Timezone)
+			if err != nil {
+				rep.errf(path+".schedule", "invalid schedule %q: %v (use e.g. '30m', '0 8 * * 1-5', '@daily', 'manual', or 'webhook')", p.Schedule, err)
+			} else if sc.IsInterval() {
+				if p.Timezone != "" {
+					rep.warnf(path+".timezone", "timezone applies to calendar schedules only; interval %q ignores it", p.Schedule)
+				}
+				if p.CatchUp {
+					rep.warnf(path+".catch_up", "catch_up applies to calendar schedules only; intervals always continue from the last run")
+				}
 			}
+		}
+		if p.Timezone != "" && !schedule.IsTimer(p.Schedule) {
+			rep.warnf(path+".timezone", "timezone has no effect on schedule %q", p.Schedule)
+		}
+		if p.PauseAfterFailures < 0 {
+			rep.errf(path+".pause_after_failures", "must be 0 (never pause) or a positive count, got %d", p.PauseAfterFailures)
+		} else if p.PauseAfterFailures > 0 && !schedule.IsTimer(p.Schedule) {
+			rep.warnf(path+".pause_after_failures", "applies to timer schedules only; schedule %q is never paused automatically", p.Schedule)
 		}
 
 		aiSteps := 0
