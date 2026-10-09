@@ -274,7 +274,7 @@ provider:
   api_key_env: OPENROUTER_API_KEY
 
 models:
-  haiku: {model: anthropic/claude-haiku-4-5, max_tokens: 1024}
+  haiku: {model: anthropic/claude-haiku-5.5, max_tokens: 4096}
 
 budgets:
   per_step_tokens:     2048

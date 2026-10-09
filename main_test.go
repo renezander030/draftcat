@@ -29,7 +29,7 @@ provider:
   base_url: https://openrouter.ai/api/v1
 models:
   haiku:
-    model: anthropic/claude-haiku-4-5
+    model: anthropic/claude-haiku-5.5
     max_tokens: 1024
     cost_per_1k_input: 0.001
     cost_per_1k_output: 0.002
@@ -81,7 +81,7 @@ pipelines:
 	if m, ok := cfg.Models["haiku"]; !ok {
 		t.Error("model 'haiku' not found")
 	} else {
-		if m.Model != "anthropic/claude-haiku-4-5" {
+		if m.Model != "anthropic/claude-haiku-5.5" {
 			t.Errorf("unexpected model name: %s", m.Model)
 		}
 		if m.MaxTokens != 1024 {
