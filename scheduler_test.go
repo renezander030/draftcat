@@ -216,11 +216,11 @@ func TestDrainEngineWithNothingRunning(t *testing.T) {
 	}
 }
 
-func TestSetRunningIsIdempotentForTheWaitGroup(t *testing.T) {
+func TestReleaseIsIdempotentForTheWaitGroup(t *testing.T) {
 	s, _ := schedulerAt(time.Now(), config.PipelineConfig{Name: "a", Schedule: "manual"})
 	s.TryStart("a")
-	s.SetRunning("a", false)
-	s.SetRunning("a", false) // must not panic with a negative counter
+	s.Release("a")
+	s.Release("a") // must not panic with a negative counter
 	if !s.Wait(time.Second) {
 		t.Fatal("released claim still counted")
 	}

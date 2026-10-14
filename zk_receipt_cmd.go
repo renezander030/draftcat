@@ -6,10 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/renezander030/draftcat/internal/approval"
-	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
 	"github.com/renezander030/draftcat/internal/zkreceipt"
 )
@@ -149,18 +146,13 @@ func latestHumanApproval(records []statestore.ApprovalRecord) (statestore.Approv
 	return statestore.ApprovalRecord{}, false
 }
 
+// resolveZKStatePath differs from statePathFromConfigFile only in treating a
+// whitespace-only state.path as unset.
 func resolveZKStatePath(configPath string) string {
-	if value := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); value != "" {
-		return value
+	if p := statePathFromConfigFile(configPath); strings.TrimSpace(p) != "" {
+		return p
 	}
-	// #nosec G304 -- the operator explicitly chooses which local Draftcat config to read.
-	if data, err := os.ReadFile(configPath); err == nil {
-		var cfg config.Config
-		if yaml.Unmarshal(data, &cfg) == nil && strings.TrimSpace(cfg.State.Path) != "" {
-			return cfg.State.Path
-		}
-	}
-	return "./state.db"
+	return defaultStatePath
 }
 
 func runZKReceiptVerify(args []string) int {

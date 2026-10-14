@@ -41,10 +41,7 @@ func enforceModelPolicy(ctx context.Context, cfg *config.Config, role, phase, te
 			}
 			return fmt.Errorf("model policy %q requires review but no operator channel is running", rule.ID)
 		}
-		timeout, _ := time.ParseDuration(cfg.Timeouts.OperatorApproval)
-		if timeout <= 0 {
-			timeout = 4 * time.Hour
-		}
+		timeout := cfg.Timeouts.OperatorApprovalWindow()
 		expires = time.Now().Add(timeout)
 		msg := fmt.Sprintf("[draftcat] Model %s requires review\n\nrule: %s\nrole: %s\nreason: %s\n\n%s",
 			phase, rule.ID, role, rule.Reason, modelPolicyPreview(text, cfg.ModelPolicy.PreviewLimit()))

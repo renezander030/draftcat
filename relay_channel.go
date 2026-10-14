@@ -140,11 +140,7 @@ func (r *RelayChannel) SendForApproval(ctx context.Context, draft string, approv
 	if err != nil {
 		return OperatorDecision{}, err
 	}
-	var id int64
-	if qd.Action == relay.ActionApprove && len(qd.Approvers) > 0 {
-		id = qd.Approvers[0]
-	}
-	return OperatorDecision{Action: qd.Action, Text: qd.Text, ApproverID: id, DeciderID: qd.DeciderID}, nil
+	return qd.asSingle(), nil
 }
 
 // SendForQuorumApproval dispatches the draft and blocks until `need` distinct
@@ -159,7 +155,7 @@ func (r *RelayChannel) SendForQuorumApproval(ctx context.Context, draft string, 
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		deadline = time.Now().Add(4 * time.Hour)
+		deadline = time.Now().Add(config.DefaultOperatorApproval)
 	}
 
 	nonce, err := relay.NewNonce()

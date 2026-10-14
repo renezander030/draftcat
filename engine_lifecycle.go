@@ -20,9 +20,9 @@ const defaultShutdownGrace = 30 * time.Second
 // credential from, labelled by the name the operator configured.
 func secretEnvNames(cfg *config.Config) []string {
 	names := []string{
-		firstNonEmpty(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"),
-		firstNonEmpty(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET"),
-		firstNonEmpty(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY"),
+		cfg.Telegram.TokenEnvName(),
+		cfg.Relay.SecretEnvName(),
+		cfg.Provider.APIKeyEnvName(),
 		"DRAFTCAT_APPROVAL_SECRET",
 	}
 	for _, n := range []string{cfg.Webhook.SecretEnv, cfg.GHL.APIKeyEnv, cfg.Observ.OTLP.HeaderEnv} {
@@ -52,9 +52,9 @@ func registerSecrets(cfg *config.Config) {
 	}
 	// Secrets already resolved into the config, in case they came from a
 	// fallback variable.
-	redact.Register(firstNonEmpty(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"), cfg.Telegram.Token())
-	redact.Register(firstNonEmpty(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET"), cfg.Relay.Secret())
-	redact.Register(firstNonEmpty(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY"), cfg.Provider.APIKey())
+	redact.Register(cfg.Telegram.TokenEnvName(), cfg.Telegram.Token())
+	redact.Register(cfg.Relay.SecretEnvName(), cfg.Relay.Secret())
+	redact.Register(cfg.Provider.APIKeyEnvName(), cfg.Provider.APIKey())
 }
 
 func firstNonEmpty(vals ...string) string {

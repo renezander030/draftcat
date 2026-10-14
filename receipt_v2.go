@@ -49,17 +49,19 @@ func newApprovalEnvelope(secret []byte, runID, pipeline string, step config.Step
 	if len(secret) == 0 {
 		return e
 	}
+	signApprovalEnvelope(secret, &e)
+	return e
+}
+
+// signApprovalEnvelope sets the envelope's nonce and v2 signature over
+// e.FieldsV2(). It reports false, leaving the envelope unsigned, when no nonce
+// could be drawn; callers decide whether an unsigned receipt is an error.
+func signApprovalEnvelope(secret []byte, e *statestore.ApprovalEnvelope) bool {
 	nonce, err := approval.NewNonce()
 	if err != nil {
-		return e
+		return false
 	}
 	e.Nonce = nonce
-	e.Signature = approval.SignV2(secret, approval.FieldsV2{
-		ReceiptID: e.ReceiptID, RunID: e.RunID, ActionID: e.ActionID,
-		Pipeline: e.Pipeline, Step: e.Step, DecidedAt: e.DecidedAt.Unix(),
-		Decision: e.Decision, OperatorID: e.OperatorID, PayloadHash: e.PayloadHash,
-		Policy: e.Policy, PolicyHash: e.PolicyHash, BindingHash: e.BindingHash,
-		ExpiresAt: e.ExpiresAt.Unix(), QuorumN: e.QuorumN, QuorumGot: e.QuorumGot,
-	}, nonce)
-	return e
+	e.Signature = approval.SignV2(secret, e.FieldsV2(), nonce)
+	return true
 }

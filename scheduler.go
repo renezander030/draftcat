@@ -265,25 +265,18 @@ func (s *Scheduler) Finish(name string, runErr error) bool {
 	return false
 }
 
-// MarkRun records a successful end of a run. Kept for call sites that do not
-// track the run's error.
-func (s *Scheduler) MarkRun(name string) { s.Finish(name, nil) }
-
-// SetRunning sets or clears the running flag directly. Clearing releases a
-// claim taken by TryStart when the run is abandoned before it starts.
-func (s *Scheduler) SetRunning(name string, running bool) {
+// Release gives back a claim taken by TryStart or ClaimDue when the run is
+// abandoned before it starts. Unlike Finish it records no run. Releasing an
+// unclaimed or unknown pipeline is a no-op.
+func (s *Scheduler) Release(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ps, ok := s.pipelines[name]
-	if !ok || ps.Running == running {
+	if !ok || !ps.Running {
 		return
 	}
-	ps.Running = running
-	if running {
-		s.inflight.Add(1)
-	} else {
-		s.inflight.Done()
-	}
+	ps.Running = false
+	s.inflight.Done()
 }
 
 // GetDue lists timer pipelines whose next run has passed, without claiming them.
