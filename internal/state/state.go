@@ -449,6 +449,19 @@ type ApprovalEnvelope struct {
 	Lifecycle   string
 }
 
+// FieldsV2 is the exact field set a v2 receipt signature covers. Times are
+// signed as Unix seconds as they stand; a zero ExpiresAt is not mapped to 0
+// here (VerifyApprovalRecord does that for rows read back from the store).
+func (e ApprovalEnvelope) FieldsV2() approval.FieldsV2 {
+	return approval.FieldsV2{
+		ReceiptID: e.ReceiptID, RunID: e.RunID, ActionID: e.ActionID,
+		Pipeline: e.Pipeline, Step: e.Step, DecidedAt: e.DecidedAt.Unix(),
+		Decision: e.Decision, OperatorID: e.OperatorID, PayloadHash: e.PayloadHash,
+		Policy: e.Policy, PolicyHash: e.PolicyHash, BindingHash: e.BindingHash,
+		ExpiresAt: e.ExpiresAt.Unix(), QuorumN: e.QuorumN, QuorumGot: e.QuorumGot,
+	}
+}
+
 // RecordApproval appends one approval-decision row. Called on every terminal
 // decision (approve/skip/adjust/timeout/quorum_fail). A failure is
 // surfaced to the caller; required authorization persistence must block release. nonce and signature carry
@@ -462,30 +475,21 @@ func (s *StateStore) RecordApproval(pipeline, step string, decidedAt time.Time,
 // RecordApprovalForRun is RecordApproval with the run identity attached, so the
 // audit trail can answer which run a decision released rather than only which
 // pipeline. runID may be "" for callers with no run context (the standalone
-// approval path), which reproduces the previous behavior exactly.
+// approval path), which reproduces the previous behavior exactly. These legacy
+// v1 rows never carry a policy: a policy release is written by RecordApprovalV2.
 func (s *StateStore) RecordApprovalForRun(runID, pipeline, step string, decidedAt time.Time,
 	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
 	nonce, signature string) error {
-	return s.RecordApprovalRow(runID, pipeline, step, decidedAt, decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, "")
-}
-
-// RecordApprovalRow is the full write, including the policy rule that released
-// a decision. policy is non-empty only for decision "policy_approve", so the
-// audit trail always distinguishes what a human tapped from what a
-// pre-declared rule released.
-func (s *StateStore) RecordApprovalRow(runID, pipeline, step string, decidedAt time.Time,
-	decision string, operatorID int64, payloadHash string, quorumN, quorumGot int,
-	nonce, signature, policy string) error {
 	_, err := s.db.ExecContext(context.Background(),
 		`INSERT INTO action_approvals (pipeline, step, decided_at, decision, operator_id, payload_hash, quorum_n, quorum_got, nonce, signature, run_id, policy)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, runID, policy,
+		pipeline, step, decidedAt.Unix(), decision, operatorID, payloadHash, quorumN, quorumGot, nonce, signature, runID, "",
 	)
 	return err
 }
 
 // RecordApprovalV2 appends a versioned, action-bound receipt. Legacy writers
-// continue through RecordApprovalRow and retain v1 verification semantics.
+// continue through RecordApprovalForRun and retain v1 verification semantics.
 func (s *StateStore) RecordApprovalV2(e ApprovalEnvelope) error {
 	lifecycle := e.Lifecycle
 	if lifecycle == "" {

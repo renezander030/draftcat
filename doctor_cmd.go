@@ -159,8 +159,8 @@ func doctorSkills(rep *doctorReport, dir string) {
 }
 
 func doctorChannel(rep *doctorReport, cfg *config.Config) {
-	tokenEnv := firstNonEmpty(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN")
-	if envSet(tokenEnv) || envSet("DRAFTCAT_TG_TOKEN") {
+	tokenEnv := cfg.Telegram.TokenEnvName()
+	if envSet(tokenEnv) || envSet(config.DefaultTelegramTokenEnv) {
 		rep.add("telegram token", "ok", tokenEnv+" is set", "")
 	} else {
 		rep.add("telegram token", "fail", tokenEnv+" is empty", "export "+tokenEnv+"=<bot token from @BotFather>; the engine refuses to start without it")
@@ -176,8 +176,8 @@ func doctorChannel(rep *doctorReport, cfg *config.Config) {
 		rep.add("operators", "ok", "operator chat and allowed users configured", "")
 	}
 	if cfg.Relay.Enabled() {
-		secretEnv := firstNonEmpty(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET")
-		if envSet(secretEnv) || envSet("DRAFTCAT_RELAY_SECRET") {
+		secretEnv := cfg.Relay.SecretEnvName()
+		if envSet(secretEnv) || envSet(config.DefaultRelaySecretEnv) {
 			rep.add("relay", "ok", fmt.Sprintf("approvals go to %s; %s is set", cfg.Relay.URL, secretEnv), "")
 		} else {
 			rep.add("relay", "fail", secretEnv+" is empty", "export the shared HMAC secret the relay was configured with")
@@ -186,8 +186,8 @@ func doctorChannel(rep *doctorReport, cfg *config.Config) {
 }
 
 func doctorProvider(rep *doctorReport, cfg *config.Config) {
-	keyEnv := firstNonEmpty(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY")
-	if envSet(keyEnv) || envSet("OPENROUTER_API_KEY") {
+	keyEnv := cfg.Provider.APIKeyEnvName()
+	if envSet(keyEnv) || envSet(config.DefaultProviderKeyEnv) {
 		rep.add("provider key", "ok", keyEnv+" is set", "")
 	} else {
 		rep.add("provider key", "fail", keyEnv+" is empty", "export "+keyEnv+"=<provider API key>")
@@ -222,13 +222,7 @@ func doctorSecretsFile(rep *doctorReport) {
 
 // doctorState inspects the state store without creating or migrating it.
 func doctorState(rep *doctorReport, cfg *config.Config, now time.Time) {
-	path := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
-	if path == "" {
-		path = cfg.State.Path
-	}
-	if path == "" {
-		path = "./state.db"
-	}
+	path := resolveStatePath(cfg)
 	if _, err := os.Stat(path); err != nil {
 		dir := filepath.Dir(path)
 		if fi, derr := os.Stat(dir); derr != nil || !fi.IsDir() {

@@ -9,9 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
-	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
@@ -223,21 +220,7 @@ func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approv
 // override, then config, then ./state.db — and opens it read-only for a
 // reporting command.
 func openStateForCmd(configPath string) (*statestore.StateStore, func(), int) {
-	statePath := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
-	if statePath == "" {
-		// #nosec G304 -- configPath is the operator's own --config argument on
-		// their own machine; reading the file they named is the feature. Same
-		// pattern as runAuditVerify.
-		if data, err := os.ReadFile(configPath); err == nil {
-			var cfg config.Config
-			if yaml.Unmarshal(data, &cfg) == nil {
-				statePath = cfg.State.Path
-			}
-		}
-	}
-	if statePath == "" {
-		statePath = "./state.db"
-	}
+	statePath := statePathFromConfigFile(configPath)
 	st, err := statestore.OpenStateStoreReadOnly(statePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runs: open state store %s: %v\n", statePath, err)

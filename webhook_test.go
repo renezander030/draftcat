@@ -25,11 +25,11 @@ func TestSchedulerTryStart(t *testing.T) {
 		t.Errorf("second TryStart should report already-running, got ok=%v reason=%q", ok, reason)
 	}
 
-	sched.SetRunning("p1", false)
+	sched.Release("p1")
 	if ok, _ := sched.TryStart("p1"); !ok {
-		t.Error("TryStart should succeed after SetRunning(false)")
+		t.Error("TryStart should succeed after Release")
 	}
-	sched.SetRunning("p1", false)
+	sched.Release("p1")
 
 	sched.Pause("p1")
 	if ok, reason := sched.TryStart("p1"); ok || reason != "pipeline is paused" {
@@ -132,7 +132,7 @@ func TestWebhookAcceptsValid(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if ok, _ := sched.TryStart("ping"); ok {
-			sched.SetRunning("ping", false)
+			sched.Release("ping")
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

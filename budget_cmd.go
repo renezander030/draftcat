@@ -10,9 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
-	"gopkg.in/yaml.v3"
 )
 
 func runBudgetCmd(args []string) int {
@@ -86,19 +84,7 @@ func runBudgetCmd(args []string) int {
 	}
 	// This administrative write requires an existing regular database. It must
 	// never turn a misspelled path into a fresh store with an empty spend ledger.
-	statePath := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
-	if statePath == "" {
-		// #nosec G304 -- the local operator supplies their config path.
-		if data, err := os.ReadFile(path); err == nil {
-			var cfg config.Config
-			if yaml.Unmarshal(data, &cfg) == nil {
-				statePath = cfg.State.Path
-			}
-		}
-	}
-	if statePath == "" {
-		statePath = "./state.db"
-	}
+	statePath := statePathFromConfigFile(path)
 	info, err := os.Stat(statePath)
 	if err != nil || !info.Mode().IsRegular() {
 		fmt.Fprintln(os.Stderr, "budget: existing state database required")

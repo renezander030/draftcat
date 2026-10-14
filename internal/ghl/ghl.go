@@ -491,27 +491,6 @@ func (c *GHLConnector) SendMessage(contactID string, msgType string, body string
 	return err
 }
 
-// --- Webhooks ---
-
-// WebhookPayload represents an inbound GHL webhook event.
-type GHLWebhookPayload struct {
-	Type       string          `json:"type"` // ContactCreate, OpportunityStageUpdate, InboundMessage, etc.
-	LocationID string          `json:"locationId"`
-	Body       json.RawMessage `json:"body"`
-}
-
-// ParseWebhook parses and validates an inbound GHL webhook payload.
-func ParseGHLWebhook(data []byte) (*GHLWebhookPayload, error) {
-	var payload GHLWebhookPayload
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, fmt.Errorf("ghl: invalid webhook payload: %w", err)
-	}
-	if payload.Type == "" {
-		return nil, fmt.Errorf("ghl: webhook missing event type")
-	}
-	return &payload, nil
-}
-
 // --- Formatting ---
 
 // FormatContactsForPrompt formats contacts for LLM consumption.

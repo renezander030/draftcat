@@ -50,7 +50,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/renezander030/draftcat/internal/approval"
 	"github.com/renezander030/draftcat/internal/config"
 	"github.com/renezander030/draftcat/internal/obs"
 	statestore "github.com/renezander030/draftcat/internal/state"
@@ -140,13 +139,12 @@ type toolTicket struct {
 	Created     time.Time
 	Expires     time.Time
 
-	done       chan struct{}
-	mu         sync.Mutex
-	decided    bool
-	decidedAt  time.Time
-	consumedAt time.Time
-	resp       ToolCallResponse
-	cancel     context.CancelFunc
+	done      chan struct{}
+	mu        sync.Mutex
+	decided   bool
+	decidedAt time.Time
+	resp      ToolCallResponse
+	cancel    context.CancelFunc
 }
 
 func (t *toolTicket) result() (ToolCallResponse, bool) {
@@ -225,11 +223,7 @@ func handleToolCall(cfg *config.Config, ch OperatorChannel) http.HandlerFunc {
 }
 
 func (g *toolGate) approvalWindow() time.Duration {
-	timeout, _ := time.ParseDuration(g.cfg.Timeouts.OperatorApproval)
-	if timeout <= 0 {
-		timeout = 4 * time.Hour
-	}
-	return timeout
+	return g.cfg.Timeouts.OperatorApprovalWindow()
 }
 
 // HandleCall is POST /gate/tool-call.
@@ -960,7 +954,7 @@ func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operato
 	receiptID := "rcpt_" + strings.TrimPrefix(newToolTicketID(), "tc_")
 	expires := req.expires
 	if expires.IsZero() {
-		expires = decidedAt.Add(4 * time.Hour)
+		expires = decidedAt.Add(config.DefaultOperatorApproval)
 	}
 	quorumGot := 0
 	if decision == "approve" || decision == "policy_approve" {
@@ -975,17 +969,7 @@ func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operato
 	}
 	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
 	if len(secret) > 0 {
-		nonce, err := approval.NewNonce()
-		if err == nil {
-			envelope.Nonce = nonce
-			envelope.Signature = approval.SignV2(secret, approval.FieldsV2{
-				ReceiptID: envelope.ReceiptID, RunID: envelope.RunID, ActionID: envelope.ActionID,
-				Pipeline: envelope.Pipeline, Step: envelope.Step, DecidedAt: envelope.DecidedAt.Unix(),
-				Decision: envelope.Decision, OperatorID: envelope.OperatorID, PayloadHash: envelope.PayloadHash,
-				Policy: envelope.Policy, PolicyHash: envelope.PolicyHash, BindingHash: envelope.BindingHash,
-				ExpiresAt: envelope.ExpiresAt.Unix(), QuorumN: envelope.QuorumN, QuorumGot: envelope.QuorumGot,
-			}, nonce)
-		}
+		signApprovalEnvelope(secret, &envelope)
 	}
 	if len(secret) > 0 && (envelope.Nonce == "" || envelope.Signature == "") {
 		return envelope, errors.New("approval receipt signing failed")
@@ -1003,16 +987,7 @@ func toolConsumptionReceipt(a statestore.ToolAction, at time.Time) (statestore.A
 	}
 	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
 	if len(secret) > 0 {
-		if nonce, err := approval.NewNonce(); err == nil {
-			e.Nonce = nonce
-			e.Signature = approval.SignV2(secret, approval.FieldsV2{
-				ReceiptID: e.ReceiptID, RunID: e.RunID, ActionID: e.ActionID,
-				Pipeline: e.Pipeline, Step: e.Step, DecidedAt: e.DecidedAt.Unix(),
-				Decision: e.Decision, OperatorID: e.OperatorID, PayloadHash: e.PayloadHash,
-				Policy: e.Policy, PolicyHash: e.PolicyHash, BindingHash: e.BindingHash,
-				ExpiresAt: e.ExpiresAt.Unix(), QuorumN: e.QuorumN, QuorumGot: e.QuorumGot,
-			}, nonce)
-		}
+		signApprovalEnvelope(secret, &e)
 	}
 	if len(secret) > 0 && (e.Nonce == "" || e.Signature == "") {
 		return e, errors.New("approval receipt signing failed")

@@ -59,6 +59,26 @@ type TelegramConfig struct {
 	token    string
 }
 
+// Default credential variables, read when the config names none (and as the
+// fallback when the configured variable is empty). These are variable names,
+// not credentials.
+const (
+	DefaultTelegramTokenEnv = "DRAFTCAT_TG_TOKEN"     // #nosec G101 -- env var name
+	DefaultRelaySecretEnv   = "DRAFTCAT_RELAY_SECRET" // #nosec G101 -- env var name
+	DefaultProviderKeyEnv   = "OPENROUTER_API_KEY"
+)
+
+// envNameOr is the configured variable name, or def when it is blank.
+func envNameOr(configured, def string) string {
+	if strings.TrimSpace(configured) != "" {
+		return configured
+	}
+	return def
+}
+
+// TokenEnvName is the variable the bot token is read from, as operators see it.
+func (t TelegramConfig) TokenEnvName() string { return envNameOr(t.TokenEnv, DefaultTelegramTokenEnv) }
+
 // Token / SetToken access the runtime-resolved bot token (never parsed from YAML).
 func (t TelegramConfig) Token() string      { return t.token }
 func (t *TelegramConfig) SetToken(s string) { t.token = s }
@@ -114,6 +134,9 @@ type RelayOperator struct {
 func (r RelayConfig) Secret() string      { return r.secret }
 func (r *RelayConfig) SetSecret(s string) { r.secret = s }
 
+// SecretEnvName is the variable the relay secret is read from.
+func (r RelayConfig) SecretEnvName() string { return envNameOr(r.SecretEnv, DefaultRelaySecretEnv) }
+
 // Enabled reports whether the relay channel is configured at all.
 func (r RelayConfig) Enabled() bool { return strings.TrimSpace(r.URL) != "" }
 
@@ -166,6 +189,9 @@ type ProviderConfig struct {
 // APIKey / SetAPIKey access the runtime-resolved provider key (never parsed from YAML).
 func (p ProviderConfig) APIKey() string      { return p.apiKey }
 func (p *ProviderConfig) SetAPIKey(s string) { p.apiKey = s }
+
+// APIKeyEnvName is the variable the provider key is read from.
+func (p ProviderConfig) APIKeyEnvName() string { return envNameOr(p.APIKeyEnv, DefaultProviderKeyEnv) }
 
 // IsOpenRouter reports whether the provider is OpenRouter. An empty type has
 // always meant OpenRouter (the key falls back to OPENROUTER_API_KEY).
@@ -286,6 +312,20 @@ type TimeoutConfig struct {
 	// finish before the engine exits. New runs are refused during the wait.
 	// Default 30s; "0s" exits at once.
 	ShutdownGrace string `yaml:"shutdown_grace"`
+}
+
+// DefaultOperatorApproval is how long an approval gate waits for a human when
+// timeouts.operator_approval does not say.
+const DefaultOperatorApproval = 4 * time.Hour
+
+// OperatorApprovalWindow parses operator_approval; empty, unparsable, zero or
+// negative = DefaultOperatorApproval.
+func (t TimeoutConfig) OperatorApprovalWindow() time.Duration {
+	d, _ := time.ParseDuration(t.OperatorApproval)
+	if d <= 0 {
+		return DefaultOperatorApproval
+	}
+	return d
 }
 
 // WebhookConfig enables the opt-in HTTP trigger server. A pipeline with

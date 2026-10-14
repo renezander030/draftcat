@@ -483,6 +483,25 @@ type QuorumDecision struct {
 	DeciderID int64   // user id that skipped or adjusted; 0 if unknown
 }
 
+// asQuorum is a single-approver decision as a quorum of one: a known approver
+// becomes the one-element Approvers list, only on "approve".
+func (d OperatorDecision) asQuorum() QuorumDecision {
+	qd := QuorumDecision{Action: d.Action, Text: d.Text, DeciderID: d.DeciderID}
+	if d.Action == "approve" && d.ApproverID != 0 {
+		qd.Approvers = []int64{d.ApproverID}
+	}
+	return qd
+}
+
+// asSingle is the inverse of asQuorum: the first approver, only on "approve".
+func (q QuorumDecision) asSingle() OperatorDecision {
+	var id int64
+	if q.Action == "approve" && len(q.Approvers) > 0 {
+		id = q.Approvers[0]
+	}
+	return OperatorDecision{Action: q.Action, Text: q.Text, ApproverID: id, DeciderID: q.DeciderID}
+}
+
 // --- Quorum decision logic (pure, testable without Telegram) ---
 
 // approvalEvent is one operator action in arrival order.
@@ -792,11 +811,7 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 		if err != nil {
 			return QuorumDecision{Action: "timeout"}, err
 		}
-		qd := QuorumDecision{Action: d.Action, Text: d.Text, DeciderID: d.DeciderID}
-		if d.Action == "approve" && d.ApproverID != 0 {
-			qd.Approvers = []int64{d.ApproverID}
-		}
-		return qd, nil
+		return d.asQuorum(), nil
 	}
 
 	buttons := approvalButtons()
@@ -1379,9 +1394,11 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			}
 
 			// Send for approval via operator channel (TG buttons, Slack reactions, etc.)
+			// Unlike OperatorApprovalWindow, a negative value (reachable only
+			// with DRAFTCAT_SKIP_VALIDATE=1) is kept as is.
 			approvalTimeout, _ := time.ParseDuration(cfg.Timeouts.OperatorApproval)
 			if approvalTimeout == 0 {
-				approvalTimeout = 4 * time.Hour
+				approvalTimeout = config.DefaultOperatorApproval
 			}
 
 			// quorumN is the required distinct-approver count (>=1).
@@ -1417,12 +1434,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				if derr != nil {
 					return "timeout", "", nil, derr
 				}
-				var aps []int64
-				if dec.Action == "approve" && dec.ApproverID != 0 {
-					aps = []int64{dec.ApproverID}
-				}
-				decider = dec.DeciderID
-				return dec.Action, dec.Text, aps, nil
+				qd := dec.asQuorum()
+				decider = qd.DeciderID
+				return qd.Action, qd.Text, qd.Approvers, nil
 			}
 
 			// approvalSecret signs the audit rows into tamper-evident receipts.
@@ -2362,20 +2376,7 @@ func runAuditVerify(args []string) int {
 		return 2
 	}
 
-	// Resolve the state path exactly like the engine does: env override first,
-	// then the config's State.Path, then the ./state.db default.
-	statePath := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH"))
-	if statePath == "" {
-		if data, err := os.ReadFile(configPath); err == nil {
-			var cfg config.Config
-			if yaml.Unmarshal(data, &cfg) == nil {
-				statePath = cfg.State.Path
-			}
-		}
-	}
-	if statePath == "" {
-		statePath = "./state.db"
-	}
+	statePath := statePathFromConfigFile(configPath)
 
 	st, err := statestore.OpenStateStoreReadOnly(statePath)
 	if err != nil {
@@ -2473,9 +2474,9 @@ func main() {
 	bootRaw := cfg
 
 	// Resolve env vars
-	cfg.Telegram.SetToken(resolveEnv(cfg.Telegram.TokenEnv, "DRAFTCAT_TG_TOKEN"))
-	cfg.Relay.SetSecret(resolveEnv(cfg.Relay.SecretEnv, "DRAFTCAT_RELAY_SECRET"))
-	cfg.Provider.SetAPIKey(resolveEnv(cfg.Provider.APIKeyEnv, "OPENROUTER_API_KEY"))
+	cfg.Telegram.SetToken(resolveEnv(cfg.Telegram.TokenEnv, config.DefaultTelegramTokenEnv))
+	cfg.Relay.SetSecret(resolveEnv(cfg.Relay.SecretEnv, config.DefaultRelaySecretEnv))
+	cfg.Provider.SetAPIKey(resolveEnv(cfg.Provider.APIKeyEnv, config.DefaultProviderKeyEnv))
 
 	// Every credential the engine holds is registered for redaction before
 	// anything is logged, so log lines, operator notices, run errors and spans
@@ -2585,15 +2586,7 @@ func main() {
 	pdfParser = pdf.NewPDFParser()
 
 	// State store — SQLite-backed dedup + run history
-	statePath := cfg.State.Path
-	if statePath == "" {
-		statePath = "./state.db"
-	}
-	// Env override so a container can point state at a mounted disk (e.g. a
-	// PaaS persistent volume) without shadowing the baked config/skills.
-	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
-		statePath = v
-	}
+	statePath := resolveStatePath(&cfg)
 	{
 		var err error
 		state, err = statestore.OpenStateStore(statePath)
@@ -2949,7 +2942,7 @@ Conversation so far:
 				runCfg, runSkills := currentConfig(&cfg), currentSkills(skillReg)
 				p, ok := pipelineByName(runCfg, name)
 				if !ok {
-					sched.SetRunning(name, false)
+					sched.Release(name)
 					continue
 				}
 				log.Printf("[scheduler] running due pipeline: %s", name)
@@ -3278,7 +3271,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		}
 		if signature != "" {
 			if err := claimWebhookSignature(signature, time.Now()); err != nil {
-				sched.SetRunning(name, false)
+				sched.Release(name)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -3289,7 +3282,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		if state != nil {
 			saved, created, err := state.AdmitWebhook(admission)
 			if err != nil {
-				sched.SetRunning(name, false)
+				sched.Release(name)
 				log.Printf("[webhook] durable admission failed: %v", err)
 				if saved.ID != "" {
 					http.Error(w, "idempotency key is already bound to another request body", http.StatusConflict)
@@ -3299,12 +3292,12 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 				return
 			}
 			if !created {
-				sched.SetRunning(name, false)
+				sched.Release(name)
 				writeWebhookAdmission(w, saved)
 				return
 			}
 			if err := state.FinishWebhookAdmission(admissionID, "running", "", now); err != nil {
-				sched.SetRunning(name, false)
+				sched.Release(name)
 				http.Error(w, "state unavailable", http.StatusServiceUnavailable)
 				return
 			}
