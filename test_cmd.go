@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/renezander030/draftcat/internal/channels"
 	"github.com/renezander030/draftcat/internal/config"
 	skillsapi "github.com/renezander030/draftcat/internal/skills"
@@ -20,6 +18,7 @@ import (
 // or auto-approve, never making a network call.
 type stubChannel struct {
 	sent        []string
+	drafts      []string
 	decisions   []OperatorDecision
 	idx         int
 	autoApprove bool
@@ -54,6 +53,7 @@ func (s *stubChannel) SendForQuorumApproval(ctx context.Context, draft string, n
 }
 
 func (s *stubChannel) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
+	s.drafts = append(s.drafts, draft)
 	fmt.Printf("  [approval-draft]\n%s\n", indentBlock(draft, "    "))
 	if s.idx < len(s.decisions) {
 		d := s.decisions[s.idx]
@@ -146,14 +146,9 @@ func runTestCmd(args []string) int {
 		return 2
 	}
 
-	cfgData, err := os.ReadFile(configPath)
+	cfg, err := loadConfigFile(configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "test: read config: %v\n", err)
-		return 1
-	}
-	var cfg config.Config
-	if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "test: parse config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "test: %v\n", err)
 		return 1
 	}
 
@@ -174,23 +169,51 @@ func runTestCmd(args []string) int {
 	fixDir := filepath.Join(fixturesRoot, pipelineName)
 	stub := &stubChannel{autoApprove: autoApprove}
 
+	expect, hasExpect, err := loadExpectation(fixDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "test: %v\n", err)
+		return 1
+	}
+
 	fmt.Printf("[test] pipeline=%s fixtures=%s\n", pipelineName, fixDir)
-	rc := runTestPipeline(&cfg, *pipeline, skills, stub, fixDir)
-	if rc != 0 {
-		return rc
+	run := runTestPipeline(cfg, *pipeline, skills, stub, fixDir)
+	if run.rc != 0 {
+		return run.rc
+	}
+	if hasExpect {
+		problems := expect.check(run, stub)
+		for _, p := range problems {
+			fmt.Printf("[expect] FAIL %s\n", p)
+		}
+		if len(problems) > 0 {
+			fmt.Printf("[test] FAILED: %d expectation(s) not met (%s/_expect.json)\n", len(problems), fixDir)
+			return 1
+		}
+		fmt.Printf("[expect] all expectations met (%s/_expect.json)\n", fixDir)
 	}
 	fmt.Println("[test] OK")
 	return 0
 }
 
+// testRun is how a dry run ended: the exit code for an error, whether the
+// pipeline reached its last step or an operator skip stopped it, and the final
+// data map.
+type testRun struct {
+	rc        int
+	stoppedAt string
+	data      map[string]interface{}
+}
+
 // runTestPipeline walks pipeline steps using fixtures instead of real connectors / AI / approval.
-func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skillsapi.SkillRegistry, ch *stubChannel, fixDir string) int {
+func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skillsapi.SkillRegistry, ch *stubChannel, fixDir string) (run testRun) {
 	data := map[string]interface{}{}
+	run.data = data
 
 	// Optional seed fixture: fixtures/<pipeline>/_input.json merged into the data map before any step.
 	if seed, found, err := loadFixture(fixDir, "_input"); err != nil {
 		fmt.Fprintf(os.Stderr, "  [error] seed fixture: %v\n", err)
-		return 1
+		run.rc = 1
+		return run
 	} else if found {
 		for k, v := range seed {
 			data[k] = v
@@ -206,7 +229,8 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 			fix, found, err := loadFixture(fixDir, step.Name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  [error] %v\n", err)
-				return 1
+				run.rc = 1
+				return run
 			}
 			if !found {
 				fmt.Printf("  [skip] no fixture %s/%s.json (deterministic step is a no-op in test mode)\n", fixDir, step.Name)
@@ -231,7 +255,8 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 				sk, ok := skills.Get(step.Skill)
 				if !ok {
 					fmt.Fprintf(os.Stderr, "  [error] unknown skill %q\n", step.Skill)
-					return 1
+					run.rc = 1
+					return run
 				}
 				prompt = sk.Prompt
 				if len(sk.OutputSchema) > 0 {
@@ -249,23 +274,27 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 			fix, found, err := loadFixture(fixDir, step.Name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  [error] %v\n", err)
-				return 1
+				run.rc = 1
+				return run
 			}
 			if !found {
 				fmt.Fprintf(os.Stderr, "  [error] ai step %q has no fixture %s/%s.json — supply {\"text\": \"...\"}\n", step.Name, fixDir, step.Name)
-				return 1
+				run.rc = 1
+				return run
 			}
 			text, _ := fix["text"].(string)
 			if text == "" {
 				fmt.Fprintf(os.Stderr, "  [error] fixture %s/%s.json: missing or empty 'text' field\n", fixDir, step.Name)
-				return 1
+				run.rc = 1
+				return run
 			}
 
 			if len(schema) > 0 {
 				parsed, err := validateOutput(text, schema)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "  [error] output validation failed: %v\n", err)
-					return 1
+					run.rc = 1
+					return run
 				}
 				data["ai_output"] = parsed
 				fmt.Printf("  [output] %v\n", parsed)
@@ -279,7 +308,8 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 			fix, found, err := loadFixture(fixDir, step.Name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  [error] %v\n", err)
-				return 1
+				run.rc = 1
+				return run
 			}
 			if found {
 				action, _ := fix["action"].(string)
@@ -294,13 +324,15 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 			decision, _ := ch.SendForApproval(context.Background(), draftMsg, nil)
 			if decision.Action == "skip" {
 				fmt.Println("  [stop] operator skipped — pipeline ends")
-				return 0
+				run.stoppedAt = step.Name
+				return run
 			}
 			data["approved"] = decision.Action == "approve"
 
 		default:
 			fmt.Fprintf(os.Stderr, "  [error] unknown step type %q\n", step.Type)
-			return 1
+			run.rc = 1
+			return run
 		}
 	}
 
@@ -308,7 +340,7 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 	if b, err := json.MarshalIndent(data, "  ", "  "); err == nil {
 		fmt.Printf("  %s\n", string(b))
 	}
-	return 0
+	return run
 }
 
 func truncateOneLine(s string, n int) string {

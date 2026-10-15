@@ -8,6 +8,7 @@
 fixtures/<pipeline-name>/
   _input.json         (optional) seeded into the pipeline data map before any step
   <step-name>.json    one file per step that needs input
+  _expect.json        (optional) what the dry run must end with
 ```
 
 ## Per-step shape
@@ -30,4 +31,41 @@ Run:
 
 ```bash
 draftcat test test-screener
+```
+
+## Expectations: `_expect.json`
+
+With `_expect.json` in the fixture directory, `draftcat test` checks the end of
+the dry run and exits 1 when anything differs, so a prompt, skill or schema
+change that alters the outcome fails in CI:
+
+```json
+{
+  "outcome": "completed",
+  "data": {
+    "ai_output.score": 4,
+    "ai_output.reject": false,
+    "approved": true
+  },
+  "absent": ["error"],
+  "drafts_contain": ["Strong fit"],
+  "sent_contain": []
+}
+```
+
+| Key | Holds when |
+|---|---|
+| `outcome` | `completed` (the last step ran) or `skipped` (an operator skip ended the pipeline) |
+| `stopped_at` | a skip stopped the pipeline at this approval step |
+| `data` | each dotted path into the final data map holds this value, compared as JSON |
+| `absent` | none of these paths is set |
+| `drafts_contain` | each text appears in some approval draft |
+| `sent_contain` | each text appears in some operator message |
+
+Every key is optional. An unknown key is refused, so a typo never asserts
+nothing. Unmet expectations are listed one per line:
+
+```
+[expect] FAIL data.ai_output.score: 3, expected 4
+[test] FAILED: 1 expectation(s) not met (fixtures/test-screener/_expect.json)
 ```

@@ -103,13 +103,102 @@ Constraints, all of which must hold when several are given on one argument:
 | `glob`     | the value matches a `path.Match` pattern (`*`, `?`, `[...]`) |
 | `regex`    | the value matches a Go regular expression — write `^` and `$` to anchor it |
 | `min`/`max`| the value is a number inside the bound |
+| `max_per_day` | the value is a number of 0 or more, and today's total stays inside the cap (below) |
 | `optional` | *(modifier)* the argument may be absent |
+
+`review_above` is not a condition but a threshold: a value above it goes to a
+human even when the rule would allow the call silently (below).
 
 Values are compared in their string form: strings as-is, numbers without an
 exponent, booleans as `true`/`false`, anything structured as compact JSON.
 `draftcat validate` refuses a regex that does not compile, a malformed glob, a
-`min` above its `max`, and a constraint with no condition (almost always a
-typo'd key).
+`min` above its `max`, a `review_above` at or above `max`, a negative
+`max_per_day`, and a constraint with no condition (almost always a typo'd key).
+
+## Amount bands and daily totals
+
+Money-shaped arguments usually need three bands and a running total:
+
+```yaml
+tool_gate:
+  tools:
+    - name: create_invoice
+      on_mismatch: deny
+      args:
+        amount:
+          min: 0
+          review_above: 500     # up to 500: allowed; above: a human decides
+          max: 5000             # above 5000: refused (on_mismatch: deny)
+          max_per_day: 10000    # today's allowed total may not pass 10000
+```
+
+- **`review_above`** sends a call whose value is above it to a human, with
+  `rule: above the review threshold — amount: 800 is above review_above 500`
+  on the prompt. Calls at or below it keep the rule's own setting.
+- **`max_per_day`** keeps a running total of the argument across the tool's
+  allowed calls in the current UTC day. A call that would take the total past
+  the cap is handled like an argument mismatch: `on_mismatch: deny` refuses it
+  (`rule: max_per_day.amount`), `approve` asks a human. Every prompt for a
+  capped tool shows the total so far, for example
+  `today: amount: 1200 allowed today, max_per_day 10000`, and a human approval
+  counts toward the total like any other.
+
+A call counts from the moment it is allowed; a permit that is revoked or
+expires unconsumed stops counting. Totals live in the state store, so they hold
+across restarts, and capped decisions are made one at a time so two concurrent
+calls cannot both fit under a total that only one fits under. The argument
+values under a cap are stored next to the action; all other arguments remain
+hashed only. When the total cannot be read, the gate denies.
+
+Adding `review_above` or `max_per_day` changes that rule's policy hash, as any
+rule edit does; rules without them keep their hash.
+
+## Checking a policy offline
+
+`draftcat gate` decides calls against `tool_gate` with the same evaluation the
+endpoint uses, without starting the engine or touching the state store:
+
+```bash
+draftcat gate check create_invoice --args '{"customer": "acme", "amount": 800}'
+draftcat gate check create_invoice --args '{"amount": 300}' --spent amount=9800 --json
+```
+
+```
+ASK  create_invoice
+  reason: a human decides
+  why:    above the review threshold — amount: 800 is above review_above 500
+  today:  amount: 0 allowed today, max_per_day 10000
+```
+
+The decision is `allow`, `deny`, or `ask` (a human decides). `--spent` sets an
+argument's total already allowed today. The repeat guard and the operator
+channel are runtime state and are not part of the check.
+
+`draftcat gate test` runs a file of cases and exits 1 when a decision differs,
+so a policy change can be reviewed in CI like code:
+
+```yaml
+cases:
+  - name: small invoice passes
+    tool: create_invoice
+    args: {customer: acme, amount: 200}
+    expect: allow
+  - name: split invoices stop at the daily cap
+    tool: create_invoice
+    args: {amount: 300}
+    spent: {amount: "9800"}
+    expect: deny
+    rule: max_per_day.amount      # optional: also pin the deciding rule
+  - name: unknown tools are refused
+    tool: wire_money
+    expect: deny
+```
+
+```
+PASS  small invoice passes: ALLOW  create_invoice
+...
+3 case(s), 0 failed
+```
 
 ## Collecting a decision
 
@@ -207,6 +296,19 @@ One notice per agent, tool and reason inside `tool_gate.notify_window`
 them. A human's own Skip is not repeated back. `notify_denials: false` turns
 the notices off.
 
+With `notify_outcomes: failed` (or `all`), the operator also hears what an
+allowed action did once the harness reports its outcome through
+`POST /gate/tool-call/<id>/complete`:
+
+```
+[tool-gate] send_email FAILED (agent: harness-1)
+action: inv-2026-0412
+result sha256: sha256:4f1c...
+```
+
+One notice per recorded outcome; a retried report does not repeat it. The
+default is `off`.
+
 ## Audit
 
 Every decision writes a v2 `action_approvals` receipt with `pipeline = tool-gate`,
@@ -224,12 +326,14 @@ tool_gate:
   max_repeats: 0             # prompts allowed per identical call inside the window; 0 = no cap
   notify_denials: true       # operator notices for denials the gate made on its own
   notify_window: 10m         # dedup window for those notices
+  notify_outcomes: off       # off | failed | all: tell the operator what allowed actions did
   tools:
     - name: <tool>
       risk: low | normal | high      # default normal; high always needs a human
       require_approval: true|false   # ask a human on every (matching) call
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
       args:
-        <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …, optional: true}
+        <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,
+                     review_above: …, max_per_day: …, optional: true}
       on_mismatch: approve | deny    # default approve
 ```

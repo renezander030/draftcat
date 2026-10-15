@@ -15,6 +15,9 @@ type ToolOutcome struct {
 	Status      string
 	ResultHash  string
 	CompletedAt time.Time
+	// Fresh is set when this call recorded the outcome, as opposed to
+	// returning one reported earlier. Not stored.
+	Fresh bool
 }
 
 func toolActionTx(tx *sql.Tx, id string) (ToolAction, error) {
@@ -170,10 +173,11 @@ func (s *StateStore) CompleteToolAction(o ToolOutcome) (ToolOutcome, bool, error
 	if a.Status != "consumed" || a.BindingHash != o.BindingHash {
 		return ToolOutcome{}, false, nil
 	}
-	_, err = tx.ExecContext(context.Background(), `INSERT OR IGNORE INTO tool_execution_outcomes(action_id,binding_hash,status,result_hash,completed_at) VALUES(?,?,?,?,?)`, o.ActionID, o.BindingHash, o.Status, o.ResultHash, o.CompletedAt.Unix())
+	res, err := tx.ExecContext(context.Background(), `INSERT OR IGNORE INTO tool_execution_outcomes(action_id,binding_hash,status,result_hash,completed_at) VALUES(?,?,?,?,?)`, o.ActionID, o.BindingHash, o.Status, o.ResultHash, o.CompletedAt.Unix())
 	if err != nil {
 		return ToolOutcome{}, false, err
 	}
+	inserted, _ := res.RowsAffected()
 	var saved ToolOutcome
 	var at int64
 	err = tx.QueryRowContext(context.Background(), `SELECT action_id,binding_hash,status,result_hash,completed_at FROM tool_execution_outcomes WHERE action_id=?`, o.ActionID).Scan(&saved.ActionID, &saved.BindingHash, &saved.Status, &saved.ResultHash, &at)
@@ -181,6 +185,7 @@ func (s *StateStore) CompleteToolAction(o ToolOutcome) (ToolOutcome, bool, error
 		return ToolOutcome{}, false, err
 	}
 	saved.CompletedAt = time.Unix(at, 0)
+	saved.Fresh = inserted == 1
 	if err := tx.Commit(); err != nil {
 		return ToolOutcome{}, false, err
 	}

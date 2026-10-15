@@ -113,3 +113,39 @@ func TestToolGate_WindowsMustParse(t *testing.T) {
 		}
 	}
 }
+
+func TestToolGate_ReviewAndDailyCapConstraints(t *testing.T) {
+	v := func(f float64) *float64 { return &f }
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "create_invoice", OnMismatch: "deny",
+		Args: map[string]config.ArgConstraint{"amount": {Min: v(0), Max: v(5000), ReviewAbove: v(500), MaxPerDay: v(10000)}},
+	}}})
+	if len(errs) != 0 || len(warns) != 0 {
+		t.Fatalf("a well-formed band and cap produced findings: errors=%v warnings=%v", errs, warns)
+	}
+	errs, warns = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "refund", RequireApproval: true,
+		Args: map[string]config.ArgConstraint{
+			"amount": {Max: v(100), ReviewAbove: v(100)},
+			"fee":    {MaxPerDay: v(-1)},
+			"note":   {ReviewAbove: v(5)},
+		},
+	}}})
+	if !anyHas(errs, "args.amount.review_above") || !anyHas(errs, "args.fee.max_per_day") {
+		t.Fatalf("review_above at max and a negative cap must be errors: %v", errs)
+	}
+	if !anyHas(warns, "args.note.review_above") {
+		t.Fatalf("review_above on a tool that always asks should warn: %v", warns)
+	}
+}
+
+func TestToolGate_NotifyOutcomesValues(t *testing.T) {
+	for _, ok := range []string{"", "off", "failed", "all"} {
+		if errs, _ := gateFindings(t, config.ToolGateConfig{NotifyOutcomes: ok, Tools: []config.ToolRule{{Name: "t"}}}); anyHas(errs, "notify_outcomes") {
+			t.Fatalf("%q refused: %v", ok, errs)
+		}
+	}
+	if errs, _ := gateFindings(t, config.ToolGateConfig{NotifyOutcomes: "errors", Tools: []config.ToolRule{{Name: "t"}}}); !anyHas(errs, "tool_gate.notify_outcomes") {
+		t.Fatalf("unknown mode accepted: %v", errs)
+	}
+}

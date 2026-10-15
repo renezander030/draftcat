@@ -632,6 +632,11 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 			rep.errf("tool_gate."+f.key, "must be a duration like 10m, or 0 to disable (got %q)", f.val)
 		}
 	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ToolGate.NotifyOutcomes)) {
+	case "", "off", "failed", "all":
+	default:
+		rep.errf("tool_gate.notify_outcomes", "must be off, failed or all (got %q)", cfg.ToolGate.NotifyOutcomes)
+	}
 	if cfg.ToolGate.MaxRepeats < 0 {
 		rep.errf("tool_gate.max_repeats", "must be 0 (no cap) or a positive count (got %d)", cfg.ToolGate.MaxRepeats)
 	}
@@ -689,7 +694,7 @@ func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
 			rep.errf(ap, "argument name is required")
 		}
 		if c.Empty() {
-			rep.errf(ap, "no condition — use equals, one_of, glob, regex, min or max")
+			rep.errf(ap, "no condition — use equals, one_of, glob, regex, min, max, review_above or max_per_day")
 		}
 		if c.Regex != "" {
 			if _, err := regexp.Compile(c.Regex); err != nil {
@@ -703,6 +708,19 @@ func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
 		}
 		if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
 			rep.errf(ap, "min %v is greater than max %v", *c.Min, *c.Max)
+		}
+		if c.ReviewAbove != nil {
+			if t.RequireApproval {
+				rep.warnf(ap+".review_above", "tool %q already asks a human on every call, so review_above never changes a decision", t.Name)
+			}
+			if c.Max != nil && *c.ReviewAbove >= *c.Max {
+				rep.errf(ap+".review_above", "review_above %v must be below max %v, or no value is ever reviewed", *c.ReviewAbove, *c.Max)
+			}
+		}
+		if c.MaxPerDay != nil {
+			if *c.MaxPerDay < 0 {
+				rep.errf(ap+".max_per_day", "must not be negative (got %v)", *c.MaxPerDay)
+			}
 		}
 	}
 }

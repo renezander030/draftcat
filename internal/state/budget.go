@@ -34,17 +34,17 @@ func (s *StateStore) BudgetDay(ctx context.Context, at time.Time) (BudgetDay, er
 // BeginBudgetCall atomically admits one provider call across store handles.
 // A pending call survives a crash; no subsequent call can assume it was free.
 // Cost is a stop threshold on settled spend, not an estimated dollar ceiling.
-func (s *StateStore) BeginBudgetCall(ctx context.Context, id string, at time.Time, requested, tokenLimit int, costLimit float64) error {
+func (s *StateStore) BeginBudgetCall(ctx context.Context, id string, at time.Time, requested, tokenLimit int, costLimit float64, label UsageLabel) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("budget store unavailable")
 	}
 	if id == "" || requested < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) {
 		return fmt.Errorf("invalid budget admission")
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO budget_calls (call_id, day, status, created_at)
- SELECT ?, ?, 'pending', ? WHERE NOT EXISTS (SELECT 1 FROM budget_calls WHERE status='pending')
+	result, err := s.db.ExecContext(ctx, `INSERT INTO budget_calls (call_id, day, status, created_at, model, pipeline)
+ SELECT ?, ?, 'pending', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM budget_calls WHERE status='pending')
  AND (? <= 0 OR COALESCE((SELECT tokens FROM budget_days WHERE day=?),0) <= ? - ?)
- AND (? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) < ?)`, id, budgetDate(at), at.Unix(), tokenLimit, budgetDate(at), tokenLimit, requested, costLimit, budgetDate(at), costLimit)
+ AND (? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) < ?)`, id, budgetDate(at), at.Unix(), label.Model, label.Pipeline, tokenLimit, budgetDate(at), tokenLimit, requested, costLimit, budgetDate(at), costLimit)
 	if err != nil {
 		return err
 	}

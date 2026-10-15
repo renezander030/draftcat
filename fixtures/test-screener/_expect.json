@@ -1,0 +1,9 @@
+{
+  "outcome": "completed",
+  "data": {
+    "ai_output.score": 4,
+    "ai_output.reject": false,
+    "approved": true
+  },
+  "drafts_contain": ["Strong fit"]
+}

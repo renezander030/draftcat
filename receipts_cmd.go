@@ -44,15 +44,21 @@ func receiptID(r statestore.ApprovalRecord) string {
 	return strconv.FormatInt(r.ID, 10)
 }
 
+// receiptVerdict is a receipt's verification status: ok, tampered or
+// unsigned, and unverified when it is signed but no secret is at hand.
+func receiptVerdict(secret []byte, r statestore.ApprovalRecord) string {
+	if r.Signature != "" && len(secret) == 0 {
+		return "unverified"
+	}
+	return statestore.VerifyApprovalRecord(secret, r)
+}
+
 func receiptView(r statestore.ApprovalRecord, secret []byte) receiptJSON {
 	expires := ""
 	if !r.ExpiresAt.IsZero() {
 		expires = r.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	verification := statestore.VerifyApprovalRecord(secret, r)
-	if r.Signature != "" && len(secret) == 0 {
-		verification = "unverified"
-	}
+	verification := receiptVerdict(secret, r)
 	return receiptJSON{
 		Version: r.Version, ReceiptID: receiptID(r), RunID: r.RunID, ActionID: r.ActionID,
 		Pipeline: r.Pipeline, Step: r.Step, DecidedAt: r.DecidedAt.UTC().Format(time.RFC3339),

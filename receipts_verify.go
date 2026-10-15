@@ -58,11 +58,7 @@ func verifyReceiptStream(src io.Reader, secret []byte) ([]receiptCheck, error) {
 		if err != nil {
 			return checks, fmt.Errorf("line %d: %w", line, err)
 		}
-		verdict := statestore.VerifyApprovalRecord(secret, record)
-		if v.Signature != "" && len(secret) == 0 {
-			verdict = "unverified"
-		}
-		checks = append(checks, receiptCheck{Line: line, ReceiptID: v.ReceiptID, Verification: verdict})
+		checks = append(checks, receiptCheck{Line: line, ReceiptID: v.ReceiptID, Verification: receiptVerdict(secret, record)})
 	}
 	if err := scanner.Err(); err != nil {
 		return checks, err
