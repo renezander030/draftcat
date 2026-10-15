@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.12.0
+
+- Bound money-shaped tool arguments in three bands and a daily total: `review_above` sends a value above it to a human, `max` refuses or escalates above the ceiling, and `max_per_day` keeps a running total per tool argument per UTC day that a call may not pass. Prompts for capped tools show the total so far.
+- Decide tool calls offline with `draftcat gate check <tool> --args JSON`, and run a policy test suite in CI with `draftcat gate test cases.yaml`, which exits 1 when a decision differs from its expectation. Both use the same evaluation as the running gate.
+- Confirm credentials before going live with `draftcat doctor --online`: Telegram `getMe` and `getChat`, the provider key, and relay reachability, through read-only calls that send nothing and spend no tokens.
+- Make `draftcat test` a regression check: `fixtures/<pipeline>/_expect.json` asserts the outcome, values in the final data, and text in approval drafts and operator messages, and the run exits 1 when one is not met.
+- Summarize human oversight with `draftcat report`: decisions per pipeline and step, decisions by person and by policy, per-operator counts, skip reasons, reported tool executions and receipt signature status over a period, with a digest that matches the receipts of the same window.
+- Tell the operator what allowed tool actions did with `tool_gate.notify_outcomes: failed|all`, once per reported outcome.
+- Split `draftcat budget status` by provider model and by pipeline (`by_model`, `by_pipeline` in `--json`).
+- Name the step a failed run stopped in and the steps that did not run in the operator's error notice.
+
+See [amount bands and daily totals](docs/tool-gate.md#amount-bands-and-daily-totals), [checking a policy offline](docs/tool-gate.md#checking-a-policy-offline), [running Draftcat unattended](docs/operations.md) and [fixture expectations](fixtures/README.md#expectations-_expectjson).
+
+### Upgrade notes
+
+All new settings are optional, and configurations without them decide exactly as before; rules without `review_above` or `max_per_day` keep their policy hashes. The state store gains a `tool_action_amounts` table and `model` and `pipeline` columns on `budget_calls` at first start. `doctor` without `--online` makes no network calls.
+
 ## 0.11.0
 
 - Record why an action was skipped: **Skip with reason...** on Telegram prompts and an optional `reason` on hitl/v0 `skip` decisions. The skip receipt names the operator; the reason is a separately signed note bound to the receipt, shown by `draftcat runs` and `draftcat receipts show` with its own verification.

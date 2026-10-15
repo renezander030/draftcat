@@ -67,7 +67,7 @@ func TestDoctorReadyConfig(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.db")
 	cfgPath := writeDoctorConfig(t, statePath)
 	now := time.Date(2026, 10, 9, 9, 0, 0, 0, time.UTC) // Friday
-	rep := doctor(cfgPath, t.TempDir(), now)
+	rep := doctor(cfgPath, t.TempDir(), now, false)
 	if !rep.OK {
 		t.Fatalf("ready config reported failures: %+v", rep.Checks)
 	}
@@ -90,7 +90,7 @@ func TestDoctorReportsMissingCredentials(t *testing.T) {
 	t.Setenv("DRAFTCAT_APPROVAL_SECRET", "")
 	t.Setenv("DRAFTCAT_STATE_PATH", "")
 	cfgPath := writeDoctorConfig(t, filepath.Join(t.TempDir(), "state.db"))
-	rep := doctor(cfgPath, t.TempDir(), time.Now())
+	rep := doctor(cfgPath, t.TempDir(), time.Now(), false)
 	if rep.OK {
 		t.Fatal("missing credentials reported OK")
 	}
@@ -122,7 +122,7 @@ func TestDoctorInspectsExistingStoreReadOnly(t *testing.T) {
 	}
 	st.Close()
 	before, _ := os.Stat(statePath)
-	rep := doctor(writeDoctorConfig(t, statePath), t.TempDir(), time.Now())
+	rep := doctor(writeDoctorConfig(t, statePath), t.TempDir(), time.Now(), false)
 	if c := checkByName(rep, "state store"); c.Status != "ok" || !strings.Contains(c.Detail, "120 tokens") {
 		t.Errorf("state store: %+v", c)
 	}

@@ -359,14 +359,19 @@ Skills are YAML prompt templates in `skills/` with an `output_schema` the engine
 draftcat                       # run the engine (validates config first; refuses to start on errors)
 draftcat validate [--strict]   # lint config + skills
 draftcat doctor [--json]       # read-only preflight: credentials, operators, state, ports, schedules
+draftcat doctor --online       # also confirm Telegram, the provider and the relay accept the credentials
 kill -HUP <pid>                # reload pipelines, budgets, policies and skills without a restart (or /reload)
-draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/ (never touches real APIs)
+draftcat test <pipeline>       # dry-run against fixtures/<pipeline>/; _expect.json makes it a regression check
 draftcat runs [pipeline]       # recent runs + the approval decisions in each (--json to archive)
 draftcat pending               # approval gates waiting on a human right now (--json)
+draftcat budget status         # today's spend, split by model and by pipeline (--json)
 draftcat receipts list         # approval receipts and verification status (--json)
 draftcat receipts show <id>    # one versioned receipt
 draftcat receipts export       # JSONL to stdout (--out path writes mode 0600)
 draftcat audit-verify          # verify signed approval receipts
+draftcat report [--since 30d]  # oversight summary: who approved, skipped or let time out, per pipeline and step
+draftcat gate check <tool>     # what tool_gate decides for one call, without the engine (--args JSON)
+draftcat gate test cases.yaml  # a policy test suite for CI: exit 1 when a decision differs
 draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
 

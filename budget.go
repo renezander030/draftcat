@@ -245,7 +245,7 @@ func (b *BudgetTracker) acquire(ctx context.Context) error {
 }
 func (b *BudgetTracker) release() { <-b.root().gate }
 
-func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested int) (string, error) {
+func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested int, model string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -265,7 +265,8 @@ func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested
 	}
 	id := newRunID(time.Now())
 	if r.store != nil {
-		if err := r.store.BeginBudgetCall(ctx, id, time.Now(), requested, cfg.Budgets.PerDayTokens, r.dayCostLimit); err != nil {
+		label := statestore.UsageLabel{Model: model, Pipeline: pipelineFromContext(ctx)}
+		if err := r.store.BeginBudgetCall(ctx, id, time.Now(), requested, cfg.Budgets.PerDayTokens, r.dayCostLimit, label); err != nil {
 			return "", err
 		}
 	}

@@ -597,7 +597,7 @@ func (t *TGBot) apiCall(method string, payload map[string]interface{}) (json.Raw
 	}
 	body, _ := json.Marshal(payload)
 	resp, err := tgClient.Post(
-		fmt.Sprintf("https://api.telegram.org/bot%s/%s", t.token, method),
+		fmt.Sprintf("%s/bot%s/%s", telegramAPIBase, t.token, method),
 		"application/json",
 		bytes.NewReader(body),
 	)
@@ -974,7 +974,7 @@ func (t *TGBot) getUpdates() ([]TGUpdate, error) {
 	}
 	body, _ := json.Marshal(reqBody)
 	resp, err := tgClient.Post(
-		fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", t.token),
+		fmt.Sprintf("%s/bot%s/getUpdates", telegramAPIBase, t.token),
 		"application/json",
 		bytes.NewReader(body),
 	)
@@ -1023,6 +1023,7 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 	pipeSpan := obs.Pipeline(pipeline.Name)
 	var (
 		stepsCompleted int
+		lastIndex      int
 		lastStep       string
 		lastKind       string
 		lastStepStart  time.Time
@@ -1047,6 +1048,9 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 			}
 			obs.EmitStep(pipeline.Name, lastStep, lastKind, lastStepStart, stStatus, stFields)
 			fields["halted_at"] = lastStep
+			if err != nil {
+				err = haltedRun(err, pipeline.Steps, lastIndex)
+			}
 		}
 		pipeSpan.End(status, fields)
 	}()
@@ -1076,8 +1080,8 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 		data[k] = v
 	}
 
-	for _, step := range pipeline.Steps {
-		lastStep = step.Name
+	for stepIndex, step := range pipeline.Steps {
+		lastStep, lastIndex = step.Name, stepIndex
 		lastKind = step.Type
 		lastStepStart = time.Now()
 		stepFields := map[string]interface{}{}
@@ -2259,7 +2263,7 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 		err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil)
 		if err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
-			bot.Send(fmt.Sprintf("[run] ERROR in %s: %s", name, err))
+			_ = bot.Send(fmt.Sprintf("[run] ERROR in %s: %s%s", name, err, haltNote(err)))
 		}
 		finishRun(sched, bot, name, err)
 	}()
@@ -2435,22 +2439,28 @@ func main() {
 			os.Exit(runReceiptsCmd(os.Args[2:]))
 		case "hitl":
 			os.Exit(runHitlCmd(os.Args[2:]))
+		case "gate":
+			os.Exit(runGateCmd(os.Args[2:]))
+		case "report":
+			os.Exit(runReportCmd(os.Args[2:]))
 		case "-h", "--help", "help":
 			fmt.Println("Draftcat — AI communication management for service businesses.")
 			fmt.Println()
 			fmt.Println("Usage:")
 			fmt.Println("  draftcat [config.yaml] [skills/]       run the engine (default)")
 			fmt.Println("  draftcat validate [--strict]           lint config + skills, exit non-zero on errors")
-			fmt.Println("  draftcat doctor [--json]               read-only preflight: credentials, operators, state, ports, schedules")
+			fmt.Println("  draftcat doctor [--online] [--json]    read-only preflight: credentials, operators, state, ports, schedules")
 			fmt.Println("  draftcat test <pipeline>               dry-run a pipeline using fixtures/<pipeline>/")
 			fmt.Println("  draftcat runs [pipeline] [--json]      recent runs + the approval decisions in each")
 			fmt.Println("  draftcat budget <status|reconcile>      inspect spend or reconcile uncertain provider usage")
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
+			fmt.Println("  draftcat report [--since 30d] [--json]  who approved, skipped or let time out, per pipeline and step")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat zk-receipt <command>          prove an approval without revealing its private fields")
 			fmt.Println("  draftcat fhe-vote <command>             count encrypted approval votes without reading them")
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
+			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
 			return
 		}
 	}
@@ -2950,7 +2960,7 @@ Conversation so far:
 					err := runPipeline(runCfg, p, budget, gateChannel(bot), runSkills, nil)
 					if err != nil {
 						log.Printf("[scheduler] pipeline %s error: %v", p.Name, err)
-						_ = bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s", p.Name, err))
+						_ = bot.Send(fmt.Sprintf("[draftcat] ERROR in %s: %s%s", p.Name, err, haltNote(err)))
 					}
 					finishRun(sched, bot, p.Name, err)
 				}(p)
@@ -3314,7 +3324,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			if err := runPipeline(runCfg, p, budget, gateChannel(bot), runSkills, seed); err != nil {
 				runErr = err
 				log.Printf("[webhook] pipeline %s error: %v", p.Name, err)
-				bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s", p.Name, err))
+				_ = bot.Send(fmt.Sprintf("[draftcat] ERROR in %s (webhook): %s%s", p.Name, err, haltNote(err)))
 				if state != nil {
 					_ = state.FinishWebhookAdmission(admissionID, "error", redact.String(err.Error()), time.Now())
 				}

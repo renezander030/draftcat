@@ -163,6 +163,14 @@ CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
     result_hash  TEXT NOT NULL DEFAULT '',
     completed_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tool_action_amounts (
+    action_id    TEXT NOT NULL REFERENCES tool_actions(action_id),
+    arg          TEXT NOT NULL,              -- argument carrying max_per_day
+    amount       TEXT NOT NULL,              -- exact decimal as the call sent it
+    day          TEXT NOT NULL,              -- UTC date the call was made
+    PRIMARY KEY (action_id, arg)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_amounts_day ON tool_action_amounts(day, arg);
 CREATE TABLE IF NOT EXISTS budget_days (
     day          TEXT PRIMARY KEY,
     tokens       INTEGER NOT NULL DEFAULT 0,
@@ -217,6 +225,8 @@ CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(s
 		`ALTER TABLE action_approvals ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE action_approvals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'decided'`,
 		`ALTER TABLE webhook_admissions ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE budget_calls ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE budget_calls ADD COLUMN pipeline TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := tx.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
@@ -532,53 +542,24 @@ func scanApproval(scan func(...interface{}) error) (ApprovalRecord, error) {
 // ApprovalsForRun returns every approval decision recorded against one run, in
 // decision order. This is the join the audit trail previously could not make.
 func (s *StateStore) ApprovalsForRun(runID string) ([]ApprovalRecord, error) {
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT `+approvalColumns+`
-		 FROM action_approvals WHERE run_id=? ORDER BY decided_at ASC, id ASC`,
-		runID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []ApprovalRecord
-	for rows.Next() {
-		r, err := scanApproval(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return s.queryApprovals(`WHERE run_id=? ORDER BY decided_at ASC, id ASC`, runID)
 }
 
 // ApprovalsForPipeline returns the last n approval rows for a pipeline,
 // newest-first.
 func (s *StateStore) ApprovalsForPipeline(pipeline string, n int) ([]ApprovalRecord, error) {
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT `+approvalColumns+`
-		 FROM action_approvals WHERE pipeline=? ORDER BY decided_at DESC, id DESC LIMIT ?`,
-		pipeline, n,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []ApprovalRecord
-	for rows.Next() {
-		r, err := scanApproval(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return s.queryApprovals(`WHERE pipeline=? ORDER BY decided_at DESC, id DESC LIMIT ?`, pipeline, n)
 }
 
 // AllApprovals returns the newest receipt rows across every pipeline.
 func (s *StateStore) AllApprovals(n int) ([]ApprovalRecord, error) {
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT `+approvalColumns+` FROM action_approvals ORDER BY decided_at DESC, id DESC LIMIT ?`, n)
+	return s.queryApprovals(`ORDER BY decided_at DESC, id DESC LIMIT ?`, n)
+}
+
+// queryApprovals reads receipt rows; tail is the WHERE/ORDER/LIMIT clause.
+func (s *StateStore) queryApprovals(tail string, args ...interface{}) ([]ApprovalRecord, error) {
+	// #nosec G202 -- tail is a constant clause at every call site; values are bound parameters.
+	rows, err := s.db.QueryContext(context.Background(), `SELECT `+approvalColumns+` FROM action_approvals `+tail, args...)
 	if err != nil {
 		return nil, err
 	}

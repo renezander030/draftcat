@@ -18,7 +18,7 @@ func TestBudgetDurableUsageAndUTCFullDates(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := time.Date(2026, 9, 30, 23, 59, 0, 0, time.UTC)
-	if err := st.BeginBudgetCall(ctx, "paid", at, 10, 100, .5); err != nil {
+	if err := st.BeginBudgetCall(ctx, "paid", at, 10, 100, .5, UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SettleBudgetCall(ctx, "paid", 20, .6); err != nil {
@@ -37,11 +37,11 @@ func TestBudgetDurableUsageAndUTCFullDates(t *testing.T) {
 	if err != nil || day.Tokens != 20 || day.Cost != .6 || day.Unsettled != 0 {
 		t.Fatalf("durable usage=%+v err=%v", day, err)
 	}
-	if err := st.BeginBudgetCall(ctx, "same-day", at, 1, 100, .5); err == nil {
+	if err := st.BeginBudgetCall(ctx, "same-day", at, 1, 100, .5, UsageLabel{}); err == nil {
 		t.Fatal("restart reopened settled cost cap")
 	}
 	next := at.Add(2 * time.Minute)
-	if err := st.BeginBudgetCall(ctx, "next-day", next, 1, 100, .5); err != nil {
+	if err := st.BeginBudgetCall(ctx, "next-day", next, 1, 100, .5, UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.SettleBudgetCall(ctx, "next-day", 2, .1); err != nil {
@@ -68,7 +68,7 @@ func TestBudgetPendingCallSurvivesRestartAndBlocksUntilReconciled(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.BeginBudgetCall(ctx, "unknown", at, 1, 0, 0); err != nil {
+	if err := st.BeginBudgetCall(ctx, "unknown", at, 1, 0, 0, UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	_ = st.Close()
@@ -77,13 +77,13 @@ func TestBudgetPendingCallSurvivesRestartAndBlocksUntilReconciled(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.BeginBudgetCall(ctx, "next", at.AddDate(0, 0, 1), 1, 0, 0); err == nil {
+	if err := st.BeginBudgetCall(ctx, "next", at.AddDate(0, 0, 1), 1, 0, 0, UsageLabel{}); err == nil {
 		t.Fatal("pending usage was forgotten on restart/new day")
 	}
 	if err := st.SettleBudgetCall(ctx, "unknown", 12, .2); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.BeginBudgetCall(ctx, "next", at, 1, 100, .5); err != nil {
+	if err := st.BeginBudgetCall(ctx, "next", at, 1, 100, .5, UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -107,7 +107,7 @@ func TestBudgetAdmissionIsAtomicAcrossStoreHandles(t *testing.T) {
 		wg.Add(1)
 		go func(id string, st *StateStore) {
 			defer wg.Done()
-			if st.BeginBudgetCall(ctx, id, time.Now(), 1, 100, 1) == nil {
+			if st.BeginBudgetCall(ctx, id, time.Now(), 1, 100, 1, UsageLabel{}) == nil {
 				admitted.Add(1)
 			}
 		}(id, st)
@@ -122,7 +122,7 @@ func TestBudgetRejectsInvalidAndOverflowUsageWithoutReleasingPending(t *testing.
 	st := newTempStore(t)
 	ctx := context.Background()
 	at := time.Now()
-	if err := st.BeginBudgetCall(ctx, "pending", at, 1, 0, 0); err != nil {
+	if err := st.BeginBudgetCall(ctx, "pending", at, 1, 0, 0, UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, cost := range []float64{-1, math.NaN(), math.Inf(1)} {

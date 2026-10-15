@@ -44,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -188,6 +189,7 @@ type toolGate struct {
 	now func() time.Time
 
 	mu       sync.Mutex
+	capMu    sync.Mutex // serializes decisions on tools with max_per_day
 	tickets  map[string]*toolTicket
 	recent   map[string]*repeatEntry
 	notified map[string]time.Time
@@ -309,58 +311,58 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default deny. An unlisted tool is refused whatever else is true.
-	if !listed {
-		log.Printf("[tool-gate] DENY %s (not in the allowlist) agent=%q", req.Tool, req.Agent)
+	// Arguments under max_per_day count toward a running total, and capped
+	// decisions are made one at a time, so two calls cannot both fit under a
+	// total only one of them fits under. The lock is never held while a human
+	// decides.
+	unlockCaps := func() {}
+	if listed && len(rule.DailyCaps()) > 0 {
+		g.capMu.Lock()
+		unlockCaps = sync.OnceFunc(g.capMu.Unlock)
+		defer unlockCaps()
+	}
+	verdict, err := g.decidePolicy(req, rule, listed)
+	if err != nil {
+		log.Printf("[tool-gate] DENY %s (%v) agent=%q", req.Tool, err, req.Agent)
+		verdict = toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: "max_per_day",
+			Reason: "the daily total could not be read — the gate denies rather than guesses"}
+	}
 
-		reason := fmt.Sprintf("tool %q is not in tool_gate.tools — the gate denies by default", req.Tool)
-		g.notifyDenial(req, argsHash, "unlisted", reason)
+	switch verdict.Decision {
+	case "deny":
+		switch verdict.Class {
+		case "unlisted":
+			log.Printf("[tool-gate] DENY %s (not in the allowlist) agent=%q", req.Tool, req.Agent)
+		case "mismatch":
+			log.Printf("[tool-gate] DENY %s (args mismatch: %s) agent=%q", req.Tool, strings.TrimPrefix(verdict.Rule, "args."), req.Agent)
+		case "cap":
+			log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, verdict.Reason, req.Agent)
+		}
+		if verdict.Class != "" {
+			g.notifyDenial(req, argsHash, verdict.Class, verdict.Reason)
+		}
 		resp := g.finishAction(req, expires, ToolCallResponse{
-			Decision: "deny", Reason: reason,
-			ArgsHash: argsHash, DecidedBy: "allowlist", Rule: "not listed",
+			Decision: "deny", Reason: verdict.Reason,
+			ArgsHash: argsHash, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
 			PolicyHash: policyHash, BindingHash: bindingHash,
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
-	}
-
-	// Argument constraints. A mismatch can only tighten: it either escalates
-	// to a human or refuses. It never lets a call through that the rule's
-	// base setting would have sent to a human.
-	needHuman := rule.RequireApproval
-	mismatch := ""
-	if ok, why := rule.MatchArgs(req.Args); !ok {
-		mismatch = why
-		if rule.DeniesOnMismatch() {
-			reason := "arguments outside the rule — " + why
-			log.Printf("[tool-gate] DENY %s (args mismatch: %s) agent=%q", req.Tool, why, req.Agent)
-
-			g.notifyDenial(req, argsHash, "mismatch", reason)
-			resp := g.finishAction(req, expires, ToolCallResponse{
-				Decision: "deny", Reason: reason,
-				ArgsHash: argsHash, DecidedBy: "policy", Rule: "args." + why,
-				PolicyHash: policyHash, BindingHash: bindingHash,
-			})
-			writeToolDecision(w, http.StatusOK, resp)
-			return
-		}
-		needHuman = true
-	}
-
-	// A listed tool that does not require approval is allowed on the
-	// strength of being listed: that IS an operator decision, made in
-	// config and reviewable, and it is recorded as one.
-	if !needHuman {
+	case "allow":
+		// A listed tool that does not require approval is allowed on the
+		// strength of being listed: that IS an operator decision, made in
+		// config and reviewable, and it is recorded as one.
 		log.Printf("[tool-gate] ALLOW %s (allowlisted, risk=%s) agent=%q", req.Tool, rule.RiskOf(), req.Agent)
 
 		resp := g.finishAction(req, expires, ToolCallResponse{
-			Decision: "allow", Reason: "allowlisted in tool_gate",
-			ArgsHash: argsHash, DecidedBy: "allowlist", Rule: "listed",
+			Decision: "allow", Reason: verdict.Reason,
+			ArgsHash: argsHash, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
 			PolicyHash: policyHash, BindingHash: bindingHash,
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
 	}
+	unlockCaps()
 
 	// Needs a human.
 	if g.ch == nil {
@@ -373,11 +375,11 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The repeat guard: what does the gate already know about this exact call?
-	tk, verdict, ok := g.repeatCheck(req, rule, argsHash)
+	tk, remembered, ok := g.repeatCheck(req, rule, argsHash)
 	if ok {
 		// A remembered decision — no prompt.
-		verdict.PolicyHash, verdict.BindingHash = policyHash, bindingHash
-		writeToolDecision(w, http.StatusOK, g.finishAction(req, expires, verdict))
+		remembered.PolicyHash, remembered.BindingHash = policyHash, bindingHash
+		writeToolDecision(w, http.StatusOK, g.finishAction(req, expires, remembered))
 		return
 	}
 	if tk != nil && tk.ID != req.ActionID {
@@ -409,7 +411,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		if async || wait > 0 {
 			parent = context.Background()
 		}
-		go g.askHuman(parent, tk, req, rule, mismatch)
+		go g.askHuman(parent, tk, req, rule, verdict)
 	}
 
 	if async {
@@ -680,15 +682,18 @@ func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule, argsHa
 // askHuman runs one human-path decision to its end and resolves the ticket.
 // The gate is written to pending_approvals before the prompt leaves, so a
 // process that dies mid-wait is reconciled at next boot like a pipeline gate.
-func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCallRequest, rule config.ToolRule, mismatch string) {
+func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCallRequest, rule config.ToolRule, verdict toolPolicyVerdict) {
 	pendingID, err := state.BeginApproval("tool-gate", req.Tool, tk.ArgsHash, 1, tk.Created, tk.Expires)
 	if err != nil {
 		g.updateTicket(tk.ID, unavailableToolResponse(tk.ID))
 		return
 	}
 	draft := fmt.Sprintf("[draftcat] Tool call awaiting approval\n\nagent: %s\ntool:  %s\nrisk:  %s\nargs:  %s", orDash(req.Agent), req.Tool, rule.RiskOf(), prettyArgs(req.Args))
-	if mismatch != "" {
-		draft += "\nrule:  arguments outside the rule — " + mismatch
+	if verdict.Why != "" {
+		draft += "\nrule:  " + verdict.Why
+	}
+	for _, line := range verdict.Totals {
+		draft += "\ntoday: " + line
 	}
 	draft += "\n\nargs sha256: " + tk.ArgsHash
 	timeout := tk.Expires.Sub(g.now())
@@ -721,6 +726,22 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 		resp.Decision, resp.Reason = "allow", "operator approved"
 	}
 	g.finishAction(req, tk.Expires, resp)
+}
+
+// decidePolicy records the call's capped amounts, then evaluates the rules
+// against today's totals in the state store.
+func (g *toolGate) decidePolicy(req ToolCallRequest, rule config.ToolRule, listed bool) (toolPolicyVerdict, error) {
+	day := g.now().UTC().Format("2006-01-02")
+	if listed {
+		if amounts := rule.CappedAmounts(req.Args); len(amounts) > 0 {
+			if err := state.RecordToolActionAmounts(req.ActionID, day, amounts); err != nil {
+				return toolPolicyVerdict{}, err
+			}
+		}
+	}
+	return evaluateToolPolicy(g.cfg.ToolGate, req.Tool, req.Args, func(tool, arg string) (*big.Rat, error) {
+		return state.ToolArgTotal(tool, arg, day)
+	})
 }
 
 // notifyDenial tells the operator about a refusal the gate made on its own.

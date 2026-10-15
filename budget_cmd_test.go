@@ -17,7 +17,7 @@ func TestBudgetCommandRecoveryChargesOriginalDayOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	day := time.Date(2026, 9, 30, 23, 59, 0, 0, time.UTC)
-	if err := st.BeginBudgetCall(context.Background(), "call-uncertain", day, 100, 1000, 1); err != nil {
+	if err := st.BeginBudgetCall(context.Background(), "call-uncertain", day, 100, 1000, 1, statestore.UsageLabel{}); err != nil {
 		t.Fatal(err)
 	}
 	_ = st.Close()

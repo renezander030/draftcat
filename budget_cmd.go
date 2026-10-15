@@ -120,6 +120,16 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 		fmt.Fprintf(os.Stderr, "budget: read pending calls: %v\n", err)
 		return 1
 	}
+	byModel, err := st.BudgetUsageBy(ctx, now, "model")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "budget: read usage by model: %v\n", err)
+		return 1
+	}
+	byPipeline, err := st.BudgetUsageBy(ctx, now, "pipeline")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "budget: read usage by pipeline: %v\n", err)
+		return 1
+	}
 	if jsonOut {
 		report := struct {
 			Day         string                         `json:"day"`
@@ -128,7 +138,9 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 			Calls       int                            `json:"calls"`
 			CallMinutes int                            `json:"call_minutes"`
 			Pending     []statestore.PendingBudgetCall `json:"pending_calls"`
-		}{now.Format("2006-01-02"), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending}
+			ByModel     []statestore.UsageShare        `json:"by_model"`
+			ByPipeline  []statestore.UsageShare        `json:"by_pipeline"`
+		}{now.Format("2006-01-02"), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending, nonNilShares(byModel), nonNilShares(byPipeline)}
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
 			fmt.Fprintf(os.Stderr, "budget: output: %v\n", err)
 			return 1
@@ -136,6 +148,8 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 		return 0
 	}
 	fmt.Printf("%s UTC: %d tokens, %.6f cost, %d voice calls, %d call minutes\n", now.Format("2006-01-02"), day.Tokens, day.Cost, day.Calls, day.CallMinutes)
+	printUsageShares("model", byModel)
+	printUsageShares("pipeline", byPipeline)
 	for _, call := range pending {
 		fmt.Printf("Unsettled provider call %s (day %s, started %s)\n", call.CallID, call.Day, call.CreatedAt.Format(time.RFC3339))
 	}
@@ -143,4 +157,27 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 		fmt.Println("Stop the engine, confirm provider usage, then use budget reconcile before resuming.")
 	}
 	return 0
+}
+
+func nonNilShares(s []statestore.UsageShare) []statestore.UsageShare {
+	if s == nil {
+		return []statestore.UsageShare{}
+	}
+	return s
+}
+
+// printUsageShares lists today's settled model calls split by model or
+// pipeline. Calls settled before attribution was recorded show as unattributed.
+func printUsageShares(by string, shares []statestore.UsageShare) {
+	if len(shares) == 0 {
+		return
+	}
+	fmt.Printf("By %s:\n", by)
+	for _, u := range shares {
+		name := u.Name
+		if name == "" {
+			name = "(unattributed)"
+		}
+		fmt.Printf("  %-40s %4d call(s) %9d tokens %12.6f cost\n", name, u.Calls, u.Tokens, u.Cost)
+	}
 }

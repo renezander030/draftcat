@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -194,7 +196,7 @@ func (g *toolGate) handleComplete(w http.ResponseWriter, r *http.Request, id str
 		writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
 		return
 	}
-	_, accepted, err := state.CompleteToolAction(statestore.ToolOutcome{ActionID: id, BindingHash: body.BindingHash, Status: body.Status, ResultHash: body.ResultHash, CompletedAt: g.now()})
+	outcome, accepted, err := state.CompleteToolAction(statestore.ToolOutcome{ActionID: id, BindingHash: body.BindingHash, Status: body.Status, ResultHash: body.ResultHash, CompletedAt: g.now()})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeToolDecision(w, http.StatusNotFound, unknownToolResponse(id))
@@ -208,4 +210,31 @@ func (g *toolGate) handleComplete(w http.ResponseWriter, r *http.Request, id str
 		code = http.StatusConflict
 	}
 	writeToolDecision(w, code, resp)
+	if outcome.Fresh {
+		g.notifyOutcome(id, outcome)
+	}
+}
+
+// notifyOutcome tells the operator channel what an allowed action did, per
+// tool_gate.notify_outcomes: off (default), failed, or all. Sent once, when
+// the outcome is first recorded.
+func (g *toolGate) notifyOutcome(id string, o statestore.ToolOutcome) {
+	mode := g.cfg.ToolGate.NotifyOutcomesMode()
+	if g.ch == nil || mode == "off" || (mode == "failed" && o.Status != "failed") {
+		return
+	}
+	a, err := state.ToolAction(id)
+	if err != nil {
+		return
+	}
+	msg := fmt.Sprintf("[tool-gate] %s %s (agent: %s)\naction: %s", a.Tool, strings.ToUpper(o.Status), orDash(a.Agent), id)
+	if a.RunID != "" {
+		msg += "\nrun: " + a.RunID
+	}
+	if o.ResultHash != "" {
+		msg += "\nresult sha256: " + o.ResultHash
+	}
+	if err := g.ch.Send(msg); err != nil {
+		log.Printf("[tool-gate] outcome notice failed: %v", err)
+	}
 }

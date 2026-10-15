@@ -576,6 +576,19 @@ type ToolGateConfig struct {
 	// MaxRepeats caps how many times the identical call may reach the human
 	// inside repeat_window before the gate stops asking and denies. 0 = no cap.
 	MaxRepeats int `yaml:"max_repeats"`
+	// NotifyOutcomes tells the operator channel when a harness reports what
+	// an allowed action did: "off" (default), "failed", or "all".
+	NotifyOutcomes string `yaml:"notify_outcomes"`
+}
+
+// NotifyOutcomesMode normalizes notify_outcomes; empty or unknown is off.
+func (g ToolGateConfig) NotifyOutcomesMode() string {
+	switch m := strings.ToLower(strings.TrimSpace(g.NotifyOutcomes)); m {
+	case "failed", "all":
+		return m
+	default:
+		return "off"
+	}
 }
 
 // NotifyDenialsOn resolves the tri-state; omitted means on.
@@ -649,12 +662,27 @@ type ArgConstraint struct {
 	Max      *float64    `yaml:"max"`
 	Min      *float64    `yaml:"min"`
 	Optional bool        `yaml:"optional"`
+	// ReviewAbove sends a call whose value is above it to a human, even when
+	// the rule would otherwise allow it silently. Together with max it makes
+	// three bands: allowed up to review_above, asked up to max, refused or
+	// asked (on_mismatch) above max.
+	ReviewAbove *float64 `yaml:"review_above" json:",omitempty"`
+	// MaxPerDay caps the running total of this argument across the tool's
+	// allowed calls in one UTC day. A call that would take the total past it
+	// is handled like a mismatch (on_mismatch).
+	MaxPerDay *float64 `yaml:"max_per_day" json:",omitempty"`
 }
 
 // Empty reports a constraint with no condition at all — almost certainly a
 // typo'd key, and worth refusing at validate time.
 func (c ArgConstraint) Empty() bool {
-	return c.Equals == nil && len(c.OneOf) == 0 && c.Glob == "" && c.Regex == "" && c.Max == nil && c.Min == nil
+	return c.Equals == nil && len(c.OneOf) == 0 && c.Glob == "" && c.Regex == "" && c.Max == nil && c.Min == nil &&
+		c.ReviewAbove == nil && c.MaxPerDay == nil
+}
+
+// numeric reports whether the constraint compares the value as a number.
+func (c ArgConstraint) numeric() bool {
+	return c.Max != nil || c.Min != nil || c.ReviewAbove != nil || c.MaxPerDay != nil
 }
 
 // Check returns whether v satisfies the constraint and, when it does not, a
@@ -695,7 +723,7 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 			return false, fmt.Sprintf("%q does not match regex %q", clip(s), c.Regex)
 		}
 	}
-	if c.Max != nil || c.Min != nil {
+	if c.numeric() {
 		f, ok := exactArgNumber(v)
 		if !ok {
 			return false, fmt.Sprintf("%q is not a number", clip(s))
@@ -706,8 +734,24 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 		if c.Min != nil && (math.IsNaN(*c.Min) || math.IsInf(*c.Min, 0) || f.Cmp(exactBound(*c.Min)) < 0) {
 			return false, fmt.Sprintf("%s is below min %s", s, strconv.FormatFloat(*c.Min, 'f', -1, 64))
 		}
+		if c.MaxPerDay != nil && f.Sign() < 0 {
+			return false, fmt.Sprintf("%s is negative; max_per_day counts amounts of 0 or more", s)
+		}
 	}
 	return true, ""
+}
+
+// Review reports whether a present numeric value is above review_above, with
+// a one-line reason. A value that is not a number is Check's to refuse.
+func (c ArgConstraint) Review(v interface{}, present bool) (bool, string) {
+	if c.ReviewAbove == nil || !present {
+		return false, ""
+	}
+	f, ok := exactArgNumber(v)
+	if !ok || math.IsNaN(*c.ReviewAbove) || math.IsInf(*c.ReviewAbove, 0) || f.Cmp(exactBound(*c.ReviewAbove)) <= 0 {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s is above review_above %s", ArgString(v), strconv.FormatFloat(*c.ReviewAbove, 'f', -1, 64))
 }
 
 // ArgString renders an argument value the way constraints compare it.
@@ -771,21 +815,106 @@ func clip(s string) string {
 // one-line reason naming the first failing argument. Keys are checked in
 // sorted order so the reason is stable.
 func (t ToolRule) MatchArgs(args map[string]interface{}) (bool, string) {
-	if len(t.Args) == 0 {
-		return true, ""
-	}
-	keys := make([]string, 0, len(t.Args))
-	for k := range t.Args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range t.argKeys() {
 		v, present := args[k]
 		if ok, why := t.Args[k].Check(v, present); !ok {
 			return false, k + ": " + why
 		}
 	}
 	return true, ""
+}
+
+// ReviewArgs reports whether any argument is above its review_above, with the
+// first such argument's reason. Keys are checked in sorted order.
+func (t ToolRule) ReviewArgs(args map[string]interface{}) (bool, string) {
+	for _, k := range t.argKeys() {
+		v, present := args[k]
+		if review, why := t.Args[k].Review(v, present); review {
+			return true, k + ": " + why
+		}
+	}
+	return false, ""
+}
+
+// CappedAmounts returns the exact value of each argument under max_per_day,
+// for the running totals. A value that is not a number is left out; Check
+// refuses it.
+func (t ToolRule) CappedAmounts(args map[string]interface{}) map[string]string {
+	amounts := map[string]string{}
+	for _, k := range t.DailyCaps() {
+		if n, ok := exactArgNumber(args[k]); ok {
+			amounts[k] = n.RatString()
+		}
+	}
+	return amounts
+}
+
+// DailyCapReading is what max_per_day says about one call: a line per capped
+// argument with today's total so far, and the first argument this call would
+// take past its cap.
+type DailyCapReading struct {
+	Totals  []string
+	OverArg string
+	Why     string
+}
+
+// ReadDailyCaps checks each capped argument the call carries against today's
+// total, read through spent. A rule that refuses on a mismatch stops at the
+// first cap the call would pass. A total that cannot be read is an error.
+func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg string) (*big.Rat, error)) (DailyCapReading, error) {
+	var r DailyCapReading
+	for _, arg := range t.DailyCaps() {
+		value, present := args[arg]
+		if !present {
+			continue
+		}
+		amount, ok := exactArgNumber(value)
+		if !ok {
+			continue // Check refuses it
+		}
+		total, err := spent(arg)
+		if err != nil {
+			return DailyCapReading{}, err
+		}
+		limit := *t.Args[arg].MaxPerDay
+		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, decimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
+		after := new(big.Rat).Add(total, amount)
+		if r.OverArg == "" && after.Cmp(exactBound(limit)) > 0 {
+			r.OverArg = arg
+			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, decimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
+			if t.DeniesOnMismatch() {
+				break
+			}
+		}
+	}
+	return r, nil
+}
+
+func decimalString(r *big.Rat) string {
+	if r.IsInt() {
+		return r.Num().String()
+	}
+	return strings.TrimSuffix(strings.TrimRight(r.FloatString(12), "0"), ".")
+}
+
+// DailyCaps lists the arguments that carry max_per_day, in sorted order.
+func (t ToolRule) DailyCaps() []string {
+	var caps []string
+	for _, k := range t.argKeys() {
+		if t.Args[k].MaxPerDay != nil {
+			caps = append(caps, k)
+		}
+	}
+	return caps
+}
+
+func (t ToolRule) argKeys() []string {
+	keys := make([]string, 0, len(t.Args))
+	for k := range t.Args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // DeniesOnMismatch reports whether an argument mismatch is refused outright

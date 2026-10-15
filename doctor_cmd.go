@@ -41,16 +41,19 @@ func (r *doctorReport) add(name, status, detail, hint string) {
 
 // runDoctor implements `draftcat doctor`: a read-only preflight of everything
 // the engine needs at start — config, credentials, operator channel, state
-// store, listeners and schedules. It never writes, never creates the state
-// store and never contacts a provider. Exit 1 when any check fails.
+// store, listeners and schedules. It never writes and never creates the state
+// store; it contacts Telegram, the provider and the relay only with --online,
+// and then only with read-only calls. Exit 1 when any check fails.
 func runDoctor(args []string, stdout io.Writer) int {
 	configPath := "config.yaml"
 	skillsDir := "skills"
-	jsonOut := false
+	jsonOut, online := false, false
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; a {
 		case "--json", "-json":
 			jsonOut = true
+		case "--online", "-online":
+			online = true
 		case "--config", "-config":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "doctor: --config requires a path")
@@ -66,8 +69,10 @@ func runDoctor(args []string, stdout io.Writer) int {
 			skillsDir = args[i+1]
 			i++
 		case "-h", "--help", "help":
-			_, _ = io.WriteString(stdout, "Usage: draftcat doctor [--config path] [--skills dir] [--json]\n\n"+
+			_, _ = io.WriteString(stdout, "Usage: draftcat doctor [--config path] [--skills dir] [--online] [--json]\n\n"+
 				"Read-only preflight: config, credentials, operator channel, state store, listeners, schedules.\n"+
+				"--online also asks Telegram, the provider and the relay whether they accept the credentials,\n"+
+				"with read-only calls that send no message and spend no tokens.\n"+
 				"Exits 1 when a check fails.\n")
 			return 0
 		default:
@@ -78,7 +83,7 @@ func runDoctor(args []string, stdout io.Writer) int {
 	// The report is the output; loader chatter would interleave with it.
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(os.Stderr)
-	rep := doctor(configPath, skillsDir, time.Now())
+	rep := doctor(configPath, skillsDir, time.Now(), online)
 	if jsonOut {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
@@ -92,7 +97,8 @@ func runDoctor(args []string, stdout io.Writer) int {
 	return 0
 }
 
-func doctor(configPath, skillsDir string, now time.Time) (rep doctorReport) {
+// doctor runs every check on one config; online adds the remote probes.
+func doctor(configPath, skillsDir string, now time.Time, online bool) (rep doctorReport) {
 	defer func() {
 		rep.OK = true
 		for _, c := range rep.Checks {
@@ -144,6 +150,9 @@ func doctor(configPath, skillsDir string, now time.Time) (rep doctorReport) {
 	doctorState(&rep, &cfg, now)
 	doctorListeners(&rep, &cfg)
 	doctorSchedules(&rep, &cfg, now)
+	if online {
+		doctorOnline(&rep, &cfg)
+	}
 	return rep
 }
 
