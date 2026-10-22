@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.0
+
+- Pre-approve a bounded run of a tool's calls with standing grants: `/grant send_email 2h 20` on rules with `allow_grants: true`. Each call a grant releases leaves a receipt naming the grant, the operator who issued it and the use it took; `/grants` lists live grants and `/ungrant` ends one. Grants never cover high-risk tools, arguments outside the rule or calls past a daily total.
+- Cap a pipeline's own share of the day with `budget: {per_day_tokens, per_day_cost}` on the pipeline, enforced in the same atomic admission as the global daily caps, with `alert_at` notices per pipeline and `pipeline_caps` in `draftcat budget status`.
+- Give each agent harness its own gate token with `tool_gate.callers`: the token fixes the agent name, limits the caller to its `tools`, and reaches only its own actions. `require_caller: true` refuses the shared webhook token on the gate.
+- Anchor the receipt history: `draftcat receipts anchor` prints a hash chain over every approval receipt, and `draftcat receipts verify-anchor` (or `audit-verify --anchor`) names the first receipt that was deleted, inserted, reordered or changed since.
+- Cap how often a tool runs with `max_calls_per_day` on a tool rule, counted like `max_per_day` and checkable offline with `draftcat gate check --calls N`.
+- Hand the tool a signed execution grant on every consume with `tool_gate.execution_grant.secret_env`, and check it before acting with `draftcat gate verify-grant`.
+- Validate webhook bodies with `input_schema` on a webhook pipeline: a body that does not match answers 422 and starts no run.
+- Bind an approval to the state of its target with `precondition` on a tool call: the permit is consumed only when the harness reports the same state.
+- Count failed span exports in `draftcat_otlp_exports_dropped_total` on `/metrics`.
+
+See [standing grants](docs/tool-gate.md#standing-grants), [caller tokens](docs/tool-gate.md#caller-tokens), [target preconditions](docs/tool-gate.md#target-preconditions), [execution grants](docs/tool-gate.md#execution-grants), [calls per day](docs/tool-gate.md#calls-per-day), [per-pipeline daily caps](docs/governance-lifecycle.md#per-pipeline-daily-caps), [anchoring the receipt history](docs/action-receipts.md#anchoring-the-receipt-history) and [validating the webhook body](docs/reliability.md#validate-the-webhook-body).
+
+### Upgrade notes
+
+All new settings are optional, and configurations without them decide exactly as before; rules without `max_calls_per_day` or `allow_grants` keep their policy hashes, and calls without `precondition` keep their permit bindings. The state store gains a `tool_grants` table and an index on `budget_calls(day, pipeline)` at first start. Telegram `/help` lists `/grant`, `/grants` and `/ungrant`.
+
 ## 0.12.0
 
 - Bound money-shaped tool arguments in three bands and a daily total: `review_above` sends a value above it to a human, `max` refuses or escalates above the ceiling, and `max_per_day` keeps a running total per tool argument per UTC day that a call may not pass. Prompts for capped tools show the total so far.

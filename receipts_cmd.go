@@ -84,12 +84,18 @@ func runReceiptsCmd(args []string) int {
 		return runReceiptsExport(args[1:])
 	case "verify":
 		return runReceiptsVerify(args[1:])
+	case "anchor":
+		return runReceiptsAnchor(args[1:], os.Stdout, os.Stderr)
+	case "verify-anchor":
+		return runReceiptsVerifyAnchor(args[1:], os.Stdin, os.Stdout, os.Stderr)
 	case "-h", "--help", "help":
 		fmt.Println("Usage: draftcat receipts <list|show|export|verify> [options]")
 		fmt.Println("  list   [--pipeline name] [--limit N] [--json] [--config path]")
 		fmt.Println("  show   <receipt-id> [--config path]")
 		fmt.Println("  export [--pipeline name] [--limit N] [--out path] [--config path]")
 		fmt.Println("  verify <file.jsonl|-> [--json]  check signed fields without opening SQLite")
+		fmt.Println("  anchor [--json] [--config path]  hash-chain anchor of the whole receipt history")
+		fmt.Println("  verify-anchor <sha256:...|anchor.json|-> [--json] [--config path]  check the history against an anchor")
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "receipts: unknown command %q\n", args[0])
@@ -187,7 +193,7 @@ func runReceiptsList(args []string) int {
 		return code
 	}
 	defer closeStore()
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	views := make([]receiptJSON, 0, len(rows))
 	for _, r := range rows {
 		views = append(views, receiptView(r, secret))
@@ -226,7 +232,7 @@ func runReceiptsShow(args []string) int {
 		fmt.Fprintf(os.Stderr, "receipts show: %v\n", err)
 		return 1
 	}
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	view := struct {
 		receiptJSON
 		Note *noteJSON `json:"note,omitempty"`
@@ -287,7 +293,7 @@ func runReceiptsExport(args []string) int {
 		dst = f
 	}
 	w := bufio.NewWriter(dst)
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	for i := len(rows) - 1; i >= 0; i-- {
 		b, err := json.Marshal(receiptView(rows[i], secret))
 		if err != nil {

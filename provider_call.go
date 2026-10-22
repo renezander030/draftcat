@@ -102,7 +102,7 @@ func callLLM(ctx context.Context, cfg *config.Config, role, prompt string, track
 				return nil, err
 			}
 			result, providerErr := providerCallLLM(ctx, cfg, role, prompt, maxTokens)
-			if err := b.finish(id, result, providerErr, cfg); err != nil {
+			if err := b.finish(id, pipelineFromContext(ctx), result, providerErr, cfg); err != nil {
 				return nil, err
 			}
 			return result, providerErr

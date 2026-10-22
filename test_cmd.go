@@ -220,6 +220,16 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 		}
 		fmt.Printf("  [seed] %s/_input.json loaded (%d key(s))\n", fixDir, len(seed))
 	}
+	// A seeded webhook_body stands in for the request body, so it meets the
+	// pipeline's input_schema exactly as the webhook listener would check it.
+	if body, ok := data["webhook_body"].(string); ok && len(p.InputSchema) > 0 {
+		if err := validateWebhookBody([]byte(body), p.InputSchema); err != nil {
+			fmt.Fprintf(os.Stderr, "  [error] webhook_body rejected by input_schema: %v\n", err)
+			run.rc = 1
+			return run
+		}
+		fmt.Printf("  [input_schema] webhook_body matches\n")
+	}
 
 	for _, step := range p.Steps {
 		fmt.Printf("[step:%s] type=%s\n", step.Name, step.Type)

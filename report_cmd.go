@@ -95,7 +95,7 @@ func reportCmd(args []string, stdout, stderr io.Writer, now time.Time) int {
 		return code
 	}
 	defer closeStore()
-	rep, err := buildOversightReport(st, from, to, pipeline, []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET")))
+	rep, err := buildOversightReport(st, from, to, pipeline, receiptSigningKey())
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "report: %v\n", err)
 		return 1

@@ -41,12 +41,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +80,11 @@ type ToolCallRequest struct {
 	// ExpiresAt optionally narrows the permit validity window. The gate never
 	// extends it beyond operator_approval.
 	ExpiresAt string `json:"expires_at"`
+	// Precondition optionally names the state of the target the call acts on
+	// (a version, an ETag, a content digest). It is shown to the human and
+	// bound into the permit; consuming the permit requires the same value, so
+	// a target that changed after the decision is not acted on.
+	Precondition string `json:"precondition"`
 
 	policyHash       string
 	bindingHash      string
@@ -100,7 +103,7 @@ type ToolCallResponse struct {
 	ArgsHash    string `json:"args_hash"`
 	PolicyHash  string `json:"policy_hash,omitempty"`
 	BindingHash string `json:"binding_hash,omitempty"`
-	DecidedBy   string `json:"decided_by,omitempty"` // "allowlist" | "policy" | "operator" | "repeat-guard"
+	DecidedBy   string `json:"decided_by,omitempty"` // "allowlist" | "policy" | "operator" | "grant" | "repeat-guard"
 	// Rule names the rule or condition behind a decision the gate made on its
 	// own, so a denial can be traced to config without reading the audit log.
 	Rule string `json:"rule,omitempty"`
@@ -115,7 +118,10 @@ type ToolCallResponse struct {
 	ResultHash        string `json:"result_hash,omitempty"`
 	CompletedAt       string `json:"completed_at,omitempty"`
 	ExecutionEvidence string `json:"execution_evidence,omitempty"`
-	unavailable       bool
+	// ExecutionGrant is a signed statement of the consumed permit that the
+	// tool can check before it acts (tool_gate.execution_grant).
+	ExecutionGrant string `json:"execution_grant,omitempty"`
+	unavailable    bool
 }
 
 const toolGatePath = "/gate/tool-call"
@@ -189,7 +195,7 @@ type toolGate struct {
 	now func() time.Time
 
 	mu       sync.Mutex
-	capMu    sync.Mutex // serializes decisions on tools with max_per_day
+	capMu    sync.Mutex // serializes decisions on tools with max_per_day or max_calls_per_day
 	tickets  map[string]*toolTicket
 	recent   map[string]*repeatEntry
 	notified map[string]time.Time
@@ -249,6 +255,14 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	caller := gateCallerFrom(r.Context())
+	if caller != nil {
+		if req.Agent != "" && req.Agent != caller.Name {
+			http.Error(w, "agent does not match the caller token", http.StatusForbidden)
+			return
+		}
+		req.Agent = caller.Name
+	}
 	req.providedActionID = strings.TrimSpace(req.ActionID) != ""
 	if !req.providedActionID {
 		// Compatibility for v0.6 clients. Stable retries require callers to
@@ -257,6 +271,10 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validActionID(req.ActionID) {
 		http.Error(w, "action_id must be 1-128 URL-safe characters", http.StatusBadRequest)
+		return
+	}
+	if !validPrecondition(req.Precondition) {
+		http.Error(w, "precondition must be at most 512 printable characters", http.StatusBadRequest)
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
@@ -311,27 +329,46 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Arguments under max_per_day count toward a running total, and capped
-	// decisions are made one at a time, so two calls cannot both fit under a
-	// total only one of them fits under. The lock is never held while a human
-	// decides.
+	// Arguments under max_per_day and calls under max_calls_per_day count
+	// toward a running total, and capped decisions are made one at a time, so
+	// two calls cannot both fit under a total only one of them fits under. The
+	// lock is never held while a human decides.
 	unlockCaps := func() {}
-	if listed && len(rule.DailyCaps()) > 0 {
+	if listed && rule.Capped() {
 		g.capMu.Lock()
 		unlockCaps = sync.OnceFunc(g.capMu.Unlock)
 		defer unlockCaps()
 	}
-	verdict, err := g.decidePolicy(req, rule, listed)
+	var verdict toolPolicyVerdict
+	var err error
+	if caller != nil && !caller.Allows(req.Tool) {
+		verdict = callerDenial(caller, req.Tool)
+	} else {
+		verdict, err = g.decidePolicy(req, rule, listed)
+	}
 	if err != nil {
 		log.Printf("[tool-gate] DENY %s (%v) agent=%q", req.Tool, err, req.Agent)
 		verdict = toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: "max_per_day",
 			Reason: "the daily total could not be read — the gate denies rather than guesses"}
 	}
 
+	// A standing grant stands in for the operator on a plain require_approval
+	// ask. It is taken while the cap lock is held, so a grant cannot carry a
+	// call past a daily total the rules just checked.
+	if verdict.Grantable {
+		if gv, approver, ok := g.grantVerdict(req); ok {
+			verdict, req.approverID = gv, approver
+		}
+	}
+
 	switch verdict.Decision {
 	case "deny":
 		switch verdict.Class {
 		case "unlisted":
+			if verdict.Rule == "caller.tools" {
+				log.Printf("[tool-gate] DENY %s (not in the caller's tools) agent=%q", req.Tool, req.Agent)
+				break
+			}
 			log.Printf("[tool-gate] DENY %s (not in the allowlist) agent=%q", req.Tool, req.Agent)
 		case "mismatch":
 			log.Printf("[tool-gate] DENY %s (args mismatch: %s) agent=%q", req.Tool, strings.TrimPrefix(verdict.Rule, "args."), req.Agent)
@@ -352,7 +389,11 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		// A listed tool that does not require approval is allowed on the
 		// strength of being listed: that IS an operator decision, made in
 		// config and reviewable, and it is recorded as one.
-		log.Printf("[tool-gate] ALLOW %s (allowlisted, risk=%s) agent=%q", req.Tool, rule.RiskOf(), req.Agent)
+		if verdict.DecidedBy == "grant" {
+			log.Printf("[tool-gate] ALLOW %s (%s) agent=%q", req.Tool, verdict.Reason, req.Agent)
+		} else {
+			log.Printf("[tool-gate] ALLOW %s (allowlisted, risk=%s) agent=%q", req.Tool, rule.RiskOf(), req.Agent)
+		}
 
 		resp := g.finishAction(req, expires, ToolCallResponse{
 			Decision: "allow", Reason: verdict.Reason,
@@ -460,6 +501,14 @@ func (g *toolGate) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[0]
+	// A caller reaches only the actions it asked for; any other id looks
+	// unknown to it.
+	if c := gateCallerFrom(r.Context()); c != nil {
+		if agent, ok := g.actionAgent(id); ok && agent != c.Name {
+			writeToolDecision(w, http.StatusNotFound, unknownToolResponse(id))
+			return
+		}
+	}
 	if len(parts) == 2 {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -508,7 +557,8 @@ func (g *toolGate) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id string) {
 	var body struct {
-		BindingHash string `json:"binding_hash"`
+		BindingHash  string `json:"binding_hash"`
+		Precondition string `json:"precondition"`
 	}
 	raw, ok := readRequestBody(w, r, 4096)
 	if !ok {
@@ -537,6 +587,11 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
 		return
 	}
+	if ok, why := preconditionHolds(a, body.Precondition); !ok {
+		resp.Permit, resp.Rule, resp.Reason = "", "precondition_failed", why
+		writeToolDecision(w, http.StatusConflict, resp)
+		return
+	}
 	now := g.now()
 	e, err := toolConsumptionReceipt(a, now)
 	if err != nil {
@@ -557,6 +612,9 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	resp.Decision, resp.Permit = "allow", "execute"
 	resp.ExecutionStatus = "unreported"
 	resp.Reason = "permit consumed; execute this bound action once"
+	if key := g.cfg.ToolGate.ExecutionGrant.Secret(); len(key) > 0 {
+		resp.ExecutionGrant = signExecutionGrant(key, executionGrantFor(a, now))
+	}
 	writeToolDecision(w, http.StatusOK, resp)
 }
 
@@ -695,6 +753,9 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 	for _, line := range verdict.Totals {
 		draft += "\ntoday: " + line
 	}
+	if req.Precondition != "" {
+		draft += "\ntarget: " + req.Precondition
+	}
 	draft += "\n\nargs sha256: " + tk.ArgsHash
 	timeout := tk.Expires.Sub(g.now())
 	ctx, cancel := withGateMetaTimeout(parent, req.RunID, req.Tool, rule.RiskOf(), timeout)
@@ -731,7 +792,7 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 // decidePolicy records the call's capped amounts, then evaluates the rules
 // against today's totals in the state store.
 func (g *toolGate) decidePolicy(req ToolCallRequest, rule config.ToolRule, listed bool) (toolPolicyVerdict, error) {
-	day := g.now().UTC().Format("2006-01-02")
+	day := statestore.UTCDay(g.now())
 	if listed {
 		if amounts := rule.CappedAmounts(req.Args); len(amounts) > 0 {
 			if err := state.RecordToolActionAmounts(req.ActionID, day, amounts); err != nil {
@@ -815,40 +876,45 @@ func validActionID(id string) bool {
 }
 
 func (g *toolGate) policyHash(tool string, rule config.ToolRule, listed bool) string {
-	b, _ := json.Marshal(struct {
+	return hashCanonical(struct {
 		ToolPolicy     string
 		Enabled        bool
 		ApprovalWindow int64
 		Telegram       config.TelegramConfig
 		Relay          config.RelayConfig
 	}{hashToolPolicy(tool, rule, listed), g.cfg.ToolGate.Enabled, int64(g.approvalWindow()), g.cfg.Telegram, g.cfg.Relay})
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func hashToolPolicy(tool string, rule config.ToolRule, listed bool) string {
-	b, _ := json.Marshal(struct {
+	return hashCanonical(struct {
 		Tool   string          `json:"tool"`
 		Listed bool            `json:"listed"`
 		Rule   config.ToolRule `json:"rule"`
 	}{Tool: tool, Listed: listed, Rule: rule})
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func hashToolBinding(req ToolCallRequest, argsHash, policyHash string, expires time.Time) string {
-	b, _ := json.Marshal(struct {
-		Version    int    `json:"version"`
-		ActionID   string `json:"action_id"`
-		Agent      string `json:"agent"`
-		Tool       string `json:"tool"`
-		RunID      string `json:"run_id"`
-		ArgsHash   string `json:"args_hash"`
-		PolicyHash string `json:"policy_hash"`
-		ExpiresAt  int64  `json:"expires_at"`
-	}{2, req.ActionID, req.Agent, req.Tool, req.RunID, argsHash, policyHash, expires.Unix()})
-	sum := sha256.Sum256(b)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	return toolBindingHash(req.ActionID, req.Agent, req.Tool, req.RunID, argsHash, policyHash, expires, req.Precondition)
+}
+
+// toolBindingHash is the permit's binding. A call without a precondition
+// keeps the version 2 binding; one with a precondition binds it as version 3.
+func toolBindingHash(actionID, agent, tool, runID, argsHash, policyHash string, expires time.Time, precondition string) string {
+	version := 2
+	if precondition != "" {
+		version = 3
+	}
+	return hashCanonical(struct {
+		Version      int    `json:"version"`
+		ActionID     string `json:"action_id"`
+		Agent        string `json:"agent"`
+		Tool         string `json:"tool"`
+		RunID        string `json:"run_id"`
+		ArgsHash     string `json:"args_hash"`
+		PolicyHash   string `json:"policy_hash"`
+		ExpiresAt    int64  `json:"expires_at"`
+		Precondition string `json:"precondition,omitempty"`
+	}{version, actionID, agent, tool, runID, argsHash, policyHash, expires.Unix(), precondition})
 }
 
 func responseFromToolAction(a statestore.ToolAction) ToolCallResponse {
@@ -972,7 +1038,7 @@ func (g *toolGate) finishAction(req ToolCallRequest, expires time.Time, resp Too
 }
 
 func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operator int64, reason string, decidedAt time.Time) (statestore.ApprovalEnvelope, error) {
-	receiptID := "rcpt_" + strings.TrimPrefix(newToolTicketID(), "tc_")
+	receiptID := newReceiptID()
 	expires := req.expires
 	if expires.IsZero() {
 		expires = decidedAt.Add(config.DefaultOperatorApproval)
@@ -988,32 +1054,18 @@ func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operato
 		QuorumN: 1, QuorumGot: quorumGot, Policy: reason, PolicyHash: req.policyHash,
 		BindingHash: req.bindingHash, ExpiresAt: expires, Lifecycle: "decided",
 	}
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
-	if len(secret) > 0 {
-		signApprovalEnvelope(secret, &envelope)
-	}
-	if len(secret) > 0 && (envelope.Nonce == "" || envelope.Signature == "") {
-		return envelope, errors.New("approval receipt signing failed")
-	}
-	return envelope, nil
+	return envelope, sealApprovalEnvelope(&envelope)
 }
 
 func toolConsumptionReceipt(a statestore.ToolAction, at time.Time) (statestore.ApprovalEnvelope, error) {
 	e := statestore.ApprovalEnvelope{
-		ReceiptID: "rcpt_" + strings.TrimPrefix(newToolTicketID(), "tc_"),
+		ReceiptID: newReceiptID(),
 		RunID:     a.RunID, ActionID: a.ActionID, Pipeline: "tool-gate", Step: a.Tool,
 		DecidedAt: at, Decision: "consume", PayloadHash: a.ArgsHash,
 		QuorumN: 1, QuorumGot: 1, Policy: "permit-consume", PolicyHash: a.PolicyHash,
 		BindingHash: a.BindingHash, ExpiresAt: a.ExpiresAt, Lifecycle: "consumed",
 	}
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
-	if len(secret) > 0 {
-		signApprovalEnvelope(secret, &e)
-	}
-	if len(secret) > 0 && (e.Nonce == "" || e.Signature == "") {
-		return e, errors.New("approval receipt signing failed")
-	}
-	return e, nil
+	return e, sealApprovalEnvelope(&e)
 }
 
 func writeToolDecision(w http.ResponseWriter, code int, resp ToolCallResponse) {

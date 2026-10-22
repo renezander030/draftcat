@@ -26,8 +26,13 @@ type toolPolicyVerdict struct {
 	// Why is the line an approval prompt shows when the rules send the call
 	// to a human for a reason beyond require_approval.
 	Why string
-	// Totals reports, for each argument with max_per_day, the running total
-	// before this call and the cap: shown to the human who decides.
+	// Grantable marks an ask a standing grant may answer: the rule allows
+	// grants and asks only because it requires approval, not because of an
+	// argument mismatch or a daily total.
+	Grantable bool
+	// Totals reports, for each argument with max_per_day and for
+	// max_calls_per_day, the running total before this call and the cap: shown
+	// to the human who decides.
 	Totals []string
 }
 
@@ -36,8 +41,8 @@ type toolDailyTotal func(tool, arg string) (*big.Rat, error)
 
 // evaluateToolPolicy decides one call against tool_gate. An unlisted tool is
 // denied; arguments outside the rule escalate to a human or are refused per
-// on_mismatch; a call that would take a max_per_day total past its cap is
-// handled the same way; a value above review_above goes to a human; anything
+// on_mismatch; a call that would take a max_per_day total or the
+// max_calls_per_day count past its cap is handled the same way; a value above review_above goes to a human; anything
 // else is allowed on the strength of being listed. A failing total lookup is
 // returned as an error, never guessed.
 func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string]interface{}, total toolDailyTotal) (toolPolicyVerdict, error) {
@@ -66,6 +71,9 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string
 		caps, err := rule.ReadDailyCaps(args, func(arg string) (*big.Rat, error) {
 			spent, err := total(tool, arg)
 			if err != nil {
+				if arg == config.CallCountKey {
+					return nil, fmt.Errorf("max_calls_per_day count for %s: %w", tool, err)
+				}
 				return nil, fmt.Errorf("max_per_day total for %s.%s: %w", tool, arg, err)
 			}
 			return spent, nil
@@ -77,7 +85,7 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string
 		if caps.OverArg != "" {
 			if rule.DeniesOnMismatch() {
 				return toolPolicyVerdict{
-					Decision: "deny", DecidedBy: "policy", Rule: "max_per_day." + caps.OverArg, Class: "cap",
+					Decision: "deny", DecidedBy: "policy", Rule: caps.Rule, Class: "cap",
 					Reason: "daily total over the rule — " + caps.Why, Totals: v.Totals,
 				}, nil
 			}
@@ -94,6 +102,7 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string
 	}
 	if needHuman {
 		v.Decision, v.DecidedBy, v.Rule, v.Reason = "ask", "", "", "a human decides"
+		v.Grantable = v.Why == "" && rule.Grantable()
 	}
 	return v, nil
 }

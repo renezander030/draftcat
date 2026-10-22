@@ -192,7 +192,7 @@ func approvalsDuring(st *statestore.StateStore, r statestore.RunRecord) []approv
 		ids = append(ids, a.ReceiptID)
 	}
 	notes, _ := st.ApprovalNotes(ids)
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	var out []approvalJSON
 	for _, a := range recs {
 		if r.RunID == "" && (a.RunID != "" || a.DecidedAt.Before(r.StartedAt) || a.DecidedAt.After(r.EndedAt)) {

@@ -90,6 +90,7 @@ func fireOTLP(spanType, name string, start time.Time, durMs int64, status string
 		defer cancel()
 		if err := ex.export(ctx, []otlpSpan{sp}); err != nil {
 			log.Printf("[obs] OTLP export dropped: %v", err)
+			recordOTLPDropped()
 		}
 	}()
 }

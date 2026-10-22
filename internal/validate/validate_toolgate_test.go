@@ -149,3 +149,63 @@ func TestToolGate_NotifyOutcomesValues(t *testing.T) {
 		t.Fatalf("unknown mode accepted: %v", errs)
 	}
 }
+
+func TestToolGate_CallCountCap(t *testing.T) {
+	n := func(i int) *int { return &i }
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", MaxCallsPerDay: n(50)}}})
+	if len(errs) != 0 || len(warns) != 0 {
+		t.Fatalf("a positive call cap produced findings: errors=%v warnings=%v", errs, warns)
+	}
+	errs, _ = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", MaxCallsPerDay: n(0)}}})
+	if !anyHas(errs, "tools[0].max_calls_per_day") {
+		t.Fatalf("a cap of 0 must be an error: %v", errs)
+	}
+	v := 1.0
+	errs, _ = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "pay",
+		Args: map[string]config.ArgConstraint{"#calls": {MaxPerDay: &v}}}}})
+	if !anyHas(errs, "args.#calls") {
+		t.Fatalf("a reserved argument name must be an error: %v", errs)
+	}
+}
+
+func TestToolGate_Callers(t *testing.T) {
+	t.Setenv("CALLER_A", "a")
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email"}},
+		Callers: []config.GateCaller{{Name: "a", TokenEnv: "CALLER_A", Tools: []string{"send_email"}}}})
+	if len(errs) != 0 || len(warns) != 0 {
+		t.Fatalf("a well-formed caller produced findings: errors=%v warnings=%v", errs, warns)
+	}
+	errs, warns = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email"}},
+		Callers: []config.GateCaller{
+			{Name: "a", TokenEnv: "CALLER_A", Tools: []string{"wire_money"}},
+			{Name: "a", TokenEnv: "CALLER_A"},
+			{Name: "", TokenEnv: ""},
+			{Name: "c", TokenEnv: "CALLER_UNSET_FOR_TEST"},
+		}})
+	for _, want := range []string{"callers[1].name", "callers[1].token_env", "callers[2].name", "callers[2].token_env"} {
+		if !anyHas(errs, want) {
+			t.Fatalf("missing error %s: %v", want, errs)
+		}
+	}
+	if !anyHas(warns, "callers[0].tools[0]") || !anyHas(warns, "callers[3].token_env") {
+		t.Fatalf("unlisted caller tool and empty token should warn: %v", warns)
+	}
+	if errs, _ := gateFindings(t, config.ToolGateConfig{RequireCaller: true, Tools: []config.ToolRule{{Name: "t"}}}); !anyHas(errs, "require_caller") {
+		t.Fatalf("require_caller without callers must be an error: %v", errs)
+	}
+}
+
+func TestToolGate_AllowGrants(t *testing.T) {
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", RequireApproval: true, AllowGrants: true}}})
+	if len(errs) != 0 || len(warns) != 0 {
+		t.Fatalf("a grantable approval tool produced findings: errors=%v warnings=%v", errs, warns)
+	}
+	errs, _ = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "wire", Risk: "high", RequireApproval: true, AllowGrants: true}}})
+	if !anyHas(errs, "tools[0].allow_grants") {
+		t.Fatalf("grants on a high-risk tool must be an error: %v", errs)
+	}
+	_, warns = gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "read", AllowGrants: true}}})
+	if !anyHas(warns, "tools[0].allow_grants") {
+		t.Fatalf("grants on a tool that never asks should warn: %v", warns)
+	}
+}

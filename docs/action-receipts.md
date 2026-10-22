@@ -118,6 +118,72 @@ This requires `DRAFTCAT_APPROVAL_SECRET`, checks each signed v1/v2 field set,
 and returns nonzero for unsigned or tampered rows. It does not certify export
 completeness or unsigned `lifecycle` metadata. See the [reliability guide](reliability.md).
 
+## Anchoring the receipt history
+
+Each receipt proves its own fields. An anchor proves the history as a whole:
+that no receipt was deleted, inserted or moved since the anchor was taken.
+
+The anchor is the end of a SHA-256 hash chain over every stored receipt, in
+the order the store appended them (ascending `action_approvals` row id, which
+only grows and is never reused):
+
+```text
+link_0 = sha256("draftcat-receipt-chain/v1")
+link_n = sha256(link_{n-1} || row_n)
+```
+
+`row_n` is the receipt's full stored row in a length-prefixed canonical form
+(`row/1`): row id, receipt version and ID, run and action IDs, pipeline, step,
+decision time, decision, operator, payload hash, quorum, nonce, signature,
+policy, policy and binding hashes, expiry and lifecycle. Signed and unsigned
+receipts are covered alike, so the chain also binds fields outside the
+signature such as `lifecycle`. Receipts, their signatures and the schema are
+unchanged; the chain is computed when you ask for it.
+
+Take an anchor and keep it outside the store (a ticket, a second disk, a
+signed email):
+
+```bash
+draftcat receipts anchor
+#   receipts      1284
+#   first         rcpt_0c1f...
+#   last          rcpt_9d4d...
+#   last decided  2026-10-21T17:02:11Z
+#   anchor        sha256:5be1...
+draftcat receipts anchor --json > anchor-2026-10-21.json
+```
+
+The JSON form adds a `trail`: each anchored receipt ID with the first 16 hex
+digits of its link. With the trail, a check names the first position where the
+history diverges; with only the `sha256:` link it says whether the history
+still reproduces it.
+
+Check the store against an anchor:
+
+```bash
+draftcat receipts verify-anchor anchor-2026-10-21.json
+#   anchor ok: 1284 receipt(s) match the anchor; 37 appended since (sha256:5be1...)
+draftcat receipts verify-anchor sha256:5be1... --json
+draftcat audit-verify lead_reply --anchor anchor-2026-10-21.json
+```
+
+The chain is recomputed over the first `count` stored receipts (for a bare
+link, over the prefix whose link matches). Receipts appended after the anchor
+pass and are reported as a count. A mismatch exits 1 and names the position and
+what happened there:
+
+| kind | meaning |
+| --- | --- |
+| `deleted` | the anchored receipt at this position is no longer in the store |
+| `inserted` | the receipt now at this position was not in the anchored history |
+| `reordered` | both receipts exist, at other positions than anchored |
+| `changed` | the same receipt holds different content than when anchored |
+
+`audit-verify --anchor` runs the per-pipeline signature check as before and the
+anchor check over the whole store; it exits 1 if either fails. Both commands
+open the store read-only and never create or migrate it; `verify-anchor` needs
+no `DRAFTCAT_APPROVAL_SECRET`. A malformed anchor exits 2.
+
 ## Skip reasons
 
 An operator can say why an action was skipped: **Skip with reason...** on the

@@ -368,10 +368,13 @@ draftcat budget status         # today's spend, split by model and by pipeline (
 draftcat receipts list         # approval receipts and verification status (--json)
 draftcat receipts show <id>    # one versioned receipt
 draftcat receipts export       # JSONL to stdout (--out path writes mode 0600)
+draftcat receipts anchor       # hash-chain anchor of every receipt, to keep outside the store
+draftcat receipts verify-anchor <anchor>  # name the first receipt changed since the anchor
 draftcat audit-verify          # verify signed approval receipts
 draftcat report [--since 30d]  # oversight summary: who approved, skipped or let time out, per pipeline and step
 draftcat gate check <tool>     # what tool_gate decides for one call, without the engine (--args JSON)
 draftcat gate test cases.yaml  # a policy test suite for CI: exit 1 when a decision differs
+draftcat gate verify-grant <grant> --tool <tool>  # a tool checks its execution grant before acting
 draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
 

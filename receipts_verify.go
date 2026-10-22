@@ -91,7 +91,7 @@ func runReceiptsVerify(args []string) int {
 		fmt.Fprintln(os.Stderr, "Usage: draftcat receipts verify <file.jsonl|-> [--json]")
 		return 2
 	}
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	if len(secret) == 0 {
 		fmt.Fprintln(os.Stderr, "DRAFTCAT_APPROVAL_SECRET is not set — cannot verify receipts")
 		return 2

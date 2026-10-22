@@ -162,3 +162,19 @@ func TestVerifyWebhookSignature_NoStateStoreStillVerifies(t *testing.T) {
 		t.Fatalf("signature check must work without a state store: %v", err)
 	}
 }
+
+func TestBearerMatches(t *testing.T) {
+	secret := []byte("s3cret")
+	for header, want := range map[string]bool{
+		"Bearer s3cret":  true,
+		"Bearer s3cret ": false,
+		"bearer s3cret":  false,
+		"s3cret":         false,
+		"Bearer ":        false,
+		"":               false,
+	} {
+		if got := bearerMatches(header, secret); got != want {
+			t.Errorf("bearerMatches(%q) = %v, want %v", header, got, want)
+		}
+	}
+}

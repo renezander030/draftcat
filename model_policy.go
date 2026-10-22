@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -76,7 +75,7 @@ func recordModelPolicyDecision(ctx context.Context, cfg *config.Config, role, ph
 	payloadHash := hex.EncodeToString(sum[:])
 	step := config.StepConfig{Name: "model-" + phase + ":" + rule.ID, Type: "approval", Role: role, Risk: config.RiskHigh}
 	policy := rule.ID + ": " + rule.Reason
-	envelope := newApprovalEnvelope([]byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET")),
+	envelope := newApprovalEnvelope(receiptSigningKey(),
 		runIDFromContext(ctx), pipelineFromContext(ctx), step, time.Now(), expires,
 		decision, operatorID, payloadHash, 1, boolCount(decision == "approve"), policy)
 	return persistApprovalReceipt(envelope)

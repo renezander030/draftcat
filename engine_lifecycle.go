@@ -30,6 +30,14 @@ func secretEnvNames(cfg *config.Config) []string {
 			names = append(names, n)
 		}
 	}
+	if n := cfg.ToolGate.ExecutionGrant.SecretEnv; n != "" {
+		names = append(names, n)
+	}
+	for _, c := range cfg.ToolGate.Callers {
+		if c.TokenEnv != "" {
+			names = append(names, c.TokenEnv)
+		}
+	}
 	return names
 }
 

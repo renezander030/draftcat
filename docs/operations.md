@@ -202,6 +202,8 @@ next to the existing counters and histograms:
 | `draftcat_budget_day_cost`, `draftcat_budget_day_cost_limit` | today's spend and the cap |
 | `draftcat_budget_unsettled_calls` | provider calls awaiting reconciliation |
 
+`draftcat_otlp_exports_dropped_total` counts OTLP span exports that failed and were dropped; it appears after the first drop, next to the `[obs] OTLP export dropped` log line.
+
 ## Oversight report
 
 ```bash

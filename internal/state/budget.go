@@ -17,14 +17,16 @@ type BudgetDay struct {
 	Unsettled   int
 }
 
-func budgetDate(at time.Time) string { return at.UTC().Format("2006-01-02") }
+// UTCDay is the day key every daily total is kept under: the UTC calendar
+// date of at, as YYYY-MM-DD.
+func UTCDay(at time.Time) string { return at.UTC().Format("2006-01-02") }
 
 func (s *StateStore) BudgetDay(ctx context.Context, at time.Time) (BudgetDay, error) {
 	var d BudgetDay
 	if s == nil || s.db == nil {
 		return d, fmt.Errorf("budget store unavailable")
 	}
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT tokens FROM budget_days WHERE day=?),0), COALESCE((SELECT cost FROM budget_days WHERE day=?),0), COALESCE((SELECT calls FROM budget_days WHERE day=?),0), COALESCE((SELECT call_minutes FROM budget_days WHERE day=?),0), (SELECT COUNT(*) FROM budget_calls WHERE status='pending')`, budgetDate(at), budgetDate(at), budgetDate(at), budgetDate(at)).Scan(&d.Tokens, &d.Cost, &d.Calls, &d.CallMinutes, &d.Unsettled)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE((SELECT tokens FROM budget_days WHERE day=?),0), COALESCE((SELECT cost FROM budget_days WHERE day=?),0), COALESCE((SELECT calls FROM budget_days WHERE day=?),0), COALESCE((SELECT call_minutes FROM budget_days WHERE day=?),0), (SELECT COUNT(*) FROM budget_calls WHERE status='pending')`, UTCDay(at), UTCDay(at), UTCDay(at), UTCDay(at)).Scan(&d.Tokens, &d.Cost, &d.Calls, &d.CallMinutes, &d.Unsettled)
 	if err == nil && (d.Tokens < 0 || d.Cost < 0 || math.IsNaN(d.Cost) || math.IsInf(d.Cost, 0)) {
 		err = fmt.Errorf("invalid persisted budget usage")
 	}
@@ -34,17 +36,27 @@ func (s *StateStore) BudgetDay(ctx context.Context, at time.Time) (BudgetDay, er
 // BeginBudgetCall atomically admits one provider call across store handles.
 // A pending call survives a crash; no subsequent call can assume it was free.
 // Cost is a stop threshold on settled spend, not an estimated dollar ceiling.
+// The label's pipeline caps apply the same two checks to the calls settled for
+// that pipeline on the same UTC date, in the same statement.
 func (s *StateStore) BeginBudgetCall(ctx context.Context, id string, at time.Time, requested, tokenLimit int, costLimit float64, label UsageLabel) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("budget store unavailable")
 	}
-	if id == "" || requested < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) {
+	if id == "" || requested < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) || math.IsNaN(label.PipelineDayCost) || math.IsInf(label.PipelineDayCost, 0) {
 		return fmt.Errorf("invalid budget admission")
 	}
+	day := UTCDay(at)
 	result, err := s.db.ExecContext(ctx, `INSERT INTO budget_calls (call_id, day, status, created_at, model, pipeline)
  SELECT ?, ?, 'pending', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM budget_calls WHERE status='pending')
  AND (? <= 0 OR COALESCE((SELECT tokens FROM budget_days WHERE day=?),0) <= ? - ?)
- AND (? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) < ?)`, id, budgetDate(at), at.Unix(), label.Model, label.Pipeline, tokenLimit, budgetDate(at), tokenLimit, requested, costLimit, budgetDate(at), costLimit)
+ AND (? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) < ?)
+ AND (? <= 0 OR (SELECT COALESCE(SUM(tokens),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') <= ? - ?)
+ AND (? <= 0 OR (SELECT COALESCE(SUM(cost),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') < ?)`,
+		id, day, at.Unix(), label.Model, label.Pipeline,
+		tokenLimit, day, tokenLimit, requested,
+		costLimit, day, costLimit,
+		label.PipelineDayTokens, day, label.Pipeline, label.PipelineDayTokens, requested,
+		label.PipelineDayCost, day, label.Pipeline, label.PipelineDayCost)
 	if err != nil {
 		return err
 	}
@@ -97,7 +109,7 @@ func (s *StateStore) AddBudgetUsage(ctx context.Context, at time.Time, tokens in
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := addBudgetUsageTx(ctx, tx, budgetDate(at), tokens, cost, calls, minutes); err != nil {
+	if err := addBudgetUsageTx(ctx, tx, UTCDay(at), tokens, cost, calls, minutes); err != nil {
 		return err
 	}
 	return tx.Commit()

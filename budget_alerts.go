@@ -7,16 +7,18 @@ import (
 	"time"
 
 	"github.com/renezander030/draftcat/internal/config"
+	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
 // budgetAlerts notifies the operator when today's usage crosses a configured
-// fraction of a daily cap (budgets.alert_at). Each threshold fires once per
-// UTC day and cap; the mark is kept in the state store so a restart does not
-// repeat it.
+// fraction of a daily cap (budgets.alert_at), globally or for a pipeline with
+// its own budget. Each threshold fires once per UTC day and cap; the mark is
+// kept in the state store so a restart does not repeat it.
 type budgetAlerts struct {
 	thresholds []float64 // ascending, each in (0, 1)
 	tokenCap   int
 	costCap    float64
+	pipelines  map[string]config.PipelineBudgetConfig // capped pipelines only
 	notify     func(string)
 	day        string
 	fired      map[string]bool
@@ -31,10 +33,14 @@ func (b *BudgetTracker) configureAlerts(cfg *config.Config, notify func(string))
 			th = append(th, f)
 		}
 	}
+	pipelines := map[string]config.PipelineBudgetConfig{}
+	for _, p := range cfg.CappedPipelines() {
+		pipelines[p.Name] = p.Budget
+	}
 	r := b.root()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(th) == 0 || notify == nil || (cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0) {
+	if len(th) == 0 || notify == nil || (cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 && len(pipelines) == 0) {
 		r.alerts = nil
 		return
 	}
@@ -43,18 +49,24 @@ func (b *BudgetTracker) configureAlerts(cfg *config.Config, notify func(string))
 		thresholds: th,
 		tokenCap:   cfg.Budgets.PerDayTokens,
 		costCap:    cfg.Budgets.PerDayCost,
+		pipelines:  pipelines,
 		notify:     notify,
 		fired:      map[string]bool{},
 	}
 }
 
-// observeLocked runs with the root budget lock held, after usage changed.
-func (a *budgetAlerts) observeLocked(r *BudgetTracker) {
-	day := r.dayStart.UTC().Format("2006-01-02")
+func (a *budgetAlerts) dayLocked(r *BudgetTracker) string {
+	day := statestore.UTCDay(r.dayStart)
 	if day != a.day {
 		a.day = day
 		a.fired = map[string]bool{}
 	}
+	return day
+}
+
+// observeLocked runs with the root budget lock held, after usage changed.
+func (a *budgetAlerts) observeLocked(r *BudgetTracker) {
+	day := a.dayLocked(r)
 	if a.tokenCap > 0 {
 		used := float64(r.tokensUsedToday) / float64(a.tokenCap)
 		if f, ok := a.crossLocked(r, day, "tokens", used); ok {
@@ -65,6 +77,26 @@ func (a *budgetAlerts) observeLocked(r *BudgetTracker) {
 		used := r.costToday / a.costCap
 		if f, ok := a.crossLocked(r, day, "cost", used); ok {
 			a.send(fmt.Sprintf("[budget] %d%% of today's cost cap used: %.4f of %.4f (UTC day %s).", pct(f), r.costToday, a.costCap, day))
+		}
+	}
+}
+
+// observePipelineLocked runs with the root budget lock held, after a call
+// settled for a pipeline; used is that pipeline's total for the day.
+func (a *budgetAlerts) observePipelineLocked(r *BudgetTracker, used statestore.UsageShare) {
+	caps, ok := a.pipelines[used.Name]
+	if !ok {
+		return
+	}
+	day := a.dayLocked(r)
+	if caps.PerDayTokens > 0 {
+		if f, ok := a.crossLocked(r, day, "pipeline:"+used.Name+":tokens", float64(used.Tokens)/float64(caps.PerDayTokens)); ok {
+			a.send(fmt.Sprintf("[budget] %d%% of the daily token cap of pipeline %s used: %d of %d (UTC day %s).", pct(f), used.Name, used.Tokens, caps.PerDayTokens, day))
+		}
+	}
+	if caps.PerDayCost > 0 {
+		if f, ok := a.crossLocked(r, day, "pipeline:"+used.Name+":cost", used.Cost/caps.PerDayCost); ok {
+			a.send(fmt.Sprintf("[budget] %d%% of the daily cost cap of pipeline %s used: %.4f of %.4f (UTC day %s).", pct(f), used.Name, used.Cost, caps.PerDayCost, day))
 		}
 	}
 }

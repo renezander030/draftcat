@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -122,5 +124,48 @@ func TestOTLPExportNeverBlocksOnBadEndpoint(t *testing.T) {
 		}
 	case <-time.After(800 * time.Millisecond):
 		t.Fatal("export blocked — did not return within budget")
+	}
+}
+
+// TestOTLPDroppedExportIsCounted asserts a failed export shows up on /metrics
+// as draftcat_otlp_exports_dropped_total, and that the series is absent until
+// the first drop.
+func TestOTLPDroppedExportIsCounted(t *testing.T) {
+	resetMetrics()
+	t.Cleanup(resetMetrics)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer collector.Close()
+
+	var before strings.Builder
+	if err := WriteMetrics(&before); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(before.String(), "draftcat_otlp_exports_dropped_total") {
+		t.Fatalf("dropped counter rendered before any drop:\n%s", before.String())
+	}
+
+	EnableOTLP(collector.URL+"/v1/traces", nil)
+	fireOTLP("pipeline", "p", time.Now(), 5, "ok", nil)
+	fireOTLP("pipeline", "p", time.Now(), 5, "ok", nil)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var sb strings.Builder
+		if err := WriteMetrics(&sb); err != nil {
+			t.Fatal(err)
+		}
+		out := sb.String()
+		if strings.Contains(out, "\ndraftcat_otlp_exports_dropped_total 2\n") {
+			if !strings.Contains(out, "# TYPE draftcat_otlp_exports_dropped_total counter\n") {
+				t.Errorf("counter rendered without its TYPE line:\n%s", out)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("want two dropped exports counted, got:\n%s", out)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

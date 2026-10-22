@@ -150,8 +150,24 @@ calls cannot both fit under a total that only one fits under. The argument
 values under a cap are stored next to the action; all other arguments remain
 hashed only. When the total cannot be read, the gate denies.
 
-Adding `review_above` or `max_per_day` changes that rule's policy hash, as any
-rule edit does; rules without them keep their hash.
+### Calls per day
+
+`max_calls_per_day` on a rule caps how many calls of the tool the gate allows
+in one UTC day, whatever the arguments:
+
+```yaml
+    - name: send_email
+      on_mismatch: deny
+      max_calls_per_day: 200   # the 201st call today is refused
+```
+
+Calls count like a `max_per_day` total: from the moment one is allowed, by a
+rule or by a human, until its permit is revoked or expires unconsumed. A call
+past the cap follows `on_mismatch` (`rule: max_calls_per_day`), and prompts for
+the tool show `today: calls: 37 allowed today, max_calls_per_day 200`.
+
+Adding `review_above`, `max_per_day` or `max_calls_per_day` changes that rule's
+policy hash, as any rule edit does; rules without them keep their hash.
 
 ## Checking a policy offline
 
@@ -171,7 +187,8 @@ ASK  create_invoice
 ```
 
 The decision is `allow`, `deny`, or `ask` (a human decides). `--spent` sets an
-argument's total already allowed today. The repeat guard and the operator
+argument's total already allowed today, and `--calls` the tool's calls already
+allowed today (`calls:` in a test case). The repeat guard and the operator
 channel are runtime state and are not part of the check.
 
 `draftcat gate test` runs a file of cases and exits 1 when a decision differs,
@@ -258,6 +275,57 @@ prompt goes out, exactly like a pipeline gate. It shows up in `/pending` and
 reconciles it at next boot as `interrupted` — audit row included — instead of
 the gate vanishing without a trace.
 
+### Target preconditions
+
+When a call changes a record, the harness can name the state of the target it
+read, for example its version, ETag or content digest:
+
+```json
+{"action_id": "crm-update-88", "tool": "update_record",
+ "args": {"id": 88, "stage": "won"}, "precondition": "etag:\"v7\""}
+```
+
+The prompt shows `target: etag:"v7"`, and the precondition is bound into the
+permit. To consume it, the harness reads the target again and sends what it
+found:
+
+```json
+{"binding_hash": "sha256:...", "precondition": "etag:\"v7\""}
+```
+
+The same value consumes the permit. A different or missing value answers `409`
+with `rule: precondition_failed`, no `permit: execute`, and the permit stays
+unconsumed; a target that changed needs a new approval. A precondition is at
+most 512 printable characters. Calls without one bind and consume as before.
+
+### Execution grants
+
+With a grant key configured, every successful consume also returns an
+`execution_grant`, a signed statement that this permit was consumed for this
+exact call:
+
+```yaml
+tool_gate:
+  execution_grant:
+    secret_env: DRAFTCAT_GRANT_SECRET   # the tool holds the same key
+```
+
+The tool checks the grant before it acts, so a call that never went through
+the gate has no grant the tool accepts:
+
+```bash
+draftcat gate verify-grant "$GRANT" --tool send_email \
+  --args '{"to":"billing@example.com"}' --max-age 5m     # exit 0 valid, 1 not
+```
+
+A grant is `dcg1.<payload>.<mac>`: the payload is base64url JSON with
+`action_id`, `tool`, `agent`, `run_id`, `args_hash`, `binding_hash`,
+`consumed_at` and `expires_at`; the mac is base64url HMAC-SHA256 over
+`dcg1.<payload>` with the key, so a tool in any language can check it. The
+`args_hash` is `sha256:` over the arguments as compact JSON with sorted keys.
+A grant covers one execution: a tool that keeps the `action_id`s it has run
+refuses a second use.
+
 ## The repeat guard
 
 An agent that loops on one call does not get a fresh prompt each time. Inside
@@ -309,6 +377,67 @@ result sha256: sha256:4f1c...
 One notice per recorded outcome; a retried report does not repeat it. The
 default is `off`.
 
+## Standing grants
+
+A rule with `allow_grants: true` lets an operator pre-approve a bounded run of
+its calls from the Telegram operator chat:
+
+```
+/grant send_email 2h 20           # the next 20 calls within 2 hours
+/grant send_email 30m 5 inbox     # only for agent "inbox"
+/grants                           # live grants: uses left, time left, who issued them
+/ungrant g_3f9a1c22e0b4           # end one now
+```
+
+While a grant lasts, a call the rule would ask about only because it has
+`require_approval` is allowed without a prompt, with `decided_by: grant` and
+`rule: grant:<id>`. Its receipt is a `policy_approve` that names the grant, the
+operator who issued it and the use it took (`standing grant g_3f9a1c22e0b4 by
+operator 111111, use 3 of 20`). The earliest-expiring grant that covers the
+call is used, and each use is taken once even under concurrent calls.
+
+A grant does not cover:
+
+- a call with arguments outside the rule, or past a `max_per_day` total or
+  `max_calls_per_day` — those still reach a human (`review_above` never
+  applies on a rule with `require_approval`, which already asks every time);
+- a high-risk tool — `draftcat validate` refuses `allow_grants` on one;
+- a rule that no longer has `allow_grants` — its grants stop applying.
+
+A grant lasts between 1 minute and 24 hours and covers at most 1000 calls
+(1000 when no count is given). Grants live in the state store and survive a
+restart.
+
+## Caller tokens
+
+Each harness can hold its own token instead of the webhook token:
+
+```yaml
+tool_gate:
+  require_caller: true            # optional: refuse the webhook token on the gate
+  callers:
+    - name: billing-agent
+      token_env: GATE_TOKEN_BILLING
+      tools: [create_invoice]     # optional: only these tools
+    - name: inbox-agent
+      token_env: GATE_TOKEN_INBOX
+```
+
+A request with a caller's token is made as that caller:
+
+- its `agent` is the caller's name, recorded on the action and bound into the
+  permit; a request that names a different agent is refused with `403`;
+- a tool outside its `tools` is denied with `rule: caller.tools`;
+- `GET`, `consume`, `revoke` and `complete` reach only the actions it asked
+  for, and any other id answers `404`;
+- a signed request is signed with the caller's own token.
+
+Removing a caller, or unsetting its variable, withdraws that one token. The
+webhook token keeps working on the gate for every listed tool unless
+`require_caller: true`. Caller tokens are redacted from logs and notices like
+every other credential. `draftcat validate` refuses duplicate names and shared
+variables, and `draftcat doctor` warns about a caller whose variable is empty.
+
 ## Audit
 
 Every decision writes a v2 `action_approvals` receipt with `pipeline = tool-gate`,
@@ -327,6 +456,13 @@ tool_gate:
   notify_denials: true       # operator notices for denials the gate made on its own
   notify_window: 10m         # dedup window for those notices
   notify_outcomes: off       # off | failed | all: tell the operator what allowed actions did
+  require_caller: false      # refuse the webhook token; only caller tokens reach the gate
+  execution_grant:
+    secret_env: <VARIABLE>   # sign an execution grant on every consume
+  callers:
+    - name: <agent>          # the agent name the token is recorded under
+      token_env: <VARIABLE>  # env var holding the caller's bearer token
+      tools: [<tool>, …]     # optional: the tools this caller may ask about
   tools:
     - name: <tool>
       risk: low | normal | high      # default normal; high always needs a human
@@ -336,4 +472,6 @@ tool_gate:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,
                      review_above: …, max_per_day: …, optional: true}
       on_mismatch: approve | deny    # default approve
+      max_calls_per_day: <n>         # allowed calls per UTC day; past it, on_mismatch applies
+      allow_grants: true|false       # operators may /grant a bounded run of calls (never high risk)
 ```

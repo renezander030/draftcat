@@ -1446,7 +1446,7 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			// approvalSecret signs the audit rows into tamper-evident receipts.
 			// Unset (empty) → rows are recorded unsigned, exactly as before, so
 			// this stays backward compatible on instances that don't opt in.
-			approvalSecret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+			approvalSecret := receiptSigningKey()
 
 			// recordAudit appends one append-only approval row (who/what/when) and
 			// bumps the Prometheus approval counter. The audit table is always on
@@ -1648,7 +1648,7 @@ func reconcileInterruptedApprovals(st *statestore.StateStore, ch OperatorChannel
 		return
 	}
 
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	log.Printf("[approval] %d approval gate(s) were open at last shutdown — marking interrupted", len(pending))
 
 	for _, p := range pending {
@@ -1769,8 +1769,10 @@ func (h *ChatHistory) Len() int {
 	return len(h.messages)
 }
 
-func handleCommand(cmd string, args string, bot *TGBot, sched *Scheduler, skills *skillsapi.SkillRegistry, cfg *config.Config, budget *BudgetTracker) {
+func handleCommand(cmd string, args string, from int64, bot *TGBot, sched *Scheduler, skills *skillsapi.SkillRegistry, cfg *config.Config, budget *BudgetTracker) {
 	switch cmd {
+	case "/grant", "/grants", "/ungrant":
+		_ = bot.Send(grantCommand(cmd, args, from, cfg.ToolGate, time.Now()))
 	case "/cron":
 		handleCron(args, bot, sched)
 	case "/skills":
@@ -1796,7 +1798,7 @@ func handleCommand(cmd string, args string, bot *TGBot, sched *Scheduler, skills
 			_ = bot.Send(reloadHook())
 		}
 	case "/help":
-		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant")
 	}
 }
 
@@ -2363,10 +2365,27 @@ func statusReport(active, paused int, budget *BudgetTracker, cfg *config.Config,
 // the append-only convention guards draftcat's own writes, and this catches edits
 // made directly to the SQLite file. Exit 1 if any row is tampered, 0 if every row
 // verifies (or is unsigned), 2 on a usage/secret error.
+//
+// With --anchor <sha256:...|anchor.json> it also recomputes the receipt hash
+// chain over the whole store and exits 1 when the history no longer matches
+// the anchor an operator kept outside it.
 func runAuditVerify(args []string) int {
+	args, anchorArg, withAnchor, ok := splitAnchorFlag(args)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "audit-verify: --anchor requires sha256:... or an anchor file")
+		return 2
+	}
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: draftcat audit-verify <pipeline> [config.yaml]")
 		return 2
+	}
+	var anchor receiptAnchor
+	if withAnchor {
+		var err error
+		if anchor, err = parseReceiptAnchor(anchorArg, os.Stdin); err != nil {
+			fmt.Fprintf(os.Stderr, "audit-verify: %v\n", err)
+			return 2
+		}
 	}
 	pipeline := args[0]
 	configPath := "config.yaml"
@@ -2374,7 +2393,7 @@ func runAuditVerify(args []string) int {
 		configPath = args[1]
 	}
 
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	if len(secret) == 0 {
 		fmt.Fprintln(os.Stderr, "DRAFTCAT_APPROVAL_SECRET is not set — cannot verify receipts")
 		return 2
@@ -2404,10 +2423,23 @@ func runAuditVerify(args []string) int {
 			r.Status, r.Record.DecidedAt.Format(time.RFC3339), r.Record.Decision, r.Record.OperatorID, r.Record.Step)
 	}
 	fmt.Printf("%d rows checked, %d tampered\n", len(results), tampered)
+	code := 0
 	if tampered > 0 {
-		return 1
+		code = 1
 	}
-	return 0
+	if withAnchor {
+		rows, err := st.ApprovalsInStoredOrder()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "verify anchor: %v\n", err)
+			return 1
+		}
+		res := checkReceiptAnchor(rows, anchor)
+		printAnchorResult(os.Stdout, res)
+		if res.Status != "match" {
+			code = 1
+		}
+	}
+	return code
 }
 
 func main() {
@@ -2455,12 +2487,15 @@ func main() {
 			fmt.Println("  draftcat budget <status|reconcile>      inspect spend or reconcile uncertain provider usage")
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
+			fmt.Println("  draftcat receipts anchor [--json]      hash-chain anchor of the whole receipt history; keep it outside the store")
 			fmt.Println("  draftcat report [--since 30d] [--json]  who approved, skipped or let time out, per pipeline and step")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
+			fmt.Println("  draftcat audit-verify <pipeline> --anchor <sha256:...|file.json>  also detect deleted, inserted or reordered receipts")
 			fmt.Println("  draftcat zk-receipt <command>          prove an approval without revealing its private fields")
 			fmt.Println("  draftcat fhe-vote <command>             count encrypted approval votes without reading them")
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
+			fmt.Println("  draftcat gate verify-grant <grant>     check an execution grant before running the tool")
 			return
 		}
 	}
@@ -2764,7 +2799,7 @@ func main() {
 						}
 						log.Printf("[cmd] %s %s (user: %d)", cmd, args, u.Message.From.ID)
 						bot.sendTyping()
-						handleCommand(cmd, args, bot, sched, currentSkills(skillReg), currentConfig(&cfg), budget)
+						handleCommand(cmd, args, u.Message.From.ID, bot, sched, currentSkills(skillReg), currentConfig(&cfg), budget)
 					} else if text != "" {
 						log.Printf("[msg] %q (user: %d)", text, u.Message.From.ID)
 						bot.sendTyping()
@@ -3013,6 +3048,14 @@ const webhookSigHeader = "X-Draftcat-Signature"
 //
 // Errors are deliberately specific for the log and generic for the caller — the
 // handler returns a bare 401 so a prober learns nothing about which check failed.
+// bearerMatches reports whether an Authorization header carries exactly the
+// webhook token, compared in constant time.
+func bearerMatches(header string, secret []byte) bool {
+	const prefix = "Bearer "
+	return strings.HasPrefix(header, prefix) &&
+		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(header, prefix)), secret) == 1
+}
+
 func verifyWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) error {
 	sig, err := authenticateWebhookSignature(header, body, secret, maxSkewSeconds, now)
 	if err != nil {
@@ -3134,33 +3177,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 	// additional port. Default-deny lives in the handler.
 	if cfg.ToolGate.Enabled {
 		gate := newToolGate(cfg, gateChannel(bot))
-		gateAuth := func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				const prefix = "Bearer "
-				got := r.Header.Get("Authorization")
-				if !strings.HasPrefix(got, prefix) ||
-					subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
-					return
-				}
-				if r.Method == http.MethodPost {
-					body, ok := readRequestBody(w, r, maxBody)
-					if !ok {
-						return
-					}
-					r.Body = io.NopCloser(bytes.NewReader(body))
-					sigHeader := r.Header.Get(webhookSigHeader)
-					if sigHeader != "" || cfg.Webhook.RequireSignature {
-						if err := verifyWebhookSignature(sigHeader, body, secret, maxSkew, time.Now()); err != nil {
-							log.Printf("[tool-gate][security] signature rejected: %v", err)
-							http.Error(w, "unauthorized", http.StatusUnauthorized)
-							return
-						}
-					}
-				}
-				next.ServeHTTP(w, r)
-			})
-		}
+		gateAuth := newGateAuthenticator(secret, cfg.ToolGate).middleware(maxBody, maxSkew, cfg.Webhook.RequireSignature)
 		mux.Handle(toolGatePath, gateAuth(http.HandlerFunc(gate.HandleCall)))
 		mux.Handle(toolGatePath+"/", gateAuth(http.HandlerFunc(gate.HandleStatus)))
 		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
@@ -3171,10 +3188,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		const prefix = "Bearer "
-		got := r.Header.Get("Authorization")
-		if !strings.HasPrefix(got, prefix) ||
-			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
+		if !bearerMatches(r.Header.Get("Authorization"), secret) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -3202,11 +3216,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// Constant-time bearer auth.
-		const prefix = "Bearer "
-		got := r.Header.Get("Authorization")
-		if !strings.HasPrefix(got, prefix) ||
-			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), secret) != 1 {
+		if !bearerMatches(r.Header.Get("Authorization"), secret) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -3238,6 +3248,14 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		p, ok := webhookPipelines(runCfg)[name]
 		if !ok {
 			http.Error(w, "no webhook-triggerable pipeline named "+name, http.StatusNotFound)
+			return
+		}
+		// The body is checked after authentication and before any admission,
+		// scheduler slot, idempotency record, or signature claim, so a body the
+		// pipeline cannot use starts nothing and the sender can correct it.
+		if err := validateWebhookBody(body, p.InputSchema); err != nil {
+			log.Printf("[webhook] pipeline %s: body rejected by input_schema: %v", name, err)
+			writeWebhookSchemaError(w, err)
 			return
 		}
 
@@ -3336,6 +3354,19 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		writeWebhookAdmission(w, admission)
 	})
 	return mux
+}
+
+// writeWebhookSchemaError answers a body that fails input_schema with 422 and
+// the failing schema field, when the failure is tied to one.
+func writeWebhookSchemaError(w http.ResponseWriter, err error) {
+	reply := map[string]string{"error": "request body does not match input_schema", "detail": err.Error()}
+	var fieldErr *schemaFieldError
+	if errors.As(err, &fieldErr) {
+		reply["path"] = fieldErr.Field
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_ = json.NewEncoder(w).Encode(reply)
 }
 
 func writeWebhookAdmission(w http.ResponseWriter, a statestore.WebhookAdmission) {

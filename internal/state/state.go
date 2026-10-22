@@ -171,6 +171,19 @@ CREATE TABLE IF NOT EXISTS tool_action_amounts (
     PRIMARY KEY (action_id, arg)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_amounts_day ON tool_action_amounts(day, arg);
+CREATE TABLE IF NOT EXISTS tool_grants (
+    grant_id     TEXT PRIMARY KEY,
+    tool         TEXT NOT NULL,
+    agent        TEXT NOT NULL DEFAULT '',   -- '' = any agent
+    granted_by   INTEGER NOT NULL,           -- operator who issued it
+    granted_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    max_uses     INTEGER NOT NULL,
+    uses         INTEGER NOT NULL DEFAULT 0,
+    revoked_at   INTEGER NOT NULL DEFAULT 0,
+    revoked_by   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tool_grants_tool ON tool_grants(tool, expires_at);
 CREATE TABLE IF NOT EXISTS budget_days (
     day          TEXT PRIMARY KEY,
     tokens       INTEGER NOT NULL DEFAULT 0,
@@ -236,6 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(s
  CREATE INDEX IF NOT EXISTS idx_runs_runid ON pipeline_runs(run_id);
  CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
  CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_idempotency ON webhook_admissions(pipeline, idempotency_key) WHERE idempotency_key <> '';
+ CREATE INDEX IF NOT EXISTS idx_budget_calls_day_pipeline ON budget_calls(day, pipeline);
  `); err != nil {
 		return err
 	}

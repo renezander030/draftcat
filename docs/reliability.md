@@ -25,6 +25,41 @@ A matching, already-admitted retry may reuse the original signature while it is
 still timely; it only reads the existing admission. Starting new work claims the
 signature atomically. Reusing that signature for another admission is refused.
 
+## Validate the webhook body
+
+A webhook pipeline can declare the body it accepts with `input_schema`, the same
+flat field schema a step uses for `output_schema`:
+
+```yaml
+pipelines:
+  - name: invoice-due-diligence
+    schedule: webhook
+    input_schema:
+      invoice: {type: string}
+      amount:  {type: number, min: 0, max: 25000.00}
+      kind:    {enum: [new, refund]}
+    steps: [...]
+```
+
+Every declared field is required; `type`, numeric `min`/`max` and `enum` are
+checked with the same exact decimal comparisons as model output, and extra fields
+pass through. The body must be one JSON object without duplicate keys or
+trailing content. The check runs after bearer and signature authentication and
+before anything is admitted: a body that does not match returns HTTP 422 and
+starts no run, takes no idempotency key, and leaves the signature unclaimed, so
+the sender can correct the body and send it again.
+
+```json
+{"error":"request body does not match input_schema","detail":"field amount: value above max","path":"amount"}
+```
+
+`path` names the failing schema field and is absent when the body is not a JSON
+object. The body itself never appears in the reply or the log line. Without
+`input_schema` the body is passed to the pipeline unchecked, as before.
+`draftcat validate` reports an invalid `input_schema` as an error and warns when
+one is set on a pipeline that is not `schedule: webhook`. `draftcat test` checks
+a `webhook_body` string seeded through `_input.json` against the schema.
+
 ## Send complete, unambiguous tool requests
 
 Oversized HTTP request bodies return 413 instead of being truncated; unreadable
@@ -32,7 +67,7 @@ bodies return 400. `webhook.max_body_bytes` applies to webhook and tool-gate POS
 The tool gate also limits direct requests to 1 MiB and consume bodies to 4 KiB.
 Unknown tool envelope fields, duplicate keys (including nested arguments), and
 trailing JSON, and nesting above 128 levels return 400 before creating or consuming a permit. Webhook payloads
-remain arbitrary bytes; the strict JSON envelope rules apply to the tool gate.
+remain arbitrary bytes unless the pipeline sets `input_schema`; the strict JSON envelope rules apply to the tool gate.
 
 Tool argument numbers retain their JSON spelling, including integers above 2^53.
 Distinct large integers therefore cannot share a rounded approval hash. Use the

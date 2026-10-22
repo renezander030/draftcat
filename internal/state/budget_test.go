@@ -144,3 +144,78 @@ func TestBudgetRejectsInvalidAndOverflowUsageWithoutReleasingPending(t *testing.
 		t.Fatalf("invalid accounting changed ledger: %+v %v", day, err)
 	}
 }
+
+// A pipeline's daily caps are checked in the admission insert against the
+// calls settled for that pipeline on the same UTC date, across store handles.
+func TestBudgetPipelineDailyCapAdmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget.db")
+	ctx := context.Background()
+	a, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	capped := UsageLabel{Pipeline: "replies", PipelineDayTokens: 50, PipelineDayCost: 1}
+	if err := a.BeginBudgetCall(ctx, "r1", at, 10, 0, 0, capped); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SettleBudgetCall(ctx, "r1", 45, .4); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.BeginBudgetCall(ctx, "r2", at, 10, 0, 0, capped); err == nil {
+		t.Fatal("token cap: 45 settled + 10 requested admitted under 50")
+	}
+	if err := b.BeginBudgetCall(ctx, "r3", at, 5, 0, 0, capped); err != nil {
+		t.Fatalf("call within the token cap refused: %v", err)
+	}
+	if err := b.SettleBudgetCall(ctx, "r3", 0, .6); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.BeginBudgetCall(ctx, "r4", at, 0, 0, 0, capped); err == nil {
+		t.Fatal("cost cap: settled 1.0 admitted at cap 1")
+	}
+	if err := a.BeginBudgetCall(ctx, "r5", at.AddDate(0, 0, 1), 10, 0, 0, capped); err != nil {
+		t.Fatalf("next UTC day still capped: %v", err)
+	}
+	if err := a.ReleaseBudgetCall(ctx, "r5"); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var admitted sync.Map
+	for id, call := range map[string]struct {
+		st    *StateStore
+		label UsageLabel
+	}{"r6": {a, capped}, "d1": {b, UsageLabel{Pipeline: "digest"}}} {
+		wg.Add(1)
+		go func(id string, st *StateStore, label UsageLabel) {
+			defer wg.Done()
+			if st.BeginBudgetCall(ctx, id, at, 1, 0, 0, label) == nil {
+				admitted.Store(id, true)
+			}
+		}(id, call.st, call.label)
+	}
+	wg.Wait()
+	if _, ok := admitted.Load("r6"); ok {
+		t.Fatal("capped pipeline admitted concurrently")
+	}
+	if _, ok := admitted.Load("d1"); !ok {
+		t.Fatal("uncapped pipeline refused")
+	}
+	u, err := a.PipelineBudgetDay(ctx, at, "replies")
+	if err != nil || u.Calls != 2 || u.Tokens != 45 || u.Cost != 1 {
+		t.Fatalf("pipeline day %+v %v", u, err)
+	}
+}
+
+func TestUTCDayIsTheUTCCalendarDate(t *testing.T) {
+	berlin := time.FixedZone("CEST", 2*60*60)
+	if got := UTCDay(time.Date(2026, 10, 22, 1, 30, 0, 0, berlin)); got != "2026-10-21" {
+		t.Fatalf("01:30 CEST is still the 21st in UTC, got %s", got)
+	}
+}

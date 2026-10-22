@@ -10,6 +10,24 @@ Every engine model request passes this boundary, including intent classification
 
 `per_step_tokens` bounds the requested completion length together with the selected model's `max_tokens`. Daily and pipeline token totals count both input and output usage reported by the provider. Token limits and money caps stop further calls based on settled usage; an admitted call can cross a threshold because the final prompt usage and charge are only known afterward. A money cap is a stop threshold rather than a prepaid dollar reservation. Configure small completion limits to bound generation work.
 
+### Per-pipeline daily caps
+
+A pipeline can carry its own daily allowance so one pipeline cannot use the whole day's budget:
+
+```yaml
+pipelines:
+  - name: inbox-replies
+    schedule: 30m
+    budget:
+      per_day_tokens: 200000   # 0 or absent = no pipeline token cap
+      per_day_cost: 2.50       # 0 or absent = no pipeline cost cap
+    steps: [...]
+```
+
+The pipeline's usage is the sum of its model calls settled on the current UTC date, so it survives restarts and is shared by every run of that pipeline and every instance on the same database. The caps are checked at the same admission gate and in the same admission write as `per_day_tokens` and `per_day_cost`, with the same semantics: a call whose requested completion would cross the token cap is refused, calls are refused once settled spend has reached the cost cap, and a response that carries the total over the token cap is charged and stops the run. A refused call fails with `BUDGET_BLOCKED: pipeline "<name>" daily ... limit` and stops that run like the global caps do; other pipelines keep running. The global daily and per-run caps still apply to every call. `budgets.alert_at` thresholds also apply to each pipeline's caps, once per UTC day, pipeline and cap.
+
+`draftcat budget status` lists each capped pipeline's usage against its caps (`pipeline_caps` in `--json`, present when at least one pipeline has a cap). `draftcat validate` reports negative caps as errors and warns about a cap on a pipeline without ai steps.
+
 Provider response bodies have a 4 MiB limit. Unreadable, oversized, malformed, or invalid-usage responses stop processing. Rate-limit responses can retry within the configured retry count and request deadline. Transport errors and responses with uncertain billing do not automatically retry as another paid request.
 
 ## Inspect and reconcile uncertain usage

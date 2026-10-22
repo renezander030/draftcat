@@ -10,6 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
+	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
@@ -80,7 +83,7 @@ func runBudgetCmd(args []string) int {
 			return code
 		}
 		defer closeStore()
-		return printBudgetStatus(st, jsonOut)
+		return printBudgetStatus(st, jsonOut, pipelineCapsFromConfigFile(path))
 	}
 	// This administrative write requires an existing regular database. It must
 	// never turn a misspelled path into a fresh store with an empty spend ledger.
@@ -106,7 +109,48 @@ func runBudgetCmd(args []string) int {
 	return 0
 }
 
-func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
+// pipelineDayCap is one capped pipeline's settled usage today against its own
+// daily caps (0 = that cap is off).
+type pipelineDayCap struct {
+	Name         string  `json:"name"`
+	Calls        int     `json:"calls"`
+	Tokens       int     `json:"tokens"`
+	PerDayTokens int     `json:"per_day_tokens"`
+	Cost         float64 `json:"cost"`
+	PerDayCost   float64 `json:"per_day_cost"`
+	Reached      bool    `json:"reached"`
+}
+
+// pipelineCapsFromConfigFile lists the pipelines with a daily budget in config
+// order. An unreadable or unparsable config shows no pipeline caps.
+func pipelineCapsFromConfigFile(configPath string) []config.PipelineCap {
+	var cfg config.Config
+	// #nosec G304 -- configPath is the operator's own --config argument.
+	data, err := os.ReadFile(configPath)
+	if err != nil || yaml.Unmarshal(data, &cfg) != nil {
+		return nil
+	}
+	return cfg.CappedPipelines()
+}
+
+func pipelineDayCaps(caps []config.PipelineCap, byPipeline []statestore.UsageShare) []pipelineDayCap {
+	used := map[string]statestore.UsageShare{}
+	for _, u := range byPipeline {
+		used[u.Name] = u
+	}
+	var out []pipelineDayCap
+	for _, c := range caps {
+		u := used[c.Name]
+		out = append(out, pipelineDayCap{
+			Name: c.Name, Calls: u.Calls, Tokens: u.Tokens, PerDayTokens: c.Budget.PerDayTokens,
+			Cost: u.Cost, PerDayCost: c.Budget.PerDayCost,
+			Reached: (c.Budget.PerDayTokens > 0 && u.Tokens >= c.Budget.PerDayTokens) || (c.Budget.PerDayCost > 0 && u.Cost >= c.Budget.PerDayCost),
+		})
+	}
+	return out
+}
+
+func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.PipelineCap) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	now := time.Now().UTC()
@@ -130,6 +174,7 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 		fmt.Fprintf(os.Stderr, "budget: read usage by pipeline: %v\n", err)
 		return 1
 	}
+	capped := pipelineDayCaps(caps, byPipeline)
 	if jsonOut {
 		report := struct {
 			Day         string                         `json:"day"`
@@ -140,16 +185,18 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool) int {
 			Pending     []statestore.PendingBudgetCall `json:"pending_calls"`
 			ByModel     []statestore.UsageShare        `json:"by_model"`
 			ByPipeline  []statestore.UsageShare        `json:"by_pipeline"`
-		}{now.Format("2006-01-02"), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending, nonNilShares(byModel), nonNilShares(byPipeline)}
+			PipelineCap []pipelineDayCap               `json:"pipeline_caps,omitempty"`
+		}{statestore.UTCDay(now), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending, nonNilShares(byModel), nonNilShares(byPipeline), capped}
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
 			fmt.Fprintf(os.Stderr, "budget: output: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Printf("%s UTC: %d tokens, %.6f cost, %d voice calls, %d call minutes\n", now.Format("2006-01-02"), day.Tokens, day.Cost, day.Calls, day.CallMinutes)
+	fmt.Printf("%s UTC: %d tokens, %.6f cost, %d voice calls, %d call minutes\n", statestore.UTCDay(now), day.Tokens, day.Cost, day.Calls, day.CallMinutes)
 	printUsageShares("model", byModel)
 	printUsageShares("pipeline", byPipeline)
+	printPipelineCaps(capped)
 	for _, call := range pending {
 		fmt.Printf("Unsettled provider call %s (day %s, started %s)\n", call.CallID, call.Day, call.CreatedAt.Format(time.RFC3339))
 	}
@@ -179,5 +226,27 @@ func printUsageShares(by string, shares []statestore.UsageShare) {
 			name = "(unattributed)"
 		}
 		fmt.Printf("  %-40s %4d call(s) %9d tokens %12.6f cost\n", name, u.Calls, u.Tokens, u.Cost)
+	}
+}
+
+// printPipelineCaps lists each capped pipeline's usage today against its caps.
+func printPipelineCaps(caps []pipelineDayCap) {
+	if len(caps) == 0 {
+		return
+	}
+	fmt.Println("Pipeline daily caps:")
+	for _, c := range caps {
+		tokens, cost := "no cap", "no cap"
+		if c.PerDayTokens > 0 {
+			tokens = strconv.Itoa(c.PerDayTokens)
+		}
+		if c.PerDayCost > 0 {
+			cost = strconv.FormatFloat(c.PerDayCost, 'f', 6, 64)
+		}
+		line := fmt.Sprintf("  %-40s %9d of %s tokens %12.6f of %s cost", c.Name, c.Tokens, tokens, c.Cost, cost)
+		if c.Reached {
+			line += "  REACHED"
+		}
+		fmt.Println(line)
 	}
 }

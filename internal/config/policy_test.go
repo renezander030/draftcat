@@ -119,3 +119,19 @@ func TestToolRule_RiskOfDefaultsToNormal(t *testing.T) {
 		t.Fatalf("RiskOf(HIGH) = %q, want high", got)
 	}
 }
+
+func TestCappedPipelinesInConfigOrder(t *testing.T) {
+	cfg := &Config{Pipelines: []PipelineConfig{
+		{Name: "b", Budget: PipelineBudgetConfig{PerDayCost: 1}},
+		{Name: "free"},
+		{Name: "", Budget: PipelineBudgetConfig{PerDayTokens: 5}},
+		{Name: "a", Budget: PipelineBudgetConfig{PerDayTokens: 10}},
+	}}
+	got := cfg.CappedPipelines()
+	if len(got) != 2 || got[0].Name != "b" || got[1].Name != "a" || got[1].Budget.PerDayTokens != 10 {
+		t.Fatalf("capped pipelines: %+v", got)
+	}
+	if (*Config)(nil).CappedPipelines() != nil {
+		t.Fatal("nil config has no caps")
+	}
+}

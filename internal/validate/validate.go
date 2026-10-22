@@ -3,6 +3,7 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -300,7 +301,11 @@ func checkBudgetAlerts(cfg *config.Config, rep *validateReport) {
 		}
 		seen[f] = true
 	}
-	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 {
+	pipelineCaps := false
+	for _, p := range cfg.Pipelines {
+		pipelineCaps = pipelineCaps || p.Budget.Capped()
+	}
+	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 && !pipelineCaps {
 		rep.warnf("budgets.alert_at", "set per_day_tokens or per_day_cost; alerts are fractions of a daily cap")
 	}
 }
@@ -371,6 +376,15 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 			rep.errf(path+".pause_after_failures", "must be 0 (never pause) or a positive count, got %d", p.PauseAfterFailures)
 		} else if p.PauseAfterFailures > 0 && !schedule.IsTimer(p.Schedule) {
 			rep.warnf(path+".pause_after_failures", "applies to timer schedules only; schedule %q is never paused automatically", p.Schedule)
+		}
+
+		if len(p.InputSchema) > 0 {
+			for _, finding := range outputschema.Check(p.InputSchema) {
+				rep.errf(path+".input_schema."+finding.Field, "%s", finding.Message)
+			}
+			if p.Schedule != "webhook" {
+				rep.warnf(path+".input_schema", "applies to webhook pipelines only; schedule %q never receives a request body", p.Schedule)
+			}
 		}
 
 		aiSteps := 0
@@ -476,12 +490,30 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 			}
 		}
 
+		checkPipelineBudget(p, path, aiSteps, rep)
+
 		if cfg.Budgets.PerStepTokens > 0 && cfg.Budgets.PerPipelineTokens > 0 && aiSteps > 0 {
 			if cfg.Budgets.PerStepTokens*aiSteps > cfg.Budgets.PerPipelineTokens {
 				rep.warnf(path, "per_step_tokens × %d ai step(s) = %d exceeds per_pipeline_tokens = %d (pipeline may halt mid-run)",
 					aiSteps, cfg.Budgets.PerStepTokens*aiSteps, cfg.Budgets.PerPipelineTokens)
 			}
 		}
+	}
+}
+
+// checkPipelineBudget validates a pipeline's own daily caps. Negative or
+// non-finite caps are errors; a cap on a pipeline without ai steps is a warning
+// because no model call of that pipeline is admitted against it.
+func checkPipelineBudget(p config.PipelineConfig, path string, aiSteps int, rep *validateReport) {
+	b := p.Budget
+	if b.PerDayTokens < 0 {
+		rep.errf(path+".budget.per_day_tokens", "must be 0 (no cap) or a positive token count, got %d", b.PerDayTokens)
+	}
+	if b.PerDayCost < 0 || math.IsNaN(b.PerDayCost) || math.IsInf(b.PerDayCost, 0) {
+		rep.errf(path+".budget.per_day_cost", "must be 0 (no cap) or a positive amount, got %v", b.PerDayCost)
+	}
+	if b.Capped() && aiSteps == 0 {
+		rep.warnf(path+".budget", "pipeline has no ai steps; its daily budget never applies")
 	}
 }
 
@@ -674,7 +706,53 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.RememberApproval && strings.EqualFold(t.Risk, config.RiskHigh) {
 			rep.errf(p+".remember_approval", "tool %q is high risk — every call must be decided by a human", t.Name)
 		}
+		if t.AllowGrants && strings.EqualFold(t.Risk, config.RiskHigh) {
+			rep.errf(p+".allow_grants", "tool %q is high risk — every call must be decided by a human", t.Name)
+		}
+		if t.AllowGrants && !t.RequireApproval {
+			rep.warnf(p+".allow_grants", "tool %q never asks a human, so a grant never applies", t.Name)
+		}
+		if t.MaxCallsPerDay != nil && *t.MaxCallsPerDay < 1 {
+			rep.errf(p+".max_calls_per_day", "must be 1 or more (got %d) — leave a tool out of tool_gate.tools to refuse it", *t.MaxCallsPerDay)
+		}
 		checkArgConstraints(t, p, rep)
+	}
+	checkGateCallers(cfg.ToolGate, seen, rep)
+	if env := strings.TrimSpace(cfg.ToolGate.ExecutionGrant.SecretEnv); env != "" && os.Getenv(env) == "" {
+		rep.warnf("tool_gate.execution_grant.secret_env", "env var %s is empty — consumes return no execution grant", env)
+	}
+}
+
+// checkGateCallers validates the named callers. A caller tool that is not in
+// tool_gate.tools can never be allowed, and two callers sharing a token
+// variable could not be told apart.
+func checkGateCallers(gate config.ToolGateConfig, listed map[string]bool, rep *validateReport) {
+	if gate.RequireCaller && len(gate.Callers) == 0 {
+		rep.errf("tool_gate.require_caller", "no callers are configured — every gate request would be refused")
+	}
+	names, envs := map[string]bool{}, map[string]bool{}
+	for i, c := range gate.Callers {
+		p := fmt.Sprintf("tool_gate.callers[%d]", i)
+		if strings.TrimSpace(c.Name) == "" {
+			rep.errf(p+".name", "caller name is required")
+		} else if names[c.Name] {
+			rep.errf(p+".name", "duplicate caller %q", c.Name)
+		}
+		names[c.Name] = true
+		switch {
+		case strings.TrimSpace(c.TokenEnv) == "":
+			rep.errf(p+".token_env", "names the env var holding the caller's token; it is required")
+		case envs[c.TokenEnv]:
+			rep.errf(p+".token_env", "%s is already another caller's token", c.TokenEnv)
+		case os.Getenv(c.TokenEnv) == "":
+			rep.warnf(p+".token_env", "env var %s is empty — this caller cannot authenticate", c.TokenEnv)
+		}
+		envs[c.TokenEnv] = true
+		for j, tool := range c.Tools {
+			if !listed[tool] {
+				rep.warnf(fmt.Sprintf("%s.tools[%d]", p, j), "tool %q is not in tool_gate.tools, so the gate denies it anyway", tool)
+			}
+		}
 	}
 }
 
@@ -692,6 +770,9 @@ func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
 		ap := fmt.Sprintf("%s.args.%s", p, k)
 		if strings.TrimSpace(k) == "" {
 			rep.errf(ap, "argument name is required")
+		}
+		if strings.HasPrefix(k, "#") {
+			rep.errf(ap, "argument names starting with '#' are reserved for the gate's own counters")
 		}
 		if c.Empty() {
 			rep.errf(ap, "no condition — use equals, one_of, glob, regex, min, max, review_above or max_per_day")

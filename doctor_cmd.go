@@ -277,6 +277,13 @@ func doctorListeners(rep *doctorReport, cfg *config.Config) {
 		} else {
 			checkListen(rep, "webhook", addr)
 		}
+		if cfg.ToolGate.Enabled {
+			for _, c := range cfg.ToolGate.Callers {
+				if c.TokenEnv == "" || !envSet(c.TokenEnv) {
+					rep.add("tool gate", "warn", fmt.Sprintf("caller %s has no token: %s is empty", c.Name, orDash(c.TokenEnv)), "export the caller's token variable; until then that caller is refused")
+				}
+			}
+		}
 	}
 	if cfg.Observ.Prometheus.Enabled {
 		checkListen(rep, "metrics", firstNonEmpty(cfg.Observ.Prometheus.Addr, "127.0.0.1:9090"))

@@ -6,7 +6,9 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -14,25 +16,33 @@ import (
 )
 
 const gateUsage = `Usage:
-  draftcat gate check <tool> [--args JSON] [--spent arg=N]... [--config path] [--json]
+  draftcat gate check <tool> [--args JSON] [--spent arg=N]... [--calls N] [--config path] [--json]
   draftcat gate test <cases.yaml> [--config path] [--json]
+  draftcat gate verify-grant <grant> --tool <tool> [--args JSON] [--max-age 5m] [--config path] [--json]
 
-check   decide one call against tool_gate without running the engine
-test    decide every case in a file and fail when one differs from its expect
+check         decide one call against tool_gate without running the engine
+test          decide every case in a file and fail when one differs from its expect
+verify-grant  check an execution grant before running the tool: exit 0 valid, 1 not
 
 A decision is allow, deny, or ask (a human decides). --spent sets an
-argument's total already allowed today, for rules with max_per_day (default 0).
-Neither command reads or writes the state store.`
+argument's total already allowed today, for rules with max_per_day, and
+--calls the tool's calls already allowed today, for max_calls_per_day (both
+default 0). verify-grant reads the key named by
+tool_gate.execution_grant.secret_env. None of them reads or writes the state
+store.`
 
 // gateCase is one entry of a `draftcat gate test` file.
 type gateCase struct {
-	Name   string                 `yaml:"name" json:"name"`
-	Tool   string                 `yaml:"tool" json:"tool"`
-	Args   map[string]interface{} `yaml:"args" json:"args,omitempty"`
-	Spent  map[string]string      `yaml:"spent" json:"spent,omitempty"`
-	Expect string                 `yaml:"expect" json:"expect"`
+	Name  string                 `yaml:"name" json:"name"`
+	Tool  string                 `yaml:"tool" json:"tool"`
+	Args  map[string]interface{} `yaml:"args" json:"args,omitempty"`
+	Spent map[string]string      `yaml:"spent" json:"spent,omitempty"`
+	// Calls is how many calls of the tool were already allowed today, for
+	// max_calls_per_day.
+	Calls  int    `yaml:"calls" json:"calls,omitempty"`
+	Expect string `yaml:"expect" json:"expect"`
 	// Rule optionally pins the rule that decides (listed, not listed,
-	// args.<why>, max_per_day.<arg>), for a deny or allow.
+	// args.<why>, max_per_day.<arg>, max_calls_per_day), for a deny or allow.
 	Rule string `yaml:"rule" json:"rule,omitempty"`
 }
 
@@ -62,6 +72,8 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	sub, rest := args[0], args[1:]
 	configPath, asJSON, argsJSON := "config.yaml", false, ""
 	spent := map[string]string{}
+	calls := 0
+	tool, maxAge := "", time.Duration(0)
 	var positional []string
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
@@ -97,6 +109,34 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			spent[strings.TrimSpace(name)] = strings.TrimSpace(amount)
+		case "--calls":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n < 0 {
+				_, _ = fmt.Fprintf(stderr, "gate: --calls wants a count of 0 or more (got %q)\n", v)
+				return 2
+			}
+			calls = n
+		case "--tool":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			tool = v
+		case "--max-age":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 {
+				_, _ = fmt.Fprintf(stderr, "gate: --max-age wants a duration like 5m (got %q)\n", v)
+				return 2
+			}
+			maxAge = d
 		case "--json":
 			asJSON = true
 		default:
@@ -119,7 +159,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 
 	switch sub {
 	case "check":
-		c := gateCase{Tool: positional[0], Spent: spent}
+		c := gateCase{Tool: positional[0], Spent: spent, Calls: calls}
 		if argsJSON != "" {
 			if err := decodeStrictJSON([]byte(argsJSON), &c.Args); err != nil {
 				_, _ = fmt.Fprintf(stderr, "gate: --args is not a JSON object: %v\n", err)
@@ -134,8 +174,8 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 		printGateResults(stdout, []gateResult{r}, asJSON)
 		return 0
 	case "test":
-		if argsJSON != "" || len(spent) > 0 {
-			_, _ = fmt.Fprintln(stderr, "gate: --args and --spent belong to check; test reads them from the file")
+		if argsJSON != "" || len(spent) > 0 || calls > 0 {
+			_, _ = fmt.Fprintln(stderr, "gate: --args, --spent and --calls belong to check; test reads them from the file")
 			return 2
 		}
 		// #nosec G304 -- the operator's own cases file.
@@ -193,6 +233,42 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "verify-grant":
+		if tool == "" {
+			_, _ = fmt.Fprintln(stderr, "gate: verify-grant needs --tool")
+			return 2
+		}
+		var args map[string]interface{}
+		if argsJSON != "" {
+			if err := decodeStrictJSON([]byte(argsJSON), &args); err != nil {
+				_, _ = fmt.Fprintf(stderr, "gate: --args is not a JSON object: %v\n", err)
+				return 2
+			}
+		}
+		key := cfg.ToolGate.ExecutionGrant.Secret()
+		if len(key) == 0 {
+			_, _ = fmt.Fprintln(stderr, "gate: tool_gate.execution_grant.secret_env is not set or its variable is empty")
+			return 2
+		}
+		g, err := verifyExecutionGrant(key, positional[0], tool, args, maxAge, time.Now())
+		switch {
+		case asJSON:
+			out := map[string]interface{}{"valid": err == nil, "grant": g}
+			if err != nil {
+				out["problem"] = err.Error()
+			}
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(out)
+		case err == nil:
+			_, _ = fmt.Fprintf(stdout, "VALID  %s\n  action: %s\n  consumed: %s\n", g.Tool, g.ActionID, g.ConsumedAt)
+		default:
+			_, _ = fmt.Fprintf(stdout, "INVALID  %s\n  problem: %v\n", tool, err)
+		}
+		if err != nil {
+			return 1
+		}
+		return 0
 	default:
 		_, _ = fmt.Fprintf(stderr, "gate: unknown command %q\n%s\n", sub, gateUsage)
 		return 2
@@ -228,6 +304,10 @@ func decideGateCase(gate config.ToolGateConfig, c gateCase) (gateResult, error) 
 		}
 		totals[arg] = v
 	}
+	if c.Calls < 0 {
+		return gateResult{}, fmt.Errorf("calls %d is not a count of 0 or more", c.Calls)
+	}
+	totals[config.CallCountKey] = big.NewRat(int64(c.Calls), 1)
 	args := normalizeGateArgs(c.Args)
 	v, err := evaluateToolPolicy(gate, c.Tool, args, func(_, arg string) (*big.Rat, error) {
 		if t, ok := totals[arg]; ok {

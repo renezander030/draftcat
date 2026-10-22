@@ -41,7 +41,7 @@ func printZKReceiptUsage() {
 }
 
 func approvalSecret() ([]byte, error) {
-	secret := []byte(os.Getenv("DRAFTCAT_APPROVAL_SECRET"))
+	secret := receiptSigningKey()
 	if len(secret) < 32 {
 		return nil, fmt.Errorf("DRAFTCAT_APPROVAL_SECRET must be set and at least 32 bytes")
 	}

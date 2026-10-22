@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -297,9 +298,10 @@ type BudgetConfig struct {
 	// step. Pair with per_step_tokens to bound that overshoot.
 	PerDayCost      float64 `yaml:"per_day_cost"`
 	PerPipelineCost float64 `yaml:"per_pipeline_cost"`
-	// AlertAt lists fractions of the daily caps (per_day_tokens, per_day_cost)
-	// at which the operator channel is notified, e.g. [0.5, 0.8, 0.95]. Each
-	// threshold notifies once per UTC day and cap, also across restarts.
+	// AlertAt lists fractions of the daily caps (per_day_tokens, per_day_cost,
+	// and each pipeline's budget caps) at which the operator channel is
+	// notified, e.g. [0.5, 0.8, 0.95]. Each threshold notifies once per UTC day
+	// and cap, also across restarts.
 	// Empty = no early warnings.
 	AlertAt []float64 `yaml:"alert_at"`
 }
@@ -410,8 +412,64 @@ type PipelineConfig struct {
 	// PauseAfterFailures pauses a timer-scheduled pipeline after this many
 	// consecutive failed runs and tells the operator once. 0 = never pause.
 	// /cron resume clears the count.
-	PauseAfterFailures int          `yaml:"pause_after_failures"`
-	Steps              []StepConfig `yaml:"steps"`
+	PauseAfterFailures int `yaml:"pause_after_failures"`
+	// Budget caps this pipeline's own share of the UTC day, on top of the
+	// global budgets. Zero or absent = no pipeline cap.
+	Budget PipelineBudgetConfig `yaml:"budget"`
+	// InputSchema checks the request body of a webhook pipeline before a run
+	// is admitted: the body must be one JSON object meeting the same flat
+	// field schema as a step's output_schema. Empty = the body is not checked.
+	InputSchema outputschema.Schema `yaml:"input_schema"`
+	Steps       []StepConfig        `yaml:"steps"`
+}
+
+// PipelineBudgetConfig is one pipeline's daily allowance of model usage. It is
+// counted from the model calls attributed to the pipeline on the current UTC
+// date and enforced at the same admission gate as budgets.per_day_tokens and
+// budgets.per_day_cost, with the same semantics: a token cap refuses a call
+// whose requested completion would cross it, a cost cap refuses calls once
+// settled spend has reached it. 0 = no cap.
+type PipelineBudgetConfig struct {
+	PerDayTokens int     `yaml:"per_day_tokens"`
+	PerDayCost   float64 `yaml:"per_day_cost"`
+}
+
+// Capped reports whether either daily cap is set.
+func (b PipelineBudgetConfig) Capped() bool { return b.PerDayTokens > 0 || b.PerDayCost > 0 }
+
+// PipelineCap is one named pipeline's daily budget.
+type PipelineCap struct {
+	Name   string
+	Budget PipelineBudgetConfig
+}
+
+// CappedPipelines lists the named pipelines that set a daily budget, in config
+// order.
+func (c *Config) CappedPipelines() []PipelineCap {
+	if c == nil {
+		return nil
+	}
+	var out []PipelineCap
+	for _, p := range c.Pipelines {
+		if p.Name != "" && p.Budget.Capped() {
+			out = append(out, PipelineCap{Name: p.Name, Budget: p.Budget})
+		}
+	}
+	return out
+}
+
+// PipelineBudget returns the daily caps of the named pipeline, zero when the
+// pipeline is unknown or uncapped.
+func (c *Config) PipelineBudget(name string) PipelineBudgetConfig {
+	if c == nil || name == "" {
+		return PipelineBudgetConfig{}
+	}
+	for _, p := range c.Pipelines {
+		if p.Name == name {
+			return p.Budget
+		}
+	}
+	return PipelineBudgetConfig{}
 }
 
 type StepConfig struct {
@@ -579,6 +637,55 @@ type ToolGateConfig struct {
 	// NotifyOutcomes tells the operator channel when a harness reports what
 	// an allowed action did: "off" (default), "failed", or "all".
 	NotifyOutcomes string `yaml:"notify_outcomes"`
+	// Callers gives each agent harness its own bearer token. A request that
+	// presents one is made as that caller: the token fixes its agent name, it
+	// may call only the tools it lists, and it reaches only its own actions.
+	// The webhook token keeps working for every tool unless RequireCaller.
+	Callers []GateCaller `yaml:"callers"`
+	// RequireCaller refuses the webhook token on the gate, so every call is
+	// made under a caller's own token.
+	RequireCaller bool `yaml:"require_caller"`
+	// ExecutionGrant adds a signed grant to every successful consume, which
+	// the tool checks before it acts.
+	ExecutionGrant ExecutionGrantConfig `yaml:"execution_grant"`
+}
+
+// ExecutionGrantConfig names the key execution grants are signed with. The
+// tool that verifies a grant holds the same key.
+type ExecutionGrantConfig struct {
+	SecretEnv string `yaml:"secret_env"`
+}
+
+// Secret returns the signing key, or nil when execution grants are off.
+func (e ExecutionGrantConfig) Secret() []byte {
+	if strings.TrimSpace(e.SecretEnv) == "" {
+		return nil
+	}
+	return []byte(os.Getenv(e.SecretEnv))
+}
+
+// GateCaller is one named harness allowed to use the tool-call gate.
+type GateCaller struct {
+	// Name is the agent name the gate records for this caller.
+	Name string `yaml:"name"`
+	// TokenEnv names the env var holding the caller's bearer token.
+	TokenEnv string `yaml:"token_env"`
+	// Tools limits the caller to these tool names. Empty = every listed tool.
+	Tools []string `yaml:"tools"`
+}
+
+// Allows reports whether the caller may ask about this tool. The tool still
+// has to be in tool_gate.tools.
+func (c GateCaller) Allows(tool string) bool {
+	if len(c.Tools) == 0 {
+		return true
+	}
+	for _, t := range c.Tools {
+		if t == tool {
+			return true
+		}
+	}
+	return false
 }
 
 // NotifyOutcomesMode normalizes notify_outcomes; empty or unknown is off.
@@ -648,7 +755,27 @@ type ToolRule struct {
 	// asking again. Off by default: approving one send does not approve the
 	// next, because the next one has the same side effect.
 	RememberApproval bool `yaml:"remember_approval"`
+	// MaxCallsPerDay caps how many calls of this tool the gate allows in one
+	// UTC day. A call counts from the moment it is allowed, consumed or not,
+	// like a max_per_day total; a call past the cap is handled like a mismatch
+	// (on_mismatch). Omitted = no count cap.
+	MaxCallsPerDay *int `yaml:"max_calls_per_day" json:",omitempty"`
+	// AllowGrants lets an operator issue a standing grant for this tool: for a
+	// set time and number of calls, a call the rule would ask about only
+	// because it requires approval is released on the operator's earlier word.
+	// Calls outside the arguments or past a daily total still go to a human.
+	// Never on a high-risk tool.
+	AllowGrants bool `yaml:"allow_grants" json:",omitempty"`
 }
+
+// Grantable reports whether an operator may issue a standing grant for the
+// tool: the rule allows grants and the tool is not high risk.
+func (t ToolRule) Grantable() bool { return t.AllowGrants && t.RiskOf() != RiskHigh }
+
+// CallCountKey is the running-total key the gate counts allowed calls under
+// for max_calls_per_day. It cannot collide with an argument name: validate
+// refuses argument names that start with '#'.
+const CallCountKey = "#calls"
 
 // ArgConstraint is one condition on one argument. Every non-empty field must
 // hold. Values are compared in their string form (JSON number spelling is retained,
@@ -846,7 +973,16 @@ func (t ToolRule) CappedAmounts(args map[string]interface{}) map[string]string {
 			amounts[k] = n.RatString()
 		}
 	}
+	if t.MaxCallsPerDay != nil {
+		amounts[CallCountKey] = "1"
+	}
 	return amounts
+}
+
+// Capped reports whether the rule keeps a running daily total: an argument
+// with max_per_day, or max_calls_per_day.
+func (t ToolRule) Capped() bool {
+	return t.MaxCallsPerDay != nil || len(t.DailyCaps()) > 0
 }
 
 // DailyCapReading is what max_per_day says about one call: a line per capped
@@ -855,7 +991,10 @@ func (t ToolRule) CappedAmounts(args map[string]interface{}) map[string]string {
 type DailyCapReading struct {
 	Totals  []string
 	OverArg string
-	Why     string
+	// Rule names the cap the call would pass: max_per_day.<arg> or
+	// max_calls_per_day.
+	Rule string
+	Why  string
 }
 
 // ReadDailyCaps checks each capped argument the call carries against today's
@@ -880,11 +1019,23 @@ func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg stri
 		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, decimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
 		after := new(big.Rat).Add(total, amount)
 		if r.OverArg == "" && after.Cmp(exactBound(limit)) > 0 {
-			r.OverArg = arg
+			r.OverArg, r.Rule = arg, "max_per_day."+arg
 			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, decimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
 			if t.DeniesOnMismatch() {
-				break
+				return r, nil
 			}
+		}
+	}
+	if t.MaxCallsPerDay != nil {
+		calls, err := spent(CallCountKey)
+		if err != nil {
+			return DailyCapReading{}, err
+		}
+		limit := *t.MaxCallsPerDay
+		r.Totals = append(r.Totals, fmt.Sprintf("calls: %s allowed today, max_calls_per_day %d", decimalString(calls), limit))
+		if r.OverArg == "" && new(big.Rat).Add(calls, big.NewRat(1, 1)).Cmp(big.NewRat(int64(limit), 1)) > 0 {
+			r.OverArg, r.Rule = CallCountKey, "max_calls_per_day"
+			r.Why = fmt.Sprintf("calls: %s already allowed today, max_calls_per_day %d", decimalString(calls), limit)
 		}
 	}
 	return r, nil

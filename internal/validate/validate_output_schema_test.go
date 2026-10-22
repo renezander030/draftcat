@@ -34,3 +34,35 @@ func TestSkillOutputSchemaErrorsBeforeRun(t *testing.T) {
 		t.Fatalf("bad skill schema didn't return ordered startup errors: %+v", rep.Findings)
 	}
 }
+
+func TestInputSchemaErrorsBeforeRun(t *testing.T) {
+	cfg := &config.Config{Pipelines: []config.PipelineConfig{{
+		Name: "p", Schedule: "webhook", Steps: []config.StepConfig{{Name: "fetch", Type: "deterministic"}},
+		InputSchema: map[string]interface{}{"amount": map[string]interface{}{"type": "string", "min": 1}},
+	}}}
+	errs := findingsAt(runCheckPipelines(cfg), "error", "input_schema.amount")
+	if len(errs) != 1 || !strings.Contains(errs[0].Message, "min/max require") {
+		t.Fatalf("bad input_schema didn't fail validation: %+v", errs)
+	}
+}
+
+func TestInputSchemaWarnsOutsideWebhookPipelines(t *testing.T) {
+	schema := map[string]interface{}{"amount": map[string]interface{}{"type": "int"}}
+	for _, sched := range []string{"manual", "1h"} {
+		cfg := &config.Config{Pipelines: []config.PipelineConfig{{
+			Name: "p", Schedule: sched, InputSchema: schema,
+			Steps: []config.StepConfig{{Name: "fetch", Type: "deterministic"}},
+		}}}
+		if len(findingsAt(runCheckPipelines(cfg), "warn", ".input_schema")) != 1 {
+			t.Errorf("%s: input_schema on a non-webhook pipeline did not warn", sched)
+		}
+	}
+	cfg := &config.Config{Pipelines: []config.PipelineConfig{{
+		Name: "p", Schedule: "webhook", InputSchema: schema,
+		Steps: []config.StepConfig{{Name: "fetch", Type: "deterministic"}},
+	}}}
+	rep := runCheckPipelines(cfg)
+	if f := append(findingsAt(rep, "error", ".input_schema"), findingsAt(rep, "warn", ".input_schema")...); len(f) != 0 {
+		t.Errorf("valid webhook input_schema reported findings: %+v", f)
+	}
+}

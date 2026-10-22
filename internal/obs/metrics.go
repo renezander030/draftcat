@@ -41,6 +41,10 @@ func (c *counterVec) render(sb *strings.Builder) {
 	sb.WriteString("# HELP " + c.name + " " + c.help + "\n")
 	sb.WriteString("# TYPE " + c.name + " counter\n")
 	for _, k := range sortedKeys(c.vals) {
+		if k == "" {
+			sb.WriteString(c.name + " " + formatNum(c.vals[k]) + "\n")
+			continue
+		}
 		sb.WriteString(c.name + "{" + k + "} " + formatNum(c.vals[k]) + "\n")
 	}
 }
@@ -105,6 +109,7 @@ type registry struct {
 	aiTokens     *counterVec
 	aiCost       *counterVec
 	approvals    *counterVec
+	otlpDropped  *counterVec
 }
 
 func newRegistry() *registry {
@@ -116,6 +121,7 @@ func newRegistry() *registry {
 		aiTokens:     newCounter("draftcat_ai_tokens_total", "Total AI tokens consumed."),
 		aiCost:       newCounter("draftcat_ai_cost_usd_total", "Total AI cost in USD."),
 		approvals:    newCounter("draftcat_approvals_total", "Total approval decisions by outcome."),
+		otlpDropped:  newCounter("draftcat_otlp_exports_dropped_total", "Total OTLP span exports that failed and were dropped."),
 	}
 }
 
@@ -139,6 +145,7 @@ func resetMetrics() {
 	reg.aiTokens = fresh.aiTokens
 	reg.aiCost = fresh.aiCost
 	reg.approvals = fresh.approvals
+	reg.otlpDropped = fresh.otlpDropped
 }
 
 // RecordPipeline records a completed pipeline run. Pure registry update — always
@@ -181,6 +188,14 @@ func RecordApproval(pipeline, step, decision string) {
 	reg.approvals.add(lbl, 1)
 }
 
+// recordOTLPDropped counts one span export the OTLP exporter gave up on. The
+// series carries no labels: the failure reason stays in the log line.
+func recordOTLPDropped() {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.otlpDropped.add("", 1)
+}
+
 // WriteMetrics renders the full text exposition to w.
 func WriteMetrics(w io.Writer) error {
 	reg.mu.Lock()
@@ -192,6 +207,7 @@ func WriteMetrics(w io.Writer) error {
 	reg.aiTokens.render(&sb)
 	reg.aiCost.render(&sb)
 	reg.approvals.render(&sb)
+	reg.otlpDropped.render(&sb)
 	reg.mu.Unlock()
 	renderGauges(&sb)
 	_, err := io.WriteString(w, sb.String())

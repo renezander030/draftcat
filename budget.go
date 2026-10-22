@@ -31,7 +31,10 @@ type BudgetTracker struct {
 	dayCostLimit       float64
 	pipelineCostLimit  float64
 	pipelineTokenLimit int
-	alerts             *budgetAlerts
+	// pipelineUsage holds today's settled model usage per pipeline name for
+	// the pipelines' own daily caps. The store is authoritative when attached.
+	pipelineUsage map[string]statestore.UsageShare
+	alerts        *budgetAlerts
 }
 
 func (b *BudgetTracker) root() *BudgetTracker {
@@ -60,11 +63,12 @@ func (b *BudgetTracker) attachStore(store *statestore.StateStore) error {
 func (b *BudgetTracker) refreshLocked(now time.Time) {
 	r := b.root()
 	now = now.UTC()
-	if r.dayStart.UTC().Format("2006-01-02") != now.Format("2006-01-02") {
+	if statestore.UTCDay(r.dayStart) != statestore.UTCDay(now) {
 		r.tokensUsedToday = 0
 		r.costToday = 0
 		r.callsToday = 0
 		r.callMinutesToday = 0
+		r.pipelineUsage = nil
 		r.dayStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	}
 	if r.store != nil {
@@ -263,9 +267,16 @@ func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested
 	if err := b.checkLocked(cfg.Budgets.PerDayTokens, requested, r.dayCostLimit, pipelineCost); err != nil {
 		return "", err
 	}
+	pipeline := pipelineFromContext(ctx)
+	caps := cfg.PipelineBudget(pipeline)
+	if caps.Capped() {
+		if err := b.checkPipelineDayLocked(ctx, pipeline, caps, requested); err != nil {
+			return "", err
+		}
+	}
 	id := newRunID(time.Now())
 	if r.store != nil {
-		label := statestore.UsageLabel{Model: model, Pipeline: pipelineFromContext(ctx)}
+		label := statestore.UsageLabel{Model: model, Pipeline: pipeline, PipelineDayTokens: caps.PerDayTokens, PipelineDayCost: caps.PerDayCost}
 		if err := r.store.BeginBudgetCall(ctx, id, time.Now(), requested, cfg.Budgets.PerDayTokens, r.dayCostLimit, label); err != nil {
 			return "", err
 		}
@@ -274,7 +285,68 @@ func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested
 	return id, nil
 }
 
-func (b *BudgetTracker) finish(id string, resp *CompletionResponse, callErr error, cfg *config.Config) error {
+// checkPipelineDayLocked applies one pipeline's daily caps before admission,
+// so a refusal names the cap. The admission insert repeats the same checks
+// atomically against the store.
+func (b *BudgetTracker) checkPipelineDayLocked(ctx context.Context, pipeline string, caps config.PipelineBudgetConfig, requested int) error {
+	r := b.root()
+	if caps.PerDayTokens < 0 || !validCost(caps.PerDayCost) {
+		return fmt.Errorf("BUDGET_BLOCKED: invalid budget limits for pipeline %q", pipeline)
+	}
+	used := r.pipelineUsage[pipeline]
+	if r.store != nil {
+		u, err := r.store.PipelineBudgetDay(ctx, time.Now(), pipeline)
+		if err != nil {
+			r.stateErr = err
+			return fmt.Errorf("BUDGET_BLOCKED: usage ledger unavailable: %w", err)
+		}
+		used = u
+		b.setPipelineUsageLocked(u)
+	}
+	if caps.PerDayTokens > 0 && requested > caps.PerDayTokens-used.Tokens {
+		return fmt.Errorf("BUDGET_BLOCKED: pipeline %q daily token limit %d would be exceeded (used: %d, requested: %d)", pipeline, caps.PerDayTokens, used.Tokens, requested)
+	}
+	if caps.PerDayCost > 0 && used.Cost >= caps.PerDayCost {
+		return fmt.Errorf("BUDGET_BLOCKED: pipeline %q daily cost limit %.4f reached (spent: %.4f)", pipeline, caps.PerDayCost, used.Cost)
+	}
+	return nil
+}
+
+func (b *BudgetTracker) setPipelineUsageLocked(u statestore.UsageShare) {
+	r := b.root()
+	if r.pipelineUsage == nil {
+		r.pipelineUsage = map[string]statestore.UsageShare{}
+	}
+	r.pipelineUsage[u.Name] = u
+}
+
+// recordPipelineLocked adds a settled call to its pipeline's daily total and
+// reports whether the response carried that total over the pipeline's token cap.
+func (b *BudgetTracker) recordPipelineLocked(pipeline string, caps config.PipelineBudgetConfig, tokens int, cost float64) error {
+	r := b.root()
+	if pipeline == "" {
+		return nil
+	}
+	u := r.pipelineUsage[pipeline]
+	u.Name = pipeline
+	if tokens > int(^uint(0)>>1)-u.Tokens || !validCost(u.Cost+cost) {
+		r.stateErr = fmt.Errorf("invalid provider usage")
+		return fmt.Errorf("BUDGET_BLOCKED: %w", r.stateErr)
+	}
+	u.Calls++
+	u.Tokens += tokens
+	u.Cost += cost
+	b.setPipelineUsageLocked(u)
+	if r.alerts != nil {
+		r.alerts.observePipelineLocked(r, u)
+	}
+	if caps.PerDayTokens > 0 && u.Tokens > caps.PerDayTokens {
+		return fmt.Errorf("BUDGET_BLOCKED: response exceeded pipeline %q daily token limit %d (used: %d)", pipeline, caps.PerDayTokens, u.Tokens)
+	}
+	return nil
+}
+
+func (b *BudgetTracker) finish(id, pipeline string, resp *CompletionResponse, callErr error, cfg *config.Config) error {
 	r := b.root()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -296,13 +368,14 @@ func (b *BudgetTracker) finish(id string, resp *CompletionResponse, callErr erro
 		if r.stateErr != nil {
 			return fmt.Errorf("BUDGET_BLOCKED: %w", r.stateErr)
 		}
+		pipelineErr := b.recordPipelineLocked(pipeline, cfg.PipelineBudget(pipeline), tokens, resp.CostUSD)
 		if cfg.Budgets.PerDayTokens > 0 && r.tokensUsedToday > cfg.Budgets.PerDayTokens {
 			return fmt.Errorf("BUDGET_BLOCKED: response exceeded daily token limit %d (used: %d)", cfg.Budgets.PerDayTokens, r.tokensUsedToday)
 		}
 		if b.pipelineTokenLimit > 0 && b.tokensUsedPipeline > b.pipelineTokenLimit {
 			return fmt.Errorf("BUDGET_BLOCKED: response exceeded per-pipeline token limit %d (used: %d)", b.pipelineTokenLimit, b.tokensUsedPipeline)
 		}
-		return nil
+		return pipelineErr
 	}
 	if !uncertainProviderError(callErr) {
 		if r.store != nil {
