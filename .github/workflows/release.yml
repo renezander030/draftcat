@@ -142,7 +142,6 @@ jobs:
         run: |
           node npm/install.js
           test "$(node npm/draftcat.js --version)" = "draftcat ${GITHUB_REF_NAME#v}"
+      # npm trusts this workflow (trusted publishing): the job proves itself with its OIDC token, no npm token
       - name: Publish npm package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance

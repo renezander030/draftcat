@@ -12,7 +12,7 @@ The workflow runs lean and voice tests, validates the configuration, tests the n
 
 The npm job has `id-token: write` and runs on a GitHub-hosted runner with Node 24. For trusted publishing, the `draftcat` package settings on npm must authorize GitHub owner `renezander030`, repository `draftcat`, workflow filename `release.yml`, and direct `npm publish`. No GitHub environment is configured in this job. npm requires CLI 11.5.1 or newer for this route. See the [npm trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/).
 
-The workflow also accepts a configured `NPM_TOKEN` repository secret as a token fallback. A successful build or GitHub release does not establish npm publication: inspect the npm job separately. If it fails with `ENEEDAUTH`, verify the exact package-side trusted publisher settings or use an authenticated maintainer account. Do not publish a second copy when the version already exists.
+The workflow holds no npm token. A successful build or GitHub release does not establish npm publication: inspect the npm job separately. If it fails with `ENEEDAUTH`, verify the exact package-side trusted publisher settings or use an authenticated maintainer account. Do not publish a second copy when the version already exists.
 
 ## Verify the published version
 
