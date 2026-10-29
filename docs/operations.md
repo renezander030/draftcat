@@ -187,6 +187,35 @@ By pipeline:
 
 Calls settled before this attribution existed are listed as `(unattributed)`.
 
+## Digest
+
+```yaml
+telegram:
+  digest:
+    at: "08:00"            # HH:MM, 24-hour
+    timezone: Europe/Berlin   # IANA zone; empty = the engine's local zone
+```
+
+Once a day at that time the operator channel receives one message with only
+what needs a person:
+
+- approvals waiting for more than 1 hour: the count and the five oldest, each
+  as pipeline / step (a tool-gate approval shows the tool as the step);
+- the tool gate [freeze](tool-gate.md#freeze), when it is on;
+- tool outcomes reported `failed` in the last 24 hours: the count.
+
+When none of these exists no message is sent, so the digest stays silent on a
+quiet day. A day counts as handled once the digest was sent or found nothing
+to say; the date is kept in the state store (the `operator_digest` table), so
+a restart on the same day does not send it again. A send that fails is retried
+after a minute. An engine that starts after the time sends the day's digest at
+its first check.
+
+`telegram.digest` is optional; absent means no digest. It sits under
+`telegram`, which is restart-only: a reload that changes it reports that a
+restart is needed. `draftcat validate` rejects a time that is not `HH:MM` and
+an unknown zone.
+
 ## Metrics
 
 With `observability.prometheus.enabled`, `/metrics` adds current-state gauges

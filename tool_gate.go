@@ -64,6 +64,11 @@ type ToolCallRequest struct {
 	// Args are the exact arguments the harness intends to call with. They are
 	// hashed into the approval record, never stored raw.
 	Args map[string]interface{} `json:"args"`
+	// Definition optionally carries the tool's definition as the harness
+	// exposes it to the model (name, description, input schema, annotations).
+	// A rule with definition_sha256 compares its canonical hash; any other
+	// rule ignores it.
+	Definition map[string]interface{} `json:"definition,omitempty"`
 	// RunID optionally ties the call to a pipeline run for the audit trail.
 	RunID string `json:"run_id"`
 	// Agent names the caller, for the operator's benefit.
@@ -341,7 +346,10 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	}
 	var verdict toolPolicyVerdict
 	var err error
-	if caller != nil && !caller.Allows(req.Tool) {
+	if frozen, why := g.frozen(); frozen {
+		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
+		verdict = freezeVerdict(why)
+	} else if caller != nil && !caller.Allows(req.Tool) {
 		verdict = callerDenial(caller, req.Tool)
 	} else {
 		verdict, err = g.decidePolicy(req, rule, listed)
@@ -580,6 +588,14 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
+	// A frozen gate refuses the permit like a denied one. The permit itself is
+	// untouched, so it can be consumed again once the freeze is lifted.
+	if frozen, why := g.frozen(); frozen {
+		resp.Permit, resp.Consume = "", ""
+		resp.Decision, resp.Rule, resp.Reason = "deny", freezeRule, why
+		writeToolDecision(w, http.StatusConflict, resp)
+		return
+	}
 	a, err := state.ToolAction(id)
 	if err != nil {
 		writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
@@ -798,7 +814,7 @@ func (g *toolGate) decidePolicy(req ToolCallRequest, rule config.ToolRule, liste
 			}
 		}
 	}
-	return evaluateToolPolicy(g.cfg.ToolGate, req.Tool, req.Args, func(tool, arg string) (*big.Rat, error) {
+	return evaluateToolPolicy(g.cfg.ToolGate, req.Tool, req.Args, req.Definition, func(tool, arg string) (*big.Rat, error) {
 		return state.ToolArgTotal(tool, arg, day)
 	})
 }

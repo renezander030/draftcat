@@ -61,6 +61,19 @@ func Parse(spec, tz string) (Schedule, error) {
 	return Schedule{spec: spec, cron: c, loc: loc}, nil
 }
 
+// ParseDaily parses a once-a-day wall-clock time, "HH:MM" (24-hour), in the
+// IANA zone tz (empty = the process's local zone), as a calendar schedule.
+func ParseDaily(at, tz string) (Schedule, error) {
+	at = strings.TrimSpace(at)
+	hh, mm, ok := strings.Cut(at, ":")
+	h, herr := strconv.Atoi(hh)
+	m, merr := strconv.Atoi(mm)
+	if !ok || herr != nil || merr != nil || len(hh) != 2 || len(mm) != 2 || h < 0 || h > 23 || m < 0 || m > 59 {
+		return Schedule{}, fmt.Errorf("invalid time %q: use HH:MM, for example 08:00", at)
+	}
+	return Parse(fmt.Sprintf("%d %d * * *", m, h), tz)
+}
+
 // String returns the schedule as written.
 func (s Schedule) String() string { return s.spec }
 

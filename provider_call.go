@@ -97,7 +97,7 @@ func callLLM(ctx context.Context, cfg *config.Config, role, prompt string, track
 				return nil, fmt.Errorf("budget admission canceled: %w", err)
 			}
 			defer b.release()
-			id, err := b.admit(ctx, cfg, maxTokens, model.Model)
+			id, err := b.admit(ctx, cfg, maxTokens, model.Model, model.WorstCaseCost(len(prompt), maxTokens))
 			if err != nil {
 				return nil, err
 			}

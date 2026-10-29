@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -217,5 +218,57 @@ func TestUTCDayIsTheUTCCalendarDate(t *testing.T) {
 	berlin := time.FixedZone("CEST", 2*60*60)
 	if got := UTCDay(time.Date(2026, 10, 22, 1, 30, 0, 0, berlin)); got != "2026-10-21" {
 		t.Fatalf("01:30 CEST is still the 21st in UTC, got %s", got)
+	}
+}
+
+// A pending reservation lives in the store: it survives a reopen, still
+// blocks the next call, and is replaced by the actual cost on settlement.
+func TestBudgetReservationSurvivesReopenAndSettlementReplacesIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget.db")
+	ctx := context.Background()
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	st, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddBudgetUsage(ctx, at, 0, .95, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BeginBudgetCall(ctx, "r1", at, 1, 0, 2, UsageLabel{ReserveCost: .5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BeginBudgetCall(ctx, "r2", at, 1, 0, 1, UsageLabel{ReserveCost: .05}); err == nil || !strings.Contains(err.Error(), "BUDGET_BLOCKED") {
+		t.Fatalf("second call during a pending reservation: %v", err)
+	}
+	_ = st.Close()
+
+	st, err = OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var reserved float64
+	if err := st.db.QueryRowContext(ctx, `SELECT reserved_cost FROM budget_calls WHERE call_id='r1' AND status='pending'`).Scan(&reserved); err != nil || reserved != .5 {
+		t.Fatalf("pending reservation after reopen: %v %v", reserved, err)
+	}
+	if err := st.BeginBudgetCall(ctx, "r3", at, 1, 0, 2, UsageLabel{ReserveCost: .1}); err == nil {
+		t.Fatal("pending call forgotten after reopen")
+	}
+	if err := st.SettleBudgetCall(ctx, "r1", 2, .01); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT reserved_cost FROM budget_calls WHERE call_id='r1'`).Scan(&reserved); err != nil || reserved != 0 {
+		t.Fatalf("reservation after settlement: %v %v", reserved, err)
+	}
+	d, err := st.BudgetDay(ctx, at)
+	if err != nil || math.Abs(d.Cost-.96) > 1e-9 {
+		t.Fatalf("day after settlement: %+v %v", d, err)
+	}
+	// Settled .96: a worst case of .05 does not fit under 1.0, .04 does.
+	if err := st.BeginBudgetCall(ctx, "r4", at, 1, 0, 1, UsageLabel{ReserveCost: .05}); err == nil {
+		t.Fatal("0.96 settled + 0.05 admitted under 1.0")
+	}
+	if err := st.BeginBudgetCall(ctx, "r5", at, 1, 0, 1, UsageLabel{ReserveCost: .04}); err != nil {
+		t.Fatalf("0.96 settled + 0.04 refused under 1.0: %v", err)
 	}
 }

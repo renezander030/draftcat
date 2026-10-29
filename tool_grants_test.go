@@ -175,7 +175,7 @@ func TestEvaluateToolPolicyMarksGrantableAsks(t *testing.T) {
 		{"send_email", map[string]interface{}{"to": "a@example.com", "n": 9}, false},
 		{"wire", nil, false},
 	} {
-		v, err := evaluateToolPolicy(gate, c.tool, c.args, zero)
+		v, err := evaluateToolPolicy(gate, c.tool, c.args, nil, zero)
 		if err != nil || v.Decision != "ask" || v.Grantable != c.want {
 			t.Errorf("%s %v: decision %s grantable %v, want ask/%v (%v)", c.tool, c.args, v.Decision, v.Grantable, c.want, err)
 		}

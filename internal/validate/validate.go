@@ -139,6 +139,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkConfigSecurity(cfg, rep)
 	checkTimeouts(cfg, rep)
 	checkBudgetAlerts(cfg, rep)
+	checkReserveMaxCost(cfg, rep)
 	checkRolesToModels(cfg, rep)
 	checkEnvVars(cfg, rep)
 	checkPipelines(cfg, skills, skillsDir, rep)
@@ -216,6 +217,11 @@ func checkConfigSecurity(cfg *config.Config, rep *validateReport) {
 	}
 	if cfg.Telegram.Security.RateLimit <= 0 {
 		rep.errf("telegram.security.rate_limit", "must be set and > 0 (engine refuses to start without it)")
+	}
+	if d := cfg.Telegram.Digest; d != nil {
+		if _, err := schedule.ParseDaily(d.At, d.Timezone); err != nil {
+			rep.errf("telegram.digest", "%v", err)
+		}
 	}
 	checkRelay(cfg, rep)
 	checkApprovalPolicy(cfg, rep)
@@ -309,6 +315,56 @@ func checkBudgetAlerts(cfg *config.Config, rep *validateReport) {
 	}
 	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 && !pipelineCaps {
 		rep.warnf("budgets.alert_at", "set per_day_tokens or per_day_cost; alerts are fractions of a daily cap")
+	}
+}
+
+// checkReserveMaxCost warns where reserve_max_cost cannot reserve: no cost cap
+// to reserve against, or a capped role whose model has no prices (its
+// reservation is 0, so that call is a stop on settled spend as before).
+func checkReserveMaxCost(cfg *config.Config, rep *validateReport) {
+	unpriced := func(role string) bool {
+		m, ok := cfg.Models[cfg.Roles[role]]
+		return ok && !m.Priced()
+	}
+	warnRoles := func(path string, roles map[string]bool) {
+		names := make([]string, 0, len(roles))
+		for r := range roles {
+			names = append(names, r)
+		}
+		sort.Strings(names)
+		for _, r := range names {
+			if unpriced(r) {
+				rep.warnf(path, "role %q uses model %q without cost_per_1k_input/output; its calls reserve nothing", r, cfg.Roles[r])
+			}
+		}
+	}
+	if cfg.Budgets.ReserveMaxCost {
+		if cfg.Budgets.PerDayCost <= 0 {
+			rep.warnf("budgets.reserve_max_cost", "set per_day_cost; the reservation is held against that cap")
+		} else {
+			all := map[string]bool{}
+			for r := range cfg.Roles {
+				all[r] = true
+			}
+			warnRoles("budgets.reserve_max_cost", all)
+		}
+	}
+	for i, p := range cfg.Pipelines {
+		if !p.Budget.ReserveMaxCost {
+			continue
+		}
+		path := fmt.Sprintf("pipelines[%d:%s].budget.reserve_max_cost", i, p.Name)
+		if p.Budget.PerDayCost <= 0 {
+			rep.warnf(path, "set per_day_cost; the reservation is held against that cap")
+			continue
+		}
+		roles := map[string]bool{}
+		for _, st := range p.Steps {
+			if st.Type == "ai" && st.Role != "" {
+				roles[st.Role] = true
+			}
+		}
+		warnRoles(path, roles)
 	}
 }
 
@@ -717,6 +773,9 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.MaxCallsPerDay != nil && *t.MaxCallsPerDay < 1 {
 			rep.errf(p+".max_calls_per_day", "must be 1 or more (got %d) — leave a tool out of tool_gate.tools to refuse it", *t.MaxCallsPerDay)
 		}
+		if t.DefinitionSHA256 != "" && !definitionPinRE.MatchString(t.DefinitionSHA256) {
+			rep.errf(p+".definition_sha256", "must look like sha256:<64 lowercase hex> (got %q) — `draftcat gate hash-definition` prints it", t.DefinitionSHA256)
+		}
 		checkArgConstraints(t, p, rep)
 	}
 	checkGateCallers(cfg.ToolGate, seen, rep)
@@ -904,6 +963,8 @@ func printValidateReport(rep *validateReport, jsonOut, strict bool) int {
 	}
 	return 0
 }
+
+var definitionPinRE = regexp.MustCompile(config.DefinitionPinPattern)
 
 var templateVarPattern = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
 

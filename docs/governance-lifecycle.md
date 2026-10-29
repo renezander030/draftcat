@@ -10,6 +10,26 @@ Every engine model request passes this boundary, including intent classification
 
 `per_step_tokens` bounds the requested completion length together with the selected model's `max_tokens`. Daily and pipeline token totals count both input and output usage reported by the provider. Token limits and money caps stop further calls based on settled usage; an admitted call can cross a threshold because the final prompt usage and charge are only known afterward. A money cap is a stop threshold rather than a prepaid dollar reservation. Configure small completion limits to bound generation work.
 
+### Worst-case cost reservation
+
+`budgets.reserve_max_cost: true` turns `per_day_cost` into a ceiling on worst-case spend. A call is admitted only if settled spend, the reservations of pending calls and this call's maximum cost stay within the cap:
+
+```yaml
+budgets:
+  per_day_cost: 1.00
+  reserve_max_cost: true     # default false: stop on settled spend only
+models:
+  fast:
+    model: example/model
+    max_tokens: 800
+    cost_per_1k_input: 0.0005
+    cost_per_1k_output: 0.0015
+```
+
+The maximum cost of a call is `(input estimate × cost_per_1k_input + max_tokens × cost_per_1k_output) / 1000`. The input estimate is one token per three prompt bytes, rounded up, and `max_tokens` is the effective completion limit of the call (the model's `max_tokens`, 2048 when unset, lowered by `per_step_tokens`). The reservation is written into the same admission statement as the pending usage row, so concurrent callers and separate instances on one database cannot jointly overshoot the cap; it persists with the pending row across a restart, and settlement replaces it with the actual cost. A refused call fails with `BUDGET_BLOCKED: daily cost limit ... would be exceeded with this call's maximum cost ...`.
+
+A model without `cost_per_1k_input` and `cost_per_1k_output` reserves nothing, so its calls stop on settled spend as without the key; `draftcat validate` warns when a capped role uses such a model, and when the key is set without a cap. The same key under `pipelines[].budget` applies the reservation to that pipeline's `per_day_cost`.
+
 ### Per-pipeline daily caps
 
 A pipeline can carry its own daily allowance so one pipeline cannot use the whole day's budget:

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.14.0
+
+- Freeze the tool gate: `/freeze [reason]` and `/unfreeze` in Telegram, or `draftcat gate freeze|unfreeze|status`, stop every gated tool call at once. While frozen the gate denies each call with "tool gate frozen by operator", refuses to consume issued permits and leaves standing grants unused. The freeze is stored, holds across a restart and reaches a running engine on its next call.
+- Pin a tool's definition with `definition_sha256` on a tool rule: the harness sends the tool's `definition` with the call, and a missing or changed definition is handled like an argument mismatch. `draftcat gate hash-definition` prints the value, and `gate check --definition` and `definition:` in test cases decide it offline.
+- Compare two policies with `draftcat gate test cases.yaml --config new.yaml --compare old.yaml`: it prints only the cases that decide differently and exits 1 when any does.
+- Reserve a model call's worst-case cost against `per_day_cost` with `budgets.reserve_max_cost: true` (or on a pipeline's `budget`): a call is admitted only if settled spend plus its maximum cost stays within the cap, and the actual cost replaces the reservation when the call settles.
+- Get one daily digest of what needs a person with `telegram.digest: {at: "08:00", timezone: Europe/Berlin}`: approvals waiting over an hour, a frozen gate and failed tool outcomes of the last day. On a day with none of these, nothing is sent.
+- Tidy-up: the tool gate answers unknown and unavailable actions from one place, sorted keys come from the standard library, and a test pins how a config reload treats every config section.
+
+See [freeze](docs/tool-gate.md#freeze), [definition pin](docs/tool-gate.md#definition-pin), [comparing two policies](docs/tool-gate.md#comparing-two-policies), [worst-case cost reservation](docs/governance-lifecycle.md#worst-case-cost-reservation) and [digest](docs/operations.md#digest).
+
+### Upgrade notes
+
+All new settings are optional, and configurations without them decide exactly as before; rules without `definition_sha256` keep their policy hashes. The state store gains the `gate_freeze` and `operator_digest` tables and the `reserved_cost` and `reserved_pipeline_cost` columns on `budget_calls` at first start. Telegram `/help` lists `/freeze` and `/unfreeze`; `telegram.digest` applies at restart, like the rest of `telegram`.
+
 ## 0.13.0
 
 - Pre-approve a bounded run of a tool's calls with standing grants: `/grant send_email 2h 20` on rules with `allow_grants: true`. Each call a grant releases leaves a receipt naming the grant, the operator who issued it and the use it took; `/grants` lists live grants and `/ungrant` ends one. Grants never cover high-risk tools, arguments outside the rule or calls past a daily total.

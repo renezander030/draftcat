@@ -28,10 +28,10 @@ func TestEvaluateToolPolicyCallCount(t *testing.T) {
 		}
 	}
 	deny := config.ToolGateConfig{Tools: []config.ToolRule{emailRule("deny", 3)}}
-	if v, _ := evaluateToolPolicy(deny, "send_email", nil, count(2)); v.Decision != "allow" {
+	if v, _ := evaluateToolPolicy(deny, "send_email", nil, nil, count(2)); v.Decision != "allow" {
 		t.Fatalf("the third call fits under 3: %+v", v)
 	}
-	v, err := evaluateToolPolicy(deny, "send_email", nil, count(3))
+	v, err := evaluateToolPolicy(deny, "send_email", nil, nil, count(3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestEvaluateToolPolicyCallCount(t *testing.T) {
 		t.Fatalf("the fourth call is refused: %+v", v)
 	}
 	ask := config.ToolGateConfig{Tools: []config.ToolRule{emailRule("", 3)}}
-	v, _ = evaluateToolPolicy(ask, "send_email", nil, count(3))
+	v, _ = evaluateToolPolicy(ask, "send_email", nil, nil, count(3))
 	if v.Decision != "ask" || len(v.Totals) != 1 || v.Totals[0] != "calls: 3 allowed today, max_calls_per_day 3" {
 		t.Fatalf("an escalating rule asks with the count: %+v", v)
 	}
@@ -57,7 +57,7 @@ func TestEvaluateToolPolicyCallCountWithArgumentCap(t *testing.T) {
 		}
 		return newRat(100), nil
 	}
-	v, _ := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number("50")}, spent)
+	v, _ := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number("50")}, nil, spent)
 	if v.Decision != "deny" || v.Rule != "max_calls_per_day" || len(v.Totals) != 2 {
 		t.Fatalf("count cap with an argument under its total: %+v", v)
 	}
