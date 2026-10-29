@@ -8,12 +8,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"os"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1060,12 +1061,7 @@ func (t ToolRule) DailyCaps() []string {
 }
 
 func (t ToolRule) argKeys() []string {
-	keys := make([]string, 0, len(t.Args))
-	for k := range t.Args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(t.Args))
 }
 
 // DeniesOnMismatch reports whether an argument mismatch is refused outright

@@ -10,8 +10,9 @@ package obs
 import (
 	"context"
 	"io"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ func (c *counterVec) render(sb *strings.Builder) {
 	}
 	sb.WriteString("# HELP " + c.name + " " + c.help + "\n")
 	sb.WriteString("# TYPE " + c.name + " counter\n")
-	for _, k := range sortedKeys(c.vals) {
+	for _, k := range slices.Sorted(maps.Keys(c.vals)) {
 		if k == "" {
 			sb.WriteString(c.name + " " + formatNum(c.vals[k]) + "\n")
 			continue
@@ -86,7 +87,7 @@ func (h *histVec) render(sb *strings.Builder) {
 	}
 	sb.WriteString("# HELP " + h.name + " " + h.help + "\n")
 	sb.WriteString("# TYPE " + h.name + " histogram\n")
-	for _, k := range sortedKeysH(h.series) {
+	for _, k := range slices.Sorted(maps.Keys(h.series)) {
 		d := h.series[k]
 		for i, b := range durationBuckets {
 			sb.WriteString(h.name + "_bucket{" + k + ",le=\"" + formatNum(b) + "\"} " + strconv.FormatUint(d.counts[i], 10) + "\n")
@@ -279,22 +280,4 @@ func formatNum(v float64) string {
 		return strconv.FormatInt(int64(v), 10)
 	}
 	return strconv.FormatFloat(v, 'g', -1, 64)
-}
-
-func sortedKeys(m map[string]float64) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func sortedKeysH(m map[string]*histData) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

@@ -530,9 +530,7 @@ func (g *toolGate) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	g.mu.Lock()
-	tk := g.tickets[id]
-	g.mu.Unlock()
+	tk := g.ticket(id)
 	if q := strings.TrimSpace(r.URL.Query().Get("wait")); q != "" {
 		d, err := time.ParseDuration(q)
 		if err != nil || d < 0 {
@@ -971,9 +969,7 @@ func (g *toolGate) reserveAction(req ToolCallRequest, argsHash, policyHash, bind
 		}
 		return ToolCallResponse{}, 0, false
 	}
-	g.mu.Lock()
-	tk := g.tickets[req.ActionID]
-	g.mu.Unlock()
+	tk := g.ticket(req.ActionID)
 	if tk == nil {
 		return ToolCallResponse{}, 0, false
 	}

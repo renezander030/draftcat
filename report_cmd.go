@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -220,7 +222,7 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	}
 	_, _ = fmt.Fprintf(w, "%d decision(s); %d made by a person, the rest by configured policy or the clock.\n\n", r.Receipts, r.ByPerson)
 
-	decisions := sortedKeys(r.Decisions)
+	decisions := slices.Sorted(maps.Keys(r.Decisions))
 	_, _ = fmt.Fprintln(w, "## Decisions")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "| Decision | Count |")
@@ -246,7 +248,7 @@ func printOversightReport(w io.Writer, r oversightReport) {
 		_, _ = fmt.Fprintln(w)
 		_, _ = fmt.Fprintln(w, "| Operator | Decisions |")
 		_, _ = fmt.Fprintln(w, "|---|---|")
-		for _, op := range sortedKeys(r.Operators) {
+		for _, op := range slices.Sorted(maps.Keys(r.Operators)) {
 			_, _ = fmt.Fprintf(w, "| %s | %d |\n", op, r.Operators[op])
 		}
 	}
@@ -258,25 +260,16 @@ func printOversightReport(w io.Writer, r oversightReport) {
 		_, _ = fmt.Fprintln(w)
 		_, _ = fmt.Fprintln(w, "| Tool | Succeeded | Failed |")
 		_, _ = fmt.Fprintln(w, "|---|---|---|")
-		for _, tool := range sortedKeys(r.Outcomes) {
+		for _, tool := range slices.Sorted(maps.Keys(r.Outcomes)) {
 			_, _ = fmt.Fprintf(w, "| %s | %d | %d |\n", tool, r.Outcomes[tool]["succeeded"], r.Outcomes[tool]["failed"])
 		}
 	}
 	_, _ = fmt.Fprintln(w, "\n## Receipts")
 	_, _ = fmt.Fprintln(w)
 	var integrity []string
-	for _, k := range sortedKeys(r.Integrity) {
+	for _, k := range slices.Sorted(maps.Keys(r.Integrity)) {
 		integrity = append(integrity, fmt.Sprintf("%s %d", k, r.Integrity[k]))
 	}
 	_, _ = fmt.Fprintf(w, "Signatures: %s.\n", strings.Join(integrity, ", "))
 	_, _ = fmt.Fprintf(w, "First %s, last %s; receipt ids sha256 %s.\n", r.First, r.Last, r.Digest)
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }

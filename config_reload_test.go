@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -171,5 +172,53 @@ func TestSyncReplansChangedScheduleFromLastRun(t *testing.T) {
 	s.Sync([]config.PipelineConfig{{Name: "a", Schedule: "10m", PauseAfterFailures: 3}})
 	if !s.pipelines["a"].NextRun.Equal(before) || s.pipelines["a"].pauseAfter != 3 {
 		t.Fatal("unchanged schedule was replanned or option not applied")
+	}
+}
+
+// A reload applies the run sections and keeps the restart-only ones running.
+// Every config section must be one or the other: a section in neither would
+// change on disk without being applied or reported.
+func TestReloadClassifiesEveryConfigSection(t *testing.T) {
+	reloaded := map[string]bool{"models": true, "roles": true, "budgets": true, "timeouts": true,
+		"approval_policy": true, "model_policy": true, "pipelines": true}
+	restart := restartOnlySections(&config.Config{})
+	ty := reflect.TypeOf(config.Config{})
+	for i := 0; i < ty.NumField(); i++ {
+		name := strings.Split(ty.Field(i).Tag.Get("yaml"), ",")[0]
+		_, keep := restart[name]
+		if keep == reloaded[name] {
+			t.Errorf("config section %q: reloaded=%v restart-only=%v; it must be exactly one", name, reloaded[name], keep)
+		}
+	}
+	if got := len(reloaded) + len(restart); got != ty.NumField() {
+		t.Errorf("classified %d sections, config has %d", got, ty.NumField())
+	}
+
+	// buildReload applies exactly the reloaded sections from the file.
+	t.Setenv("RL_TG", "x")
+	t.Setenv("RL_KEY", "y")
+	dir := t.TempDir()
+	running, _ := bootFrom(t, reloadBase)
+	changed := strings.Replace(reloadBase, "per_day_tokens: 1000", "per_day_tokens: 5000", 1)
+	changed = strings.Replace(changed, "max_tokens: 64", "max_tokens: 99", 1)
+	changed = strings.Replace(changed, "type: openrouter", "type: openai", 1)
+	next, _, _, err := buildReload(writeReloadConfig(t, dir, changed), filepath.Join(dir, "skills"), running, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file config.Config
+	if err := yaml.Unmarshal([]byte(changed), &file); err != nil {
+		t.Fatal(err)
+	}
+	nv, rv, fv := reflect.ValueOf(*next), reflect.ValueOf(*running), reflect.ValueOf(file)
+	for i := 0; i < ty.NumField(); i++ {
+		name := strings.Split(ty.Field(i).Tag.Get("yaml"), ",")[0]
+		want := rv.Field(i)
+		if reloaded[name] {
+			want = fv.Field(i)
+		}
+		if !reflect.DeepEqual(nv.Field(i).Interface(), want.Interface()) {
+			t.Errorf("section %q after reload does not come from the %s", name, map[bool]string{true: "file", false: "running config"}[reloaded[name]])
+		}
 	}
 }

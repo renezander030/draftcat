@@ -17,12 +17,17 @@ func unavailableToolResponse(id string) ToolCallResponse {
 	return ToolCallResponse{ActionID: id, ApprovalID: id, Decision: "deny", State: "denied", Reason: "durable approval state or audit unavailable; no execution authorized", unavailable: true}
 }
 
+// ticket returns the in-memory ticket for an action id, or nil.
+func (g *toolGate) ticket(id string) *toolTicket {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.tickets[id]
+}
+
 // updateTicket wakes all waiters on a terminal state and interrupts the
 // operator prompt. Persisted state decides the race, not prompt completion.
 func (g *toolGate) updateTicket(id string, resp ToolCallResponse) {
-	g.mu.Lock()
-	tk := g.tickets[id]
-	g.mu.Unlock()
+	tk := g.ticket(id)
 	if tk == nil {
 		return
 	}
@@ -58,10 +63,7 @@ func (g *toolGate) actionResponse(id string) (ToolCallResponse, int) {
 	if state != nil {
 		a, err := state.ToolAction(id)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return unknownToolResponse(id), http.StatusNotFound
-			}
-			return unavailableToolResponse(id), http.StatusServiceUnavailable
+			return storeMissResponse(id, err)
 		}
 		rule, listed := g.cfg.ToolGate.Lookup(a.Tool)
 		a, err = state.NormalizeToolAction(id, g.policyHash(a.Tool, rule, listed), g.now())
@@ -69,9 +71,7 @@ func (g *toolGate) actionResponse(id string) (ToolCallResponse, int) {
 			return unavailableToolResponse(id), http.StatusServiceUnavailable
 		}
 		if a.Status == "pending" {
-			g.mu.Lock()
-			tk := g.tickets[id]
-			g.mu.Unlock()
+			tk := g.ticket(id)
 			if tk != nil {
 				if failed, _ := tk.result(); failed.unavailable {
 					return failed, http.StatusServiceUnavailable
@@ -95,9 +95,7 @@ func (g *toolGate) actionResponse(id string) (ToolCallResponse, int) {
 		g.updateTicket(id, resp)
 		return resp, http.StatusOK
 	}
-	g.mu.Lock()
-	tk := g.tickets[id]
-	g.mu.Unlock()
+	tk := g.ticket(id)
 	if tk == nil {
 		return unknownToolResponse(id), http.StatusNotFound
 	}
@@ -119,6 +117,16 @@ func (g *toolGate) actionResponse(id string) (ToolCallResponse, int) {
 		}
 	}
 	return resp, http.StatusOK
+}
+
+// storeMissResponse answers a failed read of an action from the state store:
+// a missing row is an action id the gate never decided (404), any other error
+// fails closed as unavailable (503). Neither authorizes execution.
+func storeMissResponse(id string, err error) (ToolCallResponse, int) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return unknownToolResponse(id), http.StatusNotFound
+	}
+	return unavailableToolResponse(id), http.StatusServiceUnavailable
 }
 
 func unknownToolResponse(id string) ToolCallResponse {
@@ -147,11 +155,8 @@ func (g *toolGate) handleRevoke(w http.ResponseWriter, r *http.Request, id strin
 	}
 	a, revoked, err := state.CancelToolAction(id, body.BindingHash, g.now())
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeToolDecision(w, http.StatusNotFound, unknownToolResponse(id))
-		} else {
-			writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
-		}
+		resp, code := storeMissResponse(id, err)
+		writeToolDecision(w, code, resp)
 		return
 	}
 	resp := responseFromToolAction(a)
@@ -198,11 +203,8 @@ func (g *toolGate) handleComplete(w http.ResponseWriter, r *http.Request, id str
 	}
 	outcome, accepted, err := state.CompleteToolAction(statestore.ToolOutcome{ActionID: id, BindingHash: body.BindingHash, Status: body.Status, ResultHash: body.ResultHash, CompletedAt: g.now()})
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeToolDecision(w, http.StatusNotFound, unknownToolResponse(id))
-		} else {
-			writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
-		}
+		resp, code := storeMissResponse(id, err)
+		writeToolDecision(w, code, resp)
 		return
 	}
 	resp, code := g.actionResponse(id)

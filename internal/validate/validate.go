@@ -3,11 +3,13 @@ package validate
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -760,12 +762,7 @@ func checkGateCallers(gate config.ToolGateConfig, listed map[string]bool, rep *v
 // glob would otherwise fail every call at runtime (which is safe, but useless),
 // and an empty constraint is almost always a typo'd condition key.
 func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
-	keys := make([]string, 0, len(t.Args))
-	for k := range t.Args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(t.Args)) {
 		c := t.Args[k]
 		ap := fmt.Sprintf("%s.args.%s", p, k)
 		if strings.TrimSpace(k) == "" {
@@ -956,12 +953,7 @@ func knownActionNames() []string {
 func knownApprovalChannels() []string { return channels.Names() }
 
 func stepTypeNames() []string {
-	out := make([]string, 0, len(validStepTypes))
-	for k := range validStepTypes {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(validStepTypes))
 }
 
 // didYouMean returns ` — did you mean "ai"?` when got is a near miss for one of
