@@ -1773,6 +1773,8 @@ func handleCommand(cmd string, args string, from int64, bot *TGBot, sched *Sched
 	switch cmd {
 	case "/grant", "/grants", "/ungrant":
 		_ = bot.Send(grantCommand(cmd, args, from, cfg.ToolGate, time.Now()))
+	case "/freeze", "/unfreeze":
+		_ = bot.Send(freezeCommand(cmd, args, from, bot.security.AllowedUsers, time.Now()))
 	case "/cron":
 		handleCron(args, bot, sched)
 	case "/skills":
@@ -1798,7 +1800,7 @@ func handleCommand(cmd string, args string, from int64, bot *TGBot, sched *Sched
 			_ = bot.Send(reloadHook())
 		}
 	case "/help":
-		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant\n/freeze [reason] - Stop every gated tool call\n/unfreeze - Lift the freeze")
 	}
 }
 
@@ -2301,7 +2303,11 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *conf
 		}
 	}
 	open, oerr := state.OpenApprovals()
-	_ = bot.Send(statusReport(active, paused, budget, cfg, open, oerr, time.Now()))
+	report := statusReport(active, paused, budget, cfg, open, oerr, time.Now())
+	if line := freezeStatusLine(); line != "" {
+		report += "\n" + line
+	}
+	_ = bot.Send(report)
 }
 
 // statusReport renders /status. Spend is shown against every cap that is
@@ -2496,6 +2502,7 @@ func main() {
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
 			fmt.Println("  draftcat gate verify-grant <grant>     check an execution grant before running the tool")
+			fmt.Println("  draftcat gate <freeze|unfreeze|status> stop every gated tool call, lift the stop, show it")
 			return
 		}
 	}
@@ -2758,6 +2765,12 @@ func main() {
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 
+	// Daily digest of what needs a person; absent telegram.digest = none.
+	digest, derr := newDigestJob(&cfg, func(m string) error { return opChan.Send(m) })
+	if derr != nil {
+		log.Printf("[digest] disabled: %v", derr)
+	}
+
 	// Main event loop — polls for commands and runs scheduled pipelines
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -2981,6 +2994,8 @@ Conversation so far:
 					}
 				}
 			}
+
+			digest.tick(time.Now())
 
 			// 2. Check for scheduled pipelines
 			for _, name := range sched.ClaimDue() {

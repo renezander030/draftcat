@@ -5,9 +5,10 @@ package outputschema
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -85,12 +86,7 @@ func Check(schema map[string]interface{}) []Finding {
 
 // Fields returns map keys in a stable order.
 func Fields(fields map[string]interface{}) []string {
-	keys := make([]string, 0, len(fields))
-	for key := range fields {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(fields))
 }
 
 // Number accepts numeric values from YAML and JSON, retaining all integer and

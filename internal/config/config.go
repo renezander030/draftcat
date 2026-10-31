@@ -8,12 +8,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"os"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,7 +58,17 @@ type TelegramConfig struct {
 	TokenEnv string          `yaml:"token_env"`
 	ChatID   int64           `yaml:"chat_id"`
 	Security ChannelSecurity `yaml:"security"`
-	token    string
+	// Digest, when set, sends the operator one message a day with what needs
+	// a person. Absent = no digest. Not part of the tool gate's policy hash.
+	Digest *DigestConfig `yaml:"digest" json:"-"`
+	token  string
+}
+
+// DigestConfig is the daily operator digest: At is "HH:MM" (24-hour) in
+// Timezone, an IANA zone name (empty = the process's local zone).
+type DigestConfig struct {
+	At       string `yaml:"at"`
+	Timezone string `yaml:"timezone"`
 }
 
 // Default credential variables, read when the config names none (and as the
@@ -225,6 +236,20 @@ type ModelConfig struct {
 	CostOut   float64 `yaml:"cost_per_1k_output"`
 }
 
+// Priced reports whether the model carries a per-1k price.
+func (m ModelConfig) Priced() bool { return m.CostIn > 0 || m.CostOut > 0 }
+
+// WorstCaseCost is the most one call can cost: an input bound of one token per
+// three prompt bytes (rounded up) plus a full max_tokens completion, at the
+// model's per-1k prices. 0 when the model has no prices.
+func (m ModelConfig) WorstCaseCost(promptBytes, maxTokens int) float64 {
+	if !m.Priced() || promptBytes < 0 || maxTokens < 0 {
+		return 0
+	}
+	in := (promptBytes + 2) / 3
+	return (float64(in)*m.CostIn + float64(maxTokens)*m.CostOut) / 1000
+}
+
 // ModelPolicyConfig applies deterministic checks immediately before model
 // input is sent and immediately after model output is received.
 type ModelPolicyConfig struct {
@@ -298,6 +323,11 @@ type BudgetConfig struct {
 	// step. Pair with per_step_tokens to bound that overshoot.
 	PerDayCost      float64 `yaml:"per_day_cost"`
 	PerPipelineCost float64 `yaml:"per_pipeline_cost"`
+	// ReserveMaxCost makes per_day_cost a ceiling on worst-case spend: a call
+	// is admitted only if settled spend, the reservations of pending calls and
+	// this call's maximum cost (see ModelConfig.WorstCaseCost) stay within the
+	// cap. A model without prices reserves nothing. Default false.
+	ReserveMaxCost bool `yaml:"reserve_max_cost"`
 	// AlertAt lists fractions of the daily caps (per_day_tokens, per_day_cost,
 	// and each pipeline's budget caps) at which the operator channel is
 	// notified, e.g. [0.5, 0.8, 0.95]. Each threshold notifies once per UTC day
@@ -432,6 +462,9 @@ type PipelineConfig struct {
 type PipelineBudgetConfig struct {
 	PerDayTokens int     `yaml:"per_day_tokens"`
 	PerDayCost   float64 `yaml:"per_day_cost"`
+	// ReserveMaxCost applies the worst-case reservation of
+	// budgets.reserve_max_cost to this pipeline's per_day_cost.
+	ReserveMaxCost bool `yaml:"reserve_max_cost"`
 }
 
 // Capped reports whether either daily cap is set.
@@ -766,7 +799,16 @@ type ToolRule struct {
 	// Calls outside the arguments or past a daily total still go to a human.
 	// Never on a high-risk tool.
 	AllowGrants bool `yaml:"allow_grants" json:",omitempty"`
+	// DefinitionSHA256 pins what the tool declares about itself: the sha256 of
+	// the canonical JSON of the definition the harness sends with the call
+	// (name, description, input schema, annotations). A call whose definition
+	// is missing or hashes differently is handled like an argument mismatch
+	// (on_mismatch). Omitted = the definition is not checked.
+	DefinitionSHA256 string `yaml:"definition_sha256" json:",omitempty"`
 }
+
+// DefinitionPinPattern is the form of a definition_sha256 value.
+const DefinitionPinPattern = `^sha256:[0-9a-f]{64}$`
 
 // Grantable reports whether an operator may issue a standing grant for the
 // tool: the rule allows grants and the tool is not high risk.
@@ -1060,12 +1102,7 @@ func (t ToolRule) DailyCaps() []string {
 }
 
 func (t ToolRule) argKeys() []string {
-	keys := make([]string, 0, len(t.Args))
-	for k := range t.Args {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(t.Args))
 }
 
 // DeniesOnMismatch reports whether an argument mismatch is refused outright

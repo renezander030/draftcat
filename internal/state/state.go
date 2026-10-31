@@ -212,6 +212,17 @@ CREATE TABLE IF NOT EXISTS webhook_admissions (
     updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(status, created_at);
+CREATE TABLE IF NOT EXISTS gate_freeze (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    frozen       INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    by           TEXT NOT NULL DEFAULT '',
+    at           INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS operator_digest (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    last_day     TEXT NOT NULL DEFAULT ''     -- local date the digest was last evaluated for
+);
 `
 	if _, err := tx.ExecContext(context.Background(), schema); err != nil {
 		return err
@@ -240,6 +251,8 @@ CREATE INDEX IF NOT EXISTS idx_webhook_admissions_status ON webhook_admissions(s
 		`ALTER TABLE webhook_admissions ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE budget_calls ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE budget_calls ADD COLUMN pipeline TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE budget_calls ADD COLUMN reserved_cost REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE budget_calls ADD COLUMN reserved_pipeline_cost REAL NOT NULL DEFAULT 0`,
 	} {
 		if _, err := tx.ExecContext(context.Background(), alter); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err

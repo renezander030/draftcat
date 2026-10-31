@@ -43,9 +43,11 @@ type toolDailyTotal func(tool, arg string) (*big.Rat, error)
 // denied; arguments outside the rule escalate to a human or are refused per
 // on_mismatch; a call that would take a max_per_day total or the
 // max_calls_per_day count past its cap is handled the same way; a value above review_above goes to a human; anything
-// else is allowed on the strength of being listed. A failing total lookup is
-// returned as an error, never guessed.
-func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string]interface{}, total toolDailyTotal) (toolPolicyVerdict, error) {
+// else is allowed on the strength of being listed. A rule that pins
+// definition_sha256 treats a missing or different definition (the one the
+// harness sent with the call) like an argument mismatch; a rule without a pin
+// ignores it. A failing total lookup is returned as an error, never guessed.
+func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args, definition map[string]interface{}, total toolDailyTotal) (toolPolicyVerdict, error) {
 	rule, listed := gate.Lookup(tool)
 	if !listed {
 		return toolPolicyVerdict{
@@ -59,14 +61,20 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string
 	// sent to a human.
 	v := toolPolicyVerdict{Decision: "allow", DecidedBy: "allowlist", Rule: "listed", Reason: "allowlisted in tool_gate"}
 	needHuman := rule.RequireApproval
+	mismatchRule, mismatchWhy := "", ""
 	if ok, why := rule.MatchArgs(args); !ok {
+		mismatchRule, mismatchWhy = "args."+why, "arguments outside the rule — "+why
+	} else if ok, why := matchToolDefinition(rule, definition); !ok {
+		mismatchRule, mismatchWhy = "definition", "definition outside the rule — "+why
+	}
+	if mismatchRule != "" {
 		if rule.DeniesOnMismatch() {
 			return toolPolicyVerdict{
-				Decision: "deny", DecidedBy: "policy", Rule: "args." + why, Class: "mismatch",
-				Reason: "arguments outside the rule — " + why,
+				Decision: "deny", DecidedBy: "policy", Rule: mismatchRule, Class: "mismatch",
+				Reason: mismatchWhy,
 			}, nil
 		}
-		needHuman, v.Why = true, "arguments outside the rule — "+why
+		needHuman, v.Why = true, mismatchWhy
 	} else {
 		caps, err := rule.ReadDailyCaps(args, func(arg string) (*big.Rat, error) {
 			spent, err := total(tool, arg)
@@ -105,4 +113,20 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args map[string
 		v.Grantable = v.Why == "" && rule.Grantable()
 	}
 	return v, nil
+}
+
+// matchToolDefinition checks the definition the harness sent against the
+// rule's definition_sha256 pin. A rule without a pin matches whatever was
+// sent, or nothing. The reason names the definition and both hashes.
+func matchToolDefinition(rule config.ToolRule, definition map[string]interface{}) (bool, string) {
+	if rule.DefinitionSHA256 == "" {
+		return true, ""
+	}
+	if len(definition) == 0 {
+		return false, "no definition sent, the rule pins " + rule.DefinitionSHA256
+	}
+	if got := hashCanonical(definition); got != rule.DefinitionSHA256 {
+		return false, fmt.Sprintf("the tool definition hashes to %s, the rule pins %s", got, rule.DefinitionSHA256)
+	}
+	return true, ""
 }

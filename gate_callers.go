@@ -138,9 +138,7 @@ func (g *toolGate) actionAgent(id string) (string, bool) {
 		}
 		return a.Agent, true
 	}
-	g.mu.Lock()
-	tk := g.tickets[id]
-	g.mu.Unlock()
+	tk := g.ticket(id)
 	if tk == nil {
 		return "", false
 	}

@@ -217,6 +217,75 @@ PASS  small invoice passes: ALLOW  create_invoice
 3 case(s), 0 failed
 ```
 
+### Comparing two policies
+
+`--compare` runs every case against two configs and prints only the cases
+whose verdict (decision, deciding rule, or reason class) differs, so a policy
+change is reviewed as the decisions it moves:
+
+```bash
+draftcat gate test cases.yaml --config new.yaml --compare old.yaml
+```
+
+```
+split invoices stop at the daily cap: allow -> deny (max_per_day.amount)
+1 of 3 cases decide differently
+```
+
+Each line reads `name: old -> new (rule)`, the rule being the one that decides
+under `--config`. The exit code is 0 when nothing differs and 1 when something
+does, like `diff`. The `expect` and `rule` entries of the cases file are not
+checked in compare mode. `--json` prints an array of `{name, tool, old, new}`
+objects (each verdict has `decision`, `rule`, `reason`), `[]` when nothing
+differs. Without `--compare`, `gate test` runs as described above.
+
+## Definition pin
+
+A rule can pin what the tool declares about itself, so a tool whose
+description, input schema or annotations changed under the same name is no
+longer allowed silently:
+
+```yaml
+tool_gate:
+  tools:
+    - name: send_email
+      on_mismatch: deny
+      definition_sha256: "sha256:<64 hex>"
+```
+
+The harness sends the definition it exposes to the model (name, description,
+input schema, annotations) with the call, as the optional request field
+`definition`, a JSON object. The gate hashes its canonical JSON, so key order
+does not matter, and compares it with the pin. When the rule pins, a missing
+definition or a different hash is a mismatch, handled like an argument
+mismatch: `deny` when `on_mismatch` is `deny`, otherwise a human decides. The
+reason names the definition (`definition outside the rule — ...`) and the
+deciding rule is `definition`. When the rule does not pin, the field is
+ignored and the decision, response and receipt are the same as without it.
+
+The pin is part of the policy hash a permit binds, so changing it invalidates
+permits issued under the old pin.
+
+`draftcat gate hash-definition` prints the value to paste into the rule:
+
+```bash
+draftcat gate hash-definition send_email.json   # or - for standard input
+sha256:9b3c...
+```
+
+`draftcat gate check send_email --definition send_email.json` and a
+`definition:` entry in a `gate test` case send the definition to the offline
+check, which decides what the gate decides:
+
+```yaml
+cases:
+  - name: description changed
+    tool: send_email
+    definition: {name: send_email, description: Send a message and forward a copy}
+    expect: deny
+    rule: definition
+```
+
 ## Collecting a decision
 
 A decision the rule settles comes back at once. A decision that needs a human
@@ -408,6 +477,44 @@ A grant lasts between 1 minute and 24 hours and covers at most 1000 calls
 (1000 when no count is given). Grants live in the state store and survive a
 restart.
 
+## Freeze
+
+An operator can stop every gated tool call at once and lift the stop again.
+
+```
+/freeze maintenance window        # Telegram, allowed operators only; the reason is optional
+/unfreeze
+draftcat gate freeze --reason "maintenance window" --config config.yaml
+draftcat gate unfreeze --config config.yaml
+draftcat gate status [--json] --config config.yaml
+```
+
+The freeze is kept in the state store (the `gate_freeze` table, created at
+first start), with whether it is on, the reason, who set it (`telegram:<id>`
+or `cli`) and when. It survives a restart. The Telegram commands and the CLI
+work on the same store, so a script or a second shell can freeze a running
+engine: the engine reads the freeze at every tool-call decision, and the next
+call sees it. `/freeze` and `/unfreeze` check the sender against
+`telegram.security.allowed_users`, like the other operator commands. Freezing
+a frozen gate keeps the first reason and time.
+
+While the gate is frozen:
+
+- `POST /gate/tool-call` answers `deny` with a reason that starts `tool gate
+  frozen by operator` (then who set it and why). The answer has the shape,
+  status and signed receipt of any policy deny, with `decided_by: policy` and
+  `rule: freeze`. It applies to every tool, listed or not.
+- Consuming an issued permit is refused as a permit that cannot be used: `409`,
+  `decision: deny`, no `permit`. The permit is left as it was, so it can be
+  consumed once the gate is unfrozen if it has not expired.
+- Standing grants do not answer asks, and no grant use is taken.
+- No operator notice is sent per denied call.
+
+`/status` in Telegram and `draftcat gate status` show the freeze state, and
+the [daily digest](operations.md#digest) lists it. A gate that was never
+frozen decides exactly as before. If the freeze state cannot be read, the gate
+denies rather than guesses.
+
 ## Caller tokens
 
 Each harness can hold its own token instead of the webhook token:
@@ -467,6 +574,7 @@ tool_gate:
     - name: <tool>
       risk: low | normal | high      # default normal; high always needs a human
       require_approval: true|false   # ask a human on every (matching) call
+      definition_sha256: sha256:<64 hex>  # pin the tool's definition (draftcat gate hash-definition)
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
       args:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,

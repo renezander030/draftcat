@@ -75,7 +75,7 @@ func TestEvaluateToolPolicyBands(t *testing.T) {
 		{"-1", "deny", "args.amount: -1 is below min 0"},
 	}
 	for _, c := range cases {
-		v, err := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number(c.amount)}, zero)
+		v, err := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number(c.amount)}, nil, zero)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +83,7 @@ func TestEvaluateToolPolicyBands(t *testing.T) {
 			t.Errorf("amount %s: got %s/%q, want %s/%q", c.amount, v.Decision, v.Rule, c.decision, c.rule)
 		}
 	}
-	v, _ := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number("700")}, zero)
+	v, _ := evaluateToolPolicy(gate, "create_invoice", map[string]interface{}{"amount": json.Number("700")}, nil, zero)
 	if !strings.Contains(v.Why, "above the review threshold — amount: 700 is above review_above 500") {
 		t.Fatalf("review reason missing: %q", v.Why)
 	}
@@ -92,7 +92,7 @@ func TestEvaluateToolPolicyBands(t *testing.T) {
 func TestEvaluateToolPolicyDailyCap(t *testing.T) {
 	spent := func(string, string) (*bigRat, error) { return newRat(900), nil }
 	deny := config.ToolGateConfig{Tools: []config.ToolRule{invoiceRule("deny")}}
-	v, err := evaluateToolPolicy(deny, "create_invoice", map[string]interface{}{"amount": json.Number("200")}, spent)
+	v, err := evaluateToolPolicy(deny, "create_invoice", map[string]interface{}{"amount": json.Number("200")}, nil, spent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,16 +101,16 @@ func TestEvaluateToolPolicyDailyCap(t *testing.T) {
 		t.Fatalf("over-cap deny rule: %+v", v)
 	}
 	ask := config.ToolGateConfig{Tools: []config.ToolRule{invoiceRule("")}}
-	v, _ = evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("200")}, spent)
+	v, _ = evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("200")}, nil, spent)
 	if v.Decision != "ask" || len(v.Totals) != 1 || v.Totals[0] != "amount: 900 allowed today, max_per_day 1000" {
 		t.Fatalf("over-cap approve rule should ask with the running total: %+v", v)
 	}
-	v, _ = evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("100")}, spent)
+	v, _ = evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("100")}, nil, spent)
 	if v.Decision != "allow" {
 		t.Fatalf("a call that reaches the cap exactly is allowed: %+v", v)
 	}
 	failing := func(string, string) (*bigRat, error) { return nil, fmt.Errorf("disk gone") }
-	if _, err := evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("1")}, failing); err == nil {
+	if _, err := evaluateToolPolicy(ask, "create_invoice", map[string]interface{}{"amount": json.Number("1")}, nil, failing); err == nil {
 		t.Fatal("a total that cannot be read must be an error, not a guess")
 	}
 }
@@ -277,12 +277,12 @@ func TestEvaluateToolPolicySeveralCaps(t *testing.T) {
 		return newRat(0), nil
 	}
 	args := map[string]interface{}{"amount": json.Number("20"), "fee": json.Number("1")}
-	v, _ := evaluateToolPolicy(rule("deny"), "pay", args, spent)
+	v, _ := evaluateToolPolicy(rule("deny"), "pay", args, nil, spent)
 	if v.Decision != "deny" || v.Rule != "max_per_day.amount" || len(v.Totals) != 1 || reads != 1 {
 		t.Fatalf("deny stops at the first cap: %+v reads=%d", v, reads)
 	}
 	reads = 0
-	v, _ = evaluateToolPolicy(rule(""), "pay", args, spent)
+	v, _ = evaluateToolPolicy(rule(""), "pay", args, nil, spent)
 	if v.Decision != "ask" || len(v.Totals) != 2 || reads != 2 || !strings.Contains(v.Why, "amount: today's total would be 110") {
 		t.Fatalf("escalation reads every cap: %+v reads=%d", v, reads)
 	}

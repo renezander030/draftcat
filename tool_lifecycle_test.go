@@ -289,3 +289,17 @@ func TestToolLifecycleHTTPPendingWriteFailureDoesNotPrompt(t *testing.T) {
 		t.Fatalf("pending failure=%d %+v prompts=%d", code, resp, ch.askCount())
 	}
 }
+
+func TestToolLifecycleHTTPUnknownActionIsNotFound(t *testing.T) {
+	lifecycleHTTPStore(t)
+	g := newToolGate(gateCfg(config.ToolRule{Name: "send"}), nil)
+	for operation, body := range map[string]string{"revoke": revokeBody("binding"), "complete": completeBody("binding", "succeeded", "")} {
+		code, resp := lifecyclePost(t, g, "never-decided", operation, body)
+		if code != http.StatusNotFound || resp.Decision != "deny" || resp.Permit != "" || !strings.Contains(resp.Reason, "unknown action id") {
+			t.Fatalf("%s of an unknown action = %d %+v", operation, code, resp)
+		}
+	}
+	if code, resp := getGate(t, g, "never-decided", ""); code != http.StatusNotFound || resp.Decision != "deny" || !strings.Contains(resp.Reason, "unknown action id") {
+		t.Fatalf("poll of an unknown action = %d %+v", code, resp)
+	}
+}

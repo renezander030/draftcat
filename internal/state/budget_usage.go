@@ -23,6 +23,11 @@ type UsageLabel struct {
 	Pipeline          string
 	PipelineDayTokens int
 	PipelineDayCost   float64
+	// ReserveCost and PipelineReserveCost are the call's worst-case cost held
+	// against the daily and the pipeline's cost cap while it is pending;
+	// 0 = no reservation, a stop on settled spend only.
+	ReserveCost         float64
+	PipelineReserveCost float64
 }
 
 // PipelineBudgetDay returns the settled model usage of one pipeline on the UTC

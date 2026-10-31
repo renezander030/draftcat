@@ -15,7 +15,10 @@
 // the trap this package exists to close.
 package channels
 
-import "sort"
+import (
+	"maps"
+	"slices"
+)
 
 const (
 	// Telegram is the in-binary channel: draftcat runs the bot itself.
@@ -46,12 +49,7 @@ func IsImplemented(name string) bool {
 
 // Names returns the implemented channel names, sorted, for error messages.
 func Names() []string {
-	out := make([]string, 0, len(implemented))
-	for k := range implemented {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(implemented))
 }
 
 // Describe returns the one-line description for name, or "" if unimplemented.

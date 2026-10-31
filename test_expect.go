@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -64,12 +65,7 @@ func (e testExpectation) check(run testRun, ch *stubChannel) []string {
 	if e.StoppedAt != "" && e.StoppedAt != run.stoppedAt {
 		problems = append(problems, fmt.Sprintf("stopped_at: %q, expected %q", run.stoppedAt, e.StoppedAt))
 	}
-	paths := make([]string, 0, len(e.Data))
-	for p := range e.Data {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-	for _, p := range paths {
+	for _, p := range slices.Sorted(maps.Keys(e.Data)) {
 		got, ok := lookupPath(run.data, p)
 		if !ok {
 			problems = append(problems, fmt.Sprintf("data.%s: not set, expected %s", p, compactJSON(e.Data[p])))

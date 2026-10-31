@@ -13,8 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -138,11 +139,7 @@ func buildOTLPDocument(spans []otlpSpan) ([]byte, error) {
 		} `json:"value"`
 	}
 	mkAttrs := func(m map[string]string) []kv {
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+		keys := slices.Sorted(maps.Keys(m))
 		out := make([]kv, 0, len(keys))
 		for _, k := range keys {
 			var a kv

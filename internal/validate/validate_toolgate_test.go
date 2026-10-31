@@ -209,3 +209,19 @@ func TestToolGate_AllowGrants(t *testing.T) {
 		t.Fatalf("grants on a tool that never asks should warn: %v", warns)
 	}
 }
+
+func TestToolGate_DefinitionPinForm(t *testing.T) {
+	good := "sha256:" + strings.Repeat("a1", 32)
+	for _, pin := range []string{good} {
+		errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", DefinitionSHA256: pin}}})
+		if len(errs) != 0 {
+			t.Fatalf("%q: %v", pin, errs)
+		}
+	}
+	for _, pin := range []string{"abc", "sha256:ABCD", good + "0", strings.TrimPrefix(good, "sha256:")} {
+		errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", DefinitionSHA256: pin}}})
+		if !anyHas(errs, "definition_sha256") {
+			t.Fatalf("%q must be an error, got %v", pin, errs)
+		}
+	}
+}

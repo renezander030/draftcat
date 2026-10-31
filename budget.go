@@ -118,6 +118,16 @@ func (b *BudgetTracker) checkLocked(dayLimit, requested int, dayCost, pipelineCo
 	return nil
 }
 
+// costReservation is what a call holds against a daily cost cap before it
+// runs: its worst-case cost when reserve_max_cost is on for that cap and the
+// cap is set, otherwise nothing.
+func costReservation(on bool, dayCap, worstCase float64) float64 {
+	if !on || dayCap <= 0 || worstCase <= 0 {
+		return 0
+	}
+	return worstCase
+}
+
 func validCost(cost float64) bool { return cost >= 0 && !math.IsNaN(cost) && !math.IsInf(cost, 0) }
 
 func (b *BudgetTracker) check(limit, requested int) error {
@@ -249,7 +259,7 @@ func (b *BudgetTracker) acquire(ctx context.Context) error {
 }
 func (b *BudgetTracker) release() { <-b.root().gate }
 
-func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested int, model string) (string, error) {
+func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested int, model string, worstCase float64) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -270,13 +280,20 @@ func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested
 	pipeline := pipelineFromContext(ctx)
 	caps := cfg.PipelineBudget(pipeline)
 	if caps.Capped() {
-		if err := b.checkPipelineDayLocked(ctx, pipeline, caps, requested); err != nil {
+		if err := b.checkPipelineDayLocked(ctx, pipeline, caps, requested, worstCase); err != nil {
 			return "", err
+		}
+	}
+	reserve := costReservation(cfg.Budgets.ReserveMaxCost, r.dayCostLimit, worstCase)
+	pipelineReserve := costReservation(caps.ReserveMaxCost, caps.PerDayCost, worstCase)
+	if reserve > 0 {
+		if r.costToday+reserve > r.dayCostLimit {
+			return "", fmt.Errorf("BUDGET_BLOCKED: daily cost limit %.4f would be exceeded with this call's maximum cost %.4f (spent: %.4f)", r.dayCostLimit, reserve, r.costToday)
 		}
 	}
 	id := newRunID(time.Now())
 	if r.store != nil {
-		label := statestore.UsageLabel{Model: model, Pipeline: pipeline, PipelineDayTokens: caps.PerDayTokens, PipelineDayCost: caps.PerDayCost}
+		label := statestore.UsageLabel{Model: model, Pipeline: pipeline, PipelineDayTokens: caps.PerDayTokens, PipelineDayCost: caps.PerDayCost, ReserveCost: reserve, PipelineReserveCost: pipelineReserve}
 		if err := r.store.BeginBudgetCall(ctx, id, time.Now(), requested, cfg.Budgets.PerDayTokens, r.dayCostLimit, label); err != nil {
 			return "", err
 		}
@@ -288,7 +305,7 @@ func (b *BudgetTracker) admit(ctx context.Context, cfg *config.Config, requested
 // checkPipelineDayLocked applies one pipeline's daily caps before admission,
 // so a refusal names the cap. The admission insert repeats the same checks
 // atomically against the store.
-func (b *BudgetTracker) checkPipelineDayLocked(ctx context.Context, pipeline string, caps config.PipelineBudgetConfig, requested int) error {
+func (b *BudgetTracker) checkPipelineDayLocked(ctx context.Context, pipeline string, caps config.PipelineBudgetConfig, requested int, worstCase float64) error {
 	r := b.root()
 	if caps.PerDayTokens < 0 || !validCost(caps.PerDayCost) {
 		return fmt.Errorf("BUDGET_BLOCKED: invalid budget limits for pipeline %q", pipeline)
@@ -308,6 +325,9 @@ func (b *BudgetTracker) checkPipelineDayLocked(ctx context.Context, pipeline str
 	}
 	if caps.PerDayCost > 0 && used.Cost >= caps.PerDayCost {
 		return fmt.Errorf("BUDGET_BLOCKED: pipeline %q daily cost limit %.4f reached (spent: %.4f)", pipeline, caps.PerDayCost, used.Cost)
+	}
+	if reserve := costReservation(caps.ReserveMaxCost, caps.PerDayCost, worstCase); reserve > 0 && used.Cost+reserve > caps.PerDayCost {
+		return fmt.Errorf("BUDGET_BLOCKED: pipeline %q daily cost limit %.4f would be exceeded with this call's maximum cost %.4f (spent: %.4f)", pipeline, caps.PerDayCost, reserve, used.Cost)
 	}
 	return nil
 }

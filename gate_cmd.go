@@ -16,20 +16,34 @@ import (
 )
 
 const gateUsage = `Usage:
-  draftcat gate check <tool> [--args JSON] [--spent arg=N]... [--calls N] [--config path] [--json]
-  draftcat gate test <cases.yaml> [--config path] [--json]
+  draftcat gate check <tool> [--args JSON] [--definition file.json] [--spent arg=N]... [--calls N] [--config path] [--json]
+  draftcat gate test <cases.yaml> [--config path] [--compare old.yaml] [--json]
+  draftcat gate hash-definition <file.json|->
   draftcat gate verify-grant <grant> --tool <tool> [--args JSON] [--max-age 5m] [--config path] [--json]
+  draftcat gate freeze [--reason text] [--config path]
+  draftcat gate unfreeze [--config path]
+  draftcat gate status [--json] [--config path]
 
 check         decide one call against tool_gate without running the engine
-test          decide every case in a file and fail when one differs from its expect
+test          decide every case in a file and fail when one differs from its expect;
+              with --compare, run the cases against --config and the older file
+              and print only the cases that decide differently (exit 1 when any
+              does; expect is not checked)
+hash-definition  print the sha256 value to paste into a rule's definition_sha256
 verify-grant  check an execution grant before running the tool: exit 0 valid, 1 not
 
 A decision is allow, deny, or ask (a human decides). --spent sets an
 argument's total already allowed today, for rules with max_per_day, and
 --calls the tool's calls already allowed today, for max_calls_per_day (both
 default 0). verify-grant reads the key named by
-tool_gate.execution_grant.secret_env. None of them reads or writes the state
-store.`
+tool_gate.execution_grant.secret_env. check, test, hash-definition and
+verify-grant do not read or write the state store.
+
+freeze        deny every gated tool call until unfreeze; a running engine sees it
+              on its next call (also /freeze and /unfreeze in Telegram)
+unfreeze      lift the freeze
+status        show whether the gate is frozen, by whom, since when and why
+freeze, unfreeze and status use the state store of --config.`
 
 // gateCase is one entry of a `draftcat gate test` file.
 type gateCase struct {
@@ -41,6 +55,9 @@ type gateCase struct {
 	// max_calls_per_day.
 	Calls  int    `yaml:"calls" json:"calls,omitempty"`
 	Expect string `yaml:"expect" json:"expect"`
+	// Definition is the tool definition the harness would send with the call,
+	// for rules with definition_sha256.
+	Definition map[string]interface{} `yaml:"definition" json:"definition,omitempty"`
 	// Rule optionally pins the rule that decides (listed, not listed,
 	// args.<why>, max_per_day.<arg>, max_calls_per_day), for a deny or allow.
 	Rule string `yaml:"rule" json:"rule,omitempty"`
@@ -71,9 +88,10 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	sub, rest := args[0], args[1:]
 	configPath, asJSON, argsJSON := "config.yaml", false, ""
+	definitionPath, comparePath := "", ""
 	spent := map[string]string{}
 	calls := 0
-	tool, maxAge := "", time.Duration(0)
+	tool, maxAge, reason := "", time.Duration(0), ""
 	var positional []string
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
@@ -98,6 +116,18 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			argsJSON = v
+		case "--definition":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			definitionPath = v
+		case "--compare":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			comparePath = v
 		case "--spent":
 			v, ok := needValue()
 			if !ok {
@@ -137,6 +167,12 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			maxAge = d
+		case "--reason":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			reason = strings.TrimSpace(v)
 		case "--json":
 			asJSON = true
 		default:
@@ -147,8 +183,34 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			positional = append(positional, a)
 		}
 	}
+	if sub == "freeze" || sub == "unfreeze" || sub == "status" {
+		if len(positional) != 0 || argsJSON != "" || len(spent) > 0 || calls > 0 || tool != "" || maxAge != 0 {
+			_, _ = fmt.Fprintf(stderr, "gate: %s takes only --config (and --reason for freeze, --json for status)\n", sub)
+			return 2
+		}
+		if reason != "" && sub != "freeze" {
+			_, _ = fmt.Fprintf(stderr, "gate: --reason belongs to freeze\n")
+			return 2
+		}
+		if asJSON && sub != "status" {
+			_, _ = fmt.Fprintf(stderr, "gate: --json belongs to status\n")
+			return 2
+		}
+		return gateFreezeCmd(sub, configPath, reason, asJSON, stdout, stderr)
+	}
 	if len(positional) != 1 {
 		_, _ = fmt.Fprintln(stderr, gateUsage)
+		return 2
+	}
+	if sub == "hash-definition" {
+		return gateHashDefinition(positional[0], stdout, stderr)
+	}
+	if definitionPath != "" && sub != "check" {
+		_, _ = fmt.Fprintln(stderr, "gate: --definition belongs to check; test reads definition: from the file")
+		return 2
+	}
+	if comparePath != "" && sub != "test" {
+		_, _ = fmt.Fprintln(stderr, "gate: --compare belongs to test")
 		return 2
 	}
 	cfg, err := loadConfigFile(configPath)
@@ -165,6 +227,14 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				_, _ = fmt.Fprintf(stderr, "gate: --args is not a JSON object: %v\n", err)
 				return 2
 			}
+		}
+		if definitionPath != "" {
+			def, err := readDefinitionFile(definitionPath)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+				return 2
+			}
+			c.Definition = def
 		}
 		r, err := decideGateCase(cfg.ToolGate, c)
 		if err != nil {
@@ -196,6 +266,14 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 		if len(file.Cases) == 0 {
 			_, _ = fmt.Fprintf(stderr, "gate: %s has no cases\n", positional[0])
 			return 2
+		}
+		if comparePath != "" {
+			older, err := loadConfigFile(comparePath)
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+				return 1
+			}
+			return gateCompare(file.Cases, older.ToolGate, cfg.ToolGate, asJSON, stdout, stderr)
 		}
 		results, failed := make([]gateResult, 0, len(file.Cases)), 0
 		for i, c := range file.Cases {
@@ -275,6 +353,117 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+// readDefinitionFile reads a tool definition (a JSON object) from a file, or
+// from standard input when the path is "-".
+func readDefinitionFile(path string) (map[string]interface{}, error) {
+	var raw []byte
+	var err error
+	if path == "-" {
+		raw, err = io.ReadAll(os.Stdin)
+	} else {
+		// #nosec G304 -- the operator's own definition file.
+		raw, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var def map[string]interface{}
+	if err := decodeStrictJSON(raw, &def); err != nil || len(def) == 0 {
+		if err == nil {
+			err = fmt.Errorf("empty object")
+		}
+		return nil, fmt.Errorf("%s is not a JSON object with a tool definition: %w", path, err)
+	}
+	return def, nil
+}
+
+// gateHashDefinition prints the value a rule's definition_sha256 takes for a
+// definition. The hash is over canonical JSON, so key order does not matter.
+func gateHashDefinition(path string, stdout, stderr io.Writer) int {
+	def, err := readDefinitionFile(path)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+		return 2
+	}
+	_, _ = fmt.Fprintln(stdout, hashCanonical(def))
+	return 0
+}
+
+// gateDiff is one case that decides differently under the two configs.
+type gateDiff struct {
+	Name string      `json:"name"`
+	Tool string      `json:"tool"`
+	Old  gateVerdict `json:"old"`
+	New  gateVerdict `json:"new"`
+}
+
+type gateVerdict struct {
+	Decision string `json:"decision"`
+	Rule     string `json:"rule,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+// reasonClass is the part of a reason before its detail ("arguments outside
+// the rule", "above the review threshold"), so two denials by the same cause
+// with different values are not a difference.
+func reasonClass(r gateResult) string {
+	s := r.Why
+	if s == "" {
+		s = r.Reason
+	}
+	class, _, _ := strings.Cut(s, " — ")
+	return class
+}
+
+// gateCompare runs every case against both configs through decideGateCase and
+// reports the ones whose decision, rule or reason class differ. Expectations
+// are not checked. It exits 1 when any case differs, like diff.
+func gateCompare(cases []gateCase, older, newer config.ToolGateConfig, asJSON bool, stdout, stderr io.Writer) int {
+	diffs := []gateDiff{}
+	for i, c := range cases {
+		if c.Name == "" {
+			c.Name = fmt.Sprintf("case %d", i+1)
+		}
+		ro, err := decideGateCase(older, c)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", c.Name, err)
+			return 2
+		}
+		rn, err := decideGateCase(newer, c)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", c.Name, err)
+			return 2
+		}
+		if ro.Decision == rn.Decision && ro.Rule == rn.Rule && reasonClass(ro) == reasonClass(rn) {
+			continue
+		}
+		diffs = append(diffs, gateDiff{Name: c.Name, Tool: c.Tool,
+			Old: gateVerdict{ro.Decision, ro.Rule, ro.Reason}, New: gateVerdict{rn.Decision, rn.Rule, rn.Reason}})
+	}
+	if asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(diffs)
+	} else {
+		for _, d := range diffs {
+			rule := d.New.Rule
+			if d.Old.Decision == d.New.Decision && d.Old.Rule != d.New.Rule {
+				rule = d.Old.Rule + " -> " + d.New.Rule
+			}
+			line := fmt.Sprintf("%s: %s -> %s", d.Name, d.Old.Decision, d.New.Decision)
+			if rule != "" {
+				line += " (" + rule + ")"
+			}
+			_, _ = fmt.Fprintln(stdout, line)
+		}
+		_, _ = fmt.Fprintf(stdout, "%d of %d cases decide differently\n", len(diffs), len(cases))
+	}
+	if len(diffs) > 0 {
+		return 1
+	}
+	return 0
+}
+
 // loadConfigFile reads and parses a config file for a subcommand that reports
 // "<command>: read config: ..." or "<command>: parse config: ...".
 func loadConfigFile(path string) (*config.Config, error) {
@@ -309,7 +498,7 @@ func decideGateCase(gate config.ToolGateConfig, c gateCase) (gateResult, error) 
 	}
 	totals[config.CallCountKey] = big.NewRat(int64(c.Calls), 1)
 	args := normalizeGateArgs(c.Args)
-	v, err := evaluateToolPolicy(gate, c.Tool, args, func(_, arg string) (*big.Rat, error) {
+	v, err := evaluateToolPolicy(gate, c.Tool, args, normalizeGateArgs(c.Definition), func(_, arg string) (*big.Rat, error) {
 		if t, ok := totals[arg]; ok {
 			return t, nil
 		}

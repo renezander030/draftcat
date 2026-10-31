@@ -37,26 +37,32 @@ func (s *StateStore) BudgetDay(ctx context.Context, at time.Time) (BudgetDay, er
 // A pending call survives a crash; no subsequent call can assume it was free.
 // Cost is a stop threshold on settled spend, not an estimated dollar ceiling.
 // The label's pipeline caps apply the same two checks to the calls settled for
-// that pipeline on the same UTC date, in the same statement.
+// that pipeline on the same UTC date, in the same statement. A label with a
+// reservation also counts the pending calls' reservations and its own against
+// the cost cap, so concurrent callers cannot jointly overshoot it.
 func (s *StateStore) BeginBudgetCall(ctx context.Context, id string, at time.Time, requested, tokenLimit int, costLimit float64, label UsageLabel) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("budget store unavailable")
 	}
-	if id == "" || requested < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) || math.IsNaN(label.PipelineDayCost) || math.IsInf(label.PipelineDayCost, 0) {
+	if id == "" || requested < 0 || math.IsNaN(costLimit) || math.IsInf(costLimit, 0) || math.IsNaN(label.PipelineDayCost) || math.IsInf(label.PipelineDayCost, 0) || !validReserve(label.ReserveCost) || !validReserve(label.PipelineReserveCost) {
 		return fmt.Errorf("invalid budget admission")
 	}
 	day := UTCDay(at)
-	result, err := s.db.ExecContext(ctx, `INSERT INTO budget_calls (call_id, day, status, created_at, model, pipeline)
- SELECT ?, ?, 'pending', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM budget_calls WHERE status='pending')
+	result, err := s.db.ExecContext(ctx, `INSERT INTO budget_calls (call_id, day, status, created_at, model, pipeline, reserved_cost, reserved_pipeline_cost)
+ SELECT ?, ?, 'pending', ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM budget_calls WHERE status='pending')
  AND (? <= 0 OR COALESCE((SELECT tokens FROM budget_days WHERE day=?),0) <= ? - ?)
  AND (? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) < ?)
+ AND (? <= 0 OR ? <= 0 OR COALESCE((SELECT cost FROM budget_days WHERE day=?),0) + (SELECT COALESCE(SUM(reserved_cost),0) FROM budget_calls WHERE status='pending') + ? <= ?)
  AND (? <= 0 OR (SELECT COALESCE(SUM(tokens),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') <= ? - ?)
- AND (? <= 0 OR (SELECT COALESCE(SUM(cost),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') < ?)`,
-		id, day, at.Unix(), label.Model, label.Pipeline,
+ AND (? <= 0 OR (SELECT COALESCE(SUM(cost),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') < ?)
+ AND (? <= 0 OR ? <= 0 OR (SELECT COALESCE(SUM(cost),0) FROM budget_calls WHERE day=? AND pipeline=? AND status='settled') + (SELECT COALESCE(SUM(reserved_pipeline_cost),0) FROM budget_calls WHERE pipeline=? AND status='pending') + ? <= ?)`,
+		id, day, at.Unix(), label.Model, label.Pipeline, label.ReserveCost, label.PipelineReserveCost,
 		tokenLimit, day, tokenLimit, requested,
 		costLimit, day, costLimit,
+		costLimit, label.ReserveCost, day, label.ReserveCost, costLimit,
 		label.PipelineDayTokens, day, label.Pipeline, label.PipelineDayTokens, requested,
-		label.PipelineDayCost, day, label.Pipeline, label.PipelineDayCost)
+		label.PipelineDayCost, day, label.Pipeline, label.PipelineDayCost,
+		label.PipelineDayCost, label.PipelineReserveCost, day, label.Pipeline, label.Pipeline, label.PipelineReserveCost, label.PipelineDayCost)
 	if err != nil {
 		return err
 	}
@@ -65,10 +71,15 @@ func (s *StateStore) BeginBudgetCall(ctx context.Context, id string, at time.Tim
 		return err
 	}
 	if n != 1 {
+		if label.ReserveCost > 0 || label.PipelineReserveCost > 0 {
+			return fmt.Errorf("BUDGET_BLOCKED: daily limit reached, unresolved provider usage, or a cost cap would be exceeded with this call's maximum cost; reconcile the pending call before retrying")
+		}
 		return fmt.Errorf("BUDGET_BLOCKED: daily limit reached or unresolved provider usage; reconcile the pending call before retrying")
 	}
 	return nil
 }
+
+func validReserve(v float64) bool { return v >= 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 
 // SettleBudgetCall charges an admitted call exactly once, including denied
 // output. Reconciliation may use this same method after verifying actual usage.
@@ -91,7 +102,7 @@ func (s *StateStore) SettleBudgetCall(ctx context.Context, id string, tokens int
 	if err := addBudgetUsageTx(ctx, tx, day, tokens, cost, 0, 0); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE budget_calls SET status='settled',tokens=?,cost=?,settled_at=? WHERE call_id=? AND status='pending'`, tokens, cost, time.Now().Unix(), id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE budget_calls SET status='settled',reserved_cost=0,reserved_pipeline_cost=0,tokens=?,cost=?,settled_at=? WHERE call_id=? AND status='pending'`, tokens, cost, time.Now().Unix(), id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -99,7 +110,7 @@ func (s *StateStore) SettleBudgetCall(ctx context.Context, id string, tokens int
 
 // ReleaseBudgetCall closes a request known not to have produced billable usage.
 func (s *StateStore) ReleaseBudgetCall(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE budget_calls SET status='rejected',settled_at=? WHERE call_id=? AND status='pending'`, time.Now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE budget_calls SET status='rejected',reserved_cost=0,reserved_pipeline_cost=0,settled_at=? WHERE call_id=? AND status='pending'`, time.Now().Unix(), id)
 	return err
 }
 
