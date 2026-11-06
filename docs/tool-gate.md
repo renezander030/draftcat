@@ -7,6 +7,9 @@ audit row. It is served on the webhook listener, so `tool_gate.enabled` requires
 bearer token. If `webhook.require_signature` is enabled, gate POST bodies also
 require `X-Draftcat-Signature`.
 
+Claude Code, Codex, GitHub Copilot CLI and Gemini CLI reach the gate through
+their pre-tool hooks with `draftcat gate hook`; see [harness hooks](harness-hooks.md).
+
 Two properties matter more than convenience, and everything below preserves
 them:
 

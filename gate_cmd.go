@@ -23,6 +23,8 @@ const gateUsage = `Usage:
   draftcat gate freeze [--reason text] [--config path]
   draftcat gate unfreeze [--config path]
   draftcat gate status [--json] [--config path]
+  draftcat gate hook --format claude|codex|copilot|gemini [--url URL] [--token-env VAR] [--agent NAME] [--wait 5m]
+  draftcat gate install claude-code|codex|copilot-cli|gemini-cli [--matcher REGEX] [--dir DIR | --user] [--dry-run] [--remove]
 
 check         decide one call against tool_gate without running the engine
 test          decide every case in a file and fail when one differs from its expect;
@@ -43,7 +45,13 @@ freeze        deny every gated tool call until unfreeze; a running engine sees i
               on its next call (also /freeze and /unfreeze in Telegram)
 unfreeze      lift the freeze
 status        show whether the gate is frozen, by whom, since when and why
-freeze, unfreeze and status use the state store of --config.`
+freeze, unfreeze and status use the state store of --config.
+
+hook          an agent harness's pre-tool hook: ask the gate about the call on
+              stdin, consume an allowed permit, answer allow or deny in the
+              harness's format; anything else blocks the call
+install       write that hook into the harness's settings file (project, or
+              --user); see 'draftcat gate install --help'`
 
 // gateCase is one entry of a `draftcat gate test` file.
 type gateCase struct {
@@ -87,6 +95,12 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	sub, rest := args[0], args[1:]
+	switch sub {
+	case "hook":
+		return gateHookCmd(rest, os.Stdin, stdout, stderr)
+	case "install":
+		return gateInstallCmd(rest, stdout, stderr)
+	}
 	configPath, asJSON, argsJSON := "config.yaml", false, ""
 	definitionPath, comparePath := "", ""
 	spent := map[string]string{}

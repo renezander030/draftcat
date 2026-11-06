@@ -2487,6 +2487,8 @@ func main() {
 			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
 			fmt.Println("  draftcat gate verify-grant <grant>     check an execution grant before running the tool")
 			fmt.Println("  draftcat gate <freeze|unfreeze|status> stop every gated tool call, lift the stop, show it")
+			fmt.Println("  draftcat gate hook --format <harness>  pre-tool hook for Claude Code, Codex, Copilot CLI, Gemini CLI")
+			fmt.Println("  draftcat gate install <harness>        write that hook into the harness's settings file")
 			return
 		}
 	}
