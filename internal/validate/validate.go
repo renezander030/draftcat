@@ -140,6 +140,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkTimeouts(cfg, rep)
 	checkBudgetAlerts(cfg, rep)
 	checkReserveMaxCost(cfg, rep)
+	checkReceiptAnchor(cfg, rep)
 	checkRolesToModels(cfg, rep)
 	checkEnvVars(cfg, rep)
 	checkPipelines(cfg, skills, skillsDir, rep)
@@ -341,6 +342,47 @@ func checkBudgetAlerts(cfg *config.Config, rep *validateReport) {
 	}
 	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 && !pipelineCaps {
 		rep.warnf("budgets.alert_at", "set per_day_tokens or per_day_cost; alerts are fractions of a daily cap")
+	}
+}
+
+// checkReceiptAnchor checks the scheduled receipt anchor: a schedule it can
+// keep, and somewhere to put the anchor. An anchor file next to the state
+// store shares its host and disk, so whoever can rewrite the receipts can
+// rewrite the anchors too.
+func checkReceiptAnchor(cfg *config.Config, rep *validateReport) {
+	a := cfg.Receipts.Anchor
+	if a == nil {
+		return
+	}
+	const p = "receipts.anchor"
+	if _, err := a.Schedule(); err != nil {
+		rep.errf(p, "%v", err)
+	} else if strings.TrimSpace(a.Every) != "" && strings.TrimSpace(a.Timezone) != "" {
+		rep.warnf(p+".timezone", "applies to at only; every runs on its interval")
+	}
+	file := strings.TrimSpace(a.File)
+	if file == "" {
+		if !a.Notify {
+			rep.errf(p, "set file or notify: true; without either the anchor is kept nowhere")
+		}
+		return
+	}
+	absFile, ferr := filepath.Abs(file)
+	absState, serr := filepath.Abs(cfg.StatePath())
+	if ferr != nil || serr != nil {
+		return
+	}
+	switch absFile {
+	case absState, absState + "-wal", absState + "-shm", absState + "-journal":
+		rep.errf(p+".file", "%s is the state store itself", file)
+		return
+	}
+	if info, err := os.Stat(absFile); err == nil && info.IsDir() {
+		rep.errf(p+".file", "%s is a directory; name the file the anchors are appended to", file)
+		return
+	}
+	if rel, err := filepath.Rel(filepath.Dir(absState), absFile); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		rep.warnf(p+".file", "%s sits in the state directory, on the same host and disk as the receipts it anchors; keep it on another disk or host", file)
 	}
 }
 

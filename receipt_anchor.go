@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -24,7 +26,10 @@ const anchorTrailHex = 16
 // The trail lists each covered receipt with a prefix of its link, so a later
 // check can name the position where the stored history stops matching.
 type receiptAnchor struct {
-	Format         string        `json:"format"`
+	Format string `json:"format"`
+	// AnchoredAt is when a scheduled anchor was taken; a line of the anchor
+	// file and the operator message carry it, `receipts anchor` does not.
+	AnchoredAt     string        `json:"anchored_at,omitempty"`
 	Count          int           `json:"count"`
 	FirstReceiptID string        `json:"first_receipt_id,omitempty"`
 	LastReceiptID  string        `json:"last_receipt_id,omitempty"`
@@ -50,6 +55,11 @@ type anchorResult struct {
 	StoreReceiptID  string `json:"store_receipt_id,omitempty"`
 	Link            string `json:"link"`
 	Detail          string `json:"detail"`
+	// Checking an anchor log: the anchors in the log, and the line (with its
+	// time) this result is about, the first that fails or else the newest.
+	Anchors    int    `json:"anchors,omitempty"`
+	Line       int    `json:"line,omitempty"`
+	AnchoredAt string `json:"anchored_at,omitempty"`
 }
 
 func formatLink(l [32]byte) string { return "sha256:" + hex.EncodeToString(l[:]) }
@@ -66,7 +76,11 @@ func receiptChainLinks(rows []statestore.ApprovalRecord) [][32]byte {
 
 // buildReceiptAnchor anchors every stored receipt.
 func buildReceiptAnchor(rows []statestore.ApprovalRecord) receiptAnchor {
-	links := receiptChainLinks(rows)
+	return anchorFromLinks(rows, receiptChainLinks(rows))
+}
+
+// anchorFromLinks builds the anchor from links already computed over rows.
+func anchorFromLinks(rows []statestore.ApprovalRecord, links [][32]byte) receiptAnchor {
 	a := receiptAnchor{Format: receiptAnchorFormat, Count: len(rows), Link: formatLink(links[len(rows)]), Trail: []anchorEntry{}}
 	for i, r := range rows {
 		a.Trail = append(a.Trail, anchorEntry{ReceiptID: receiptID(r), Link: hex.EncodeToString(links[i+1][:])[:anchorTrailHex]})
@@ -89,8 +103,10 @@ func validLink(s string) bool {
 }
 
 // parseReceiptAnchor reads an anchor given as a bare terminal link
-// (sha256:...), a JSON file written by `receipts anchor --json`, or - for
-// stdin. A bare link carries no count; Count is -1 then.
+// (sha256:...), a JSON document written by `receipts anchor --json` (a file,
+// - for stdin, or the JSON itself), or one line of the scheduled anchor file
+// or message, given the same ways. A bare link carries no count; Count is -1
+// then.
 func parseReceiptAnchor(arg string, stdin io.Reader) (receiptAnchor, error) {
 	if strings.HasPrefix(arg, "sha256:") {
 		if !validLink(arg) {
@@ -100,32 +116,102 @@ func parseReceiptAnchor(arg string, stdin io.Reader) (receiptAnchor, error) {
 	}
 	var body []byte
 	var err error
-	if arg == "-" {
+	switch {
+	case arg == "-":
 		body, err = io.ReadAll(io.LimitReader(stdin, 64<<20))
-	} else {
+	case strings.HasPrefix(strings.TrimSpace(arg), "{"):
+		body = []byte(arg)
+	default:
 		body, err = os.ReadFile(arg) // #nosec G304 -- the operator names the anchor file
 	}
 	if err != nil {
 		return receiptAnchor{}, err
 	}
+	a, err := parseAnchorDocument(body)
+	if err != nil {
+		return a, fmt.Errorf("anchor file: %w", err)
+	}
+	return a, nil
+}
+
+// parseAnchorDocument decodes and checks one anchor document.
+func parseAnchorDocument(body []byte) (receiptAnchor, error) {
 	var a receiptAnchor
 	if err := decodeStrictJSON(body, &a); err != nil {
-		return receiptAnchor{}, fmt.Errorf("anchor file: %w", err)
+		return receiptAnchor{}, err
 	}
 	switch {
 	case a.Format != receiptAnchorFormat:
-		return a, fmt.Errorf("anchor file: format %q, want %q", a.Format, receiptAnchorFormat)
+		return a, fmt.Errorf("format %q, want %q", a.Format, receiptAnchorFormat)
 	case a.Count < 0:
-		return a, fmt.Errorf("anchor file: count must not be negative")
+		return a, fmt.Errorf("count must not be negative")
 	case !validLink(a.Link):
-		return a, fmt.Errorf("anchor file: link is not sha256: followed by 64 lowercase hex digits")
+		return a, fmt.Errorf("link is not sha256: followed by 64 lowercase hex digits")
 	case len(a.Trail) != 0 && len(a.Trail) != a.Count:
-		return a, fmt.Errorf("anchor file: trail holds %d entries for %d receipts", len(a.Trail), a.Count)
+		return a, fmt.Errorf("trail holds %d entries for %d receipts", len(a.Trail), a.Count)
 	}
 	if n := len(a.Trail); n > 0 && !strings.HasPrefix(a.Link, "sha256:"+a.Trail[n-1].Link) {
-		return a, fmt.Errorf("anchor file: the last trail entry does not match the link")
+		return a, fmt.Errorf("the last trail entry does not match the link")
+	}
+	if a.AnchoredAt != "" {
+		if _, err := time.Parse(time.RFC3339, a.AnchoredAt); err != nil {
+			return a, fmt.Errorf("anchored_at is not an RFC 3339 time")
+		}
 	}
 	return a, nil
+}
+
+// loggedAnchor is one anchor of an anchor log and the line it stands on.
+type loggedAnchor struct {
+	line   int
+	anchor receiptAnchor
+}
+
+// readAnchorLog reads every anchor of a file the scheduled anchor appends to,
+// oldest first. Blank lines are skipped; any other line must be an anchor.
+func readAnchorLog(path string) ([]loggedAnchor, error) {
+	f, err := os.Open(path) // #nosec G304 -- the operator names the anchor log
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<20) // a line carries one trail entry per receipt
+	var out []loggedAnchor
+	for n := 1; sc.Scan(); n++ {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		a, err := parseAnchorDocument(line)
+		if err != nil {
+			return nil, fmt.Errorf("anchor log line %d: %w", n, err)
+		}
+		out = append(out, loggedAnchor{line: n, anchor: a})
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("anchor log: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("anchor log %s holds no anchor", path)
+	}
+	return out, nil
+}
+
+// checkAnchorLog checks the store against every anchor of a log, oldest
+// first, and returns the first that fails, or the newest when all match. A
+// newer anchor taken after the history was changed would match the changed
+// history; the older anchors still name the change.
+func checkAnchorLog(rows []statestore.ApprovalRecord, entries []loggedAnchor) anchorResult {
+	var res anchorResult
+	for _, e := range entries {
+		res = checkReceiptAnchor(rows, e.anchor)
+		res.Anchors, res.Line, res.AnchoredAt = len(entries), e.line, e.anchor.AnchoredAt
+		if res.Status != "match" {
+			break
+		}
+	}
+	return res
 }
 
 // checkReceiptAnchor recomputes the chain over the stored receipts and
@@ -216,6 +302,17 @@ func classifyDivergence(res *anchorResult, rows []statestore.ApprovalRecord, a r
 }
 
 func printAnchorResult(w io.Writer, res anchorResult) {
+	if res.Anchors > 0 {
+		at := ""
+		if res.AnchoredAt != "" {
+			at = ", anchored " + res.AnchoredAt
+		}
+		if res.Status == "match" {
+			_, _ = fmt.Fprintf(w, "anchor log ok: all %d anchor(s) match; the newest is line %d%s\n", res.Anchors, res.Line, at)
+		} else {
+			_, _ = fmt.Fprintf(w, "anchor log MISMATCH: line %d%s is the first of %d anchor(s) the store fails\n", res.Line, at, res.Anchors)
+		}
+	}
 	if res.Status == "match" {
 		_, _ = fmt.Fprintf(w, "anchor ok: %s (%s)\n", res.Detail, res.Link)
 		return
@@ -282,22 +379,30 @@ func runReceiptsAnchor(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// runReceiptsVerifyAnchor checks the stored history against an anchor.
+const verifyAnchorUsage = "Usage: draftcat receipts verify-anchor <sha256:...|anchor.json|anchor line|-> [--json] [--config path]\n" +
+	"       draftcat receipts verify-anchor --log anchors.jsonl [--json] [--config path]"
+
+// runReceiptsVerifyAnchor checks the stored history against an anchor, or
+// with --log against every anchor of a scheduled anchor file.
 func runReceiptsVerifyAnchor(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	configPath, jsonOut, anchorArg := "config.yaml", false, ""
+	configPath, jsonOut, anchorArg, logPath := "config.yaml", false, "", ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--json":
 			jsonOut = true
-		case "--config", "-config":
+		case "--config", "-config", "--log":
 			if i+1 >= len(args) {
-				_, _ = fmt.Fprintln(stderr, "receipts verify-anchor: --config requires a path")
+				_, _ = fmt.Fprintf(stderr, "receipts verify-anchor: %s requires a path\n", args[i])
 				return 2
 			}
-			configPath = args[i+1]
+			if args[i] == "--log" {
+				logPath = args[i+1]
+			} else {
+				configPath = args[i+1]
+			}
 			i++
 		case "-h", "--help":
-			_, _ = fmt.Fprintln(stdout, "Usage: draftcat receipts verify-anchor <sha256:...|anchor.json|-> [--json] [--config path]")
+			_, _ = fmt.Fprintln(stdout, verifyAnchorUsage)
 			return 0
 		default:
 			if anchorArg != "" || (strings.HasPrefix(args[i], "-") && args[i] != "-") {
@@ -307,11 +412,18 @@ func runReceiptsVerifyAnchor(args []string, stdin io.Reader, stdout, stderr io.W
 			anchorArg = args[i]
 		}
 	}
-	if anchorArg == "" {
-		_, _ = fmt.Fprintln(stderr, "Usage: draftcat receipts verify-anchor <sha256:...|anchor.json|-> [--json] [--config path]")
+	if (anchorArg == "") == (logPath == "") {
+		_, _ = fmt.Fprintln(stderr, verifyAnchorUsage)
 		return 2
 	}
-	a, err := parseReceiptAnchor(anchorArg, stdin)
+	var a receiptAnchor
+	var entries []loggedAnchor
+	var err error
+	if logPath != "" {
+		entries, err = readAnchorLog(logPath)
+	} else {
+		a, err = parseReceiptAnchor(anchorArg, stdin)
+	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "receipts verify-anchor: %v\n", err)
 		return 2
@@ -320,7 +432,12 @@ func runReceiptsVerifyAnchor(args []string, stdin io.Reader, stdout, stderr io.W
 	if code != 0 {
 		return code
 	}
-	res := checkReceiptAnchor(rows, a)
+	var res anchorResult
+	if entries != nil {
+		res = checkAnchorLog(rows, entries)
+	} else {
+		res = checkReceiptAnchor(rows, a)
+	}
 	if jsonOut {
 		b, _ := json.MarshalIndent(res, "", "  ")
 		_, _ = fmt.Fprintln(stdout, string(b))

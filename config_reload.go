@@ -25,7 +25,7 @@ import (
 // that only shape runs (pipelines, models, roles, budgets, timeouts, model and
 // approval policy, skills) and keeps the sections that built long-lived
 // resources at start (channels, provider, state, listeners, tool gate,
-// observability, voice) as they are, naming any that changed so the operator
+// observability, voice, the receipt anchor schedule) as they are, naming any that changed so the operator
 // knows a restart is needed for them.
 
 var (
@@ -63,6 +63,7 @@ func restartOnlySections(c *config.Config) map[string]interface{} {
 		"tool_gate":     c.ToolGate,
 		"observability": c.Observ,
 		"voice":         c.Voice,
+		"receipts":      c.Receipts,
 	}
 }
 

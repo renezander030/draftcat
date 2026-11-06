@@ -216,6 +216,21 @@ its first check.
 restart is needed. `draftcat validate` rejects a time that is not `HH:MM` and
 an unknown zone.
 
+## Receipt anchors
+
+```yaml
+receipts:
+  anchor:
+    every: 24h                 # or at: "07:00" with timezone
+    file: /mnt/audit/anchors.jsonl
+    notify: true
+```
+
+On each slot the engine anchors the receipt history and, when it changed,
+appends the anchor to `file` and sends it to the operator channel as
+`[anchor] ...`, so a copy lives off the host. An unchanged history sends
+nothing. See [Anchoring on a schedule](action-receipts.md#anchoring-on-a-schedule).
+
 ## Metrics
 
 With `observability.prometheus.enabled`, `/metrics` adds current-state gauges

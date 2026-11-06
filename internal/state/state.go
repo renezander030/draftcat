@@ -223,6 +223,14 @@ CREATE TABLE IF NOT EXISTS operator_digest (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     last_day     TEXT NOT NULL DEFAULT ''     -- local date the digest was last evaluated for
 );
+CREATE TABLE IF NOT EXISTS receipt_anchor_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    slot_at      INTEGER NOT NULL DEFAULT 0,  -- when the last scheduled anchor was handled
+    link         TEXT NOT NULL DEFAULT '',    -- the anchor taken then
+    file         TEXT NOT NULL DEFAULT '',    -- the file the last anchor line went to
+    file_link    TEXT NOT NULL DEFAULT '',    -- the anchor in that line
+    notify_link  TEXT NOT NULL DEFAULT ''     -- the anchor last sent to the operator
+);
 `
 	if _, err := tx.ExecContext(context.Background(), schema); err != nil {
 		return err

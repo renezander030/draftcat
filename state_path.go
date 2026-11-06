@@ -10,21 +10,11 @@ import (
 	"github.com/renezander030/draftcat/internal/config"
 )
 
-const defaultStatePath = "./state.db"
+const defaultStatePath = config.DefaultStatePath
 
-// resolveStatePath is where the engine and every subcommand find the state store:
-// DRAFTCAT_STATE_PATH first (so a container can point state at a mounted disk
-// without shadowing the baked config), then the config's state.path, then
-// ./state.db.
-func resolveStatePath(cfg *config.Config) string {
-	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
-		return v
-	}
-	if cfg != nil && cfg.State.Path != "" {
-		return cfg.State.Path
-	}
-	return defaultStatePath
-}
+// resolveStatePath is where the engine and every subcommand find the state
+// store; see config.Config.StatePath.
+func resolveStatePath(cfg *config.Config) string { return cfg.StatePath() }
 
 // statePathFromConfigFile applies resolveStatePath for a subcommand that only has a
 // --config argument. The config is read only when the env override is unset;

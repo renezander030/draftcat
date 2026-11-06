@@ -2478,6 +2478,7 @@ func main() {
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
 			fmt.Println("  draftcat receipts anchor [--json]      hash-chain anchor of the whole receipt history; keep it outside the store")
+			fmt.Println("  draftcat receipts verify-anchor --log <anchors.jsonl>  check the history against every anchor receipts.anchor wrote")
 			fmt.Println("  draftcat report [--since 30d] [--json]  who approved, skipped or let time out, per pipeline and step")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat audit-verify <pipeline> --anchor <sha256:...|file.json>  also detect deleted, inserted or reordered receipts")
@@ -2754,6 +2755,11 @@ func main() {
 	if derr != nil {
 		log.Printf("[digest] disabled: %v", derr)
 	}
+	// Scheduled receipt anchor kept off the store; absent receipts.anchor = none.
+	anchorJob, aerr := newReceiptAnchorJob(&cfg, func(m string) error { return opChan.Send(m) })
+	if aerr != nil {
+		log.Printf("[anchor] disabled: %v", aerr)
+	}
 
 	// Main event loop — polls for commands and runs scheduled pipelines
 	ticker := time.NewTicker(2 * time.Second)
@@ -2980,6 +2986,7 @@ Conversation so far:
 			}
 
 			digest.tick(time.Now())
+			anchorJob.tick(time.Now())
 
 			// 2. Check for scheduled pipelines
 			for _, name := range sched.ClaimDue() {

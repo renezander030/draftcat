@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/renezander030/draftcat/internal/outputschema"
+	"github.com/renezander030/draftcat/internal/schedule"
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -43,6 +44,7 @@ type Config struct {
 	Webhook     WebhookConfig          `yaml:"webhook"`
 	Observ      ObservabilityConfig    `yaml:"observability"`
 	Pipelines   []PipelineConfig       `yaml:"pipelines"`
+	Receipts    ReceiptsConfig         `yaml:"receipts"`
 	// Voice is parsed unconditionally as raw YAML. Decoded into voice.Config
 	// only when draftcat is built with -tags voice. Lean builds ignore it.
 	Voice yaml.Node `yaml:"voice"`
@@ -52,6 +54,69 @@ type Config struct {
 // run history). Empty Path defaults to "./state.db".
 type StateConfig struct {
 	Path string `yaml:"path"`
+}
+
+// DefaultStatePath is the state store when neither DRAFTCAT_STATE_PATH nor
+// state.path names one.
+const DefaultStatePath = "./state.db"
+
+// StatePath is where the engine and every subcommand find the state store:
+// DRAFTCAT_STATE_PATH first (so a container can point state at a mounted disk
+// without shadowing the baked config), then state.path, then ./state.db.
+func (c *Config) StatePath() string {
+	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
+		return v
+	}
+	if c != nil && c.State.Path != "" {
+		return c.State.Path
+	}
+	return DefaultStatePath
+}
+
+// ReceiptsConfig holds settings for the approval receipt history.
+type ReceiptsConfig struct {
+	// Anchor, when set, has the engine take an anchor of the whole receipt
+	// history on a schedule and keep it outside the store. Absent = none.
+	Anchor *ReceiptAnchorConfig `yaml:"anchor"`
+}
+
+// ReceiptAnchorConfig schedules the receipt anchor: Every is an interval
+// ("24h"), or At is "HH:MM" (24-hour) once a day in Timezone, an IANA zone
+// name (empty = the process's local zone). Exactly one of Every and At is
+// set. File, when set, gets one JSON line per anchor; Notify sends the anchor
+// to the operator channel.
+type ReceiptAnchorConfig struct {
+	Every    string `yaml:"every"`
+	At       string `yaml:"at"`
+	Timezone string `yaml:"timezone"`
+	File     string `yaml:"file"`
+	Notify   bool   `yaml:"notify"`
+}
+
+// MinReceiptAnchorEvery is the shortest interval receipts.anchor.every takes.
+const MinReceiptAnchorEvery = time.Minute
+
+// Schedule parses when the anchor is taken. It refuses neither or both of
+// every and at, an interval under MinReceiptAnchorEvery, a time that is not
+// HH:MM and an unknown zone.
+func (a ReceiptAnchorConfig) Schedule() (schedule.Schedule, error) {
+	every, at := strings.TrimSpace(a.Every), strings.TrimSpace(a.At)
+	switch {
+	case every == "" && at == "":
+		return schedule.Schedule{}, fmt.Errorf("set every (an interval such as 24h) or at (HH:MM)")
+	case every != "" && at != "":
+		return schedule.Schedule{}, fmt.Errorf("set every or at, not both")
+	case at != "":
+		return schedule.ParseDaily(at, a.Timezone)
+	}
+	d, err := time.ParseDuration(every)
+	if err != nil {
+		return schedule.Schedule{}, fmt.Errorf("every %q is not a duration such as 24h", every)
+	}
+	if d < MinReceiptAnchorEvery {
+		return schedule.Schedule{}, fmt.Errorf("every %s is shorter than the minimum %s", every, MinReceiptAnchorEvery)
+	}
+	return schedule.Parse(every, a.Timezone)
 }
 
 type TelegramConfig struct {
