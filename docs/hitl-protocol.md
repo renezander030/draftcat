@@ -250,6 +250,13 @@ who wants in-place card updates — but it becomes *their* deployment choice, no
 draftcat's dependency. Slack, Discord, email, PagerDuty and a plain CLI script
 are the same three steps against a different presenter.
 
+`contrib/teams-relay` is the self-hosted Teams relay. `contrib/slack-relay` does
+the same for Slack: it posts the draft to a channel as a Block Kit message with
+Approve / Skip / Adjust buttons, verifies Slack's request signature on every
+click, maps the clicking Slack user to an operator identity, and passes
+`draftcat hitl verify`. Name it in a step as `channel: relay`; `channel: slack`
+stays a validation error.
+
 ---
 
 ## 7. Conformance

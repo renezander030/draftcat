@@ -47,6 +47,14 @@ var validStepTypes = map[string]bool{
 // reads too. Keeping a second list here is what let `channel: slack` pass
 // validation for a channel that was never built.
 
+// relayedSurfaces are names an operator may write for a surface that draftcat
+// reaches only through the `relay` channel. They stay errors, since the engine
+// would never route to them; the message points at the relay that does.
+var relayedSurfaces = map[string]string{
+	"slack": "contrib/slack-relay",
+	"teams": "contrib/teams-relay",
+}
+
 type validateFinding struct {
 	Level   string `json:"level"`
 	Path    string `json:"path"`
@@ -582,6 +590,9 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				// channel the draft never reaches, while validate said OK.
 				if st.Channel == "" {
 					rep.errf(spath+".channel", "approval step requires 'channel'")
+				} else if relayDir, ok := relayedSurfaces[st.Channel]; ok {
+					rep.errf(spath+".channel", "channel %q is not implemented in draftcat — reach it with 'channel: relay' and the hitl/v0 relay in %s (see docs/hitl-protocol.md)",
+						st.Channel, relayDir)
 				} else if !channels.IsImplemented(st.Channel) {
 					rep.errf(spath+".channel", "channel %q is not implemented — approvals cannot be routed there (implemented: %s)",
 						st.Channel, strings.Join(knownApprovalChannels(), ", "))

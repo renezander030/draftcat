@@ -47,6 +47,22 @@ func TestValidateRejectsUnimplementedChannel(t *testing.T) {
 	if !strings.Contains(errs[0].Message, "not implemented") {
 		t.Errorf("message %q should say the channel is not implemented", errs[0].Message)
 	}
+	// Slack is reached through the relay channel; the error says how.
+	for _, want := range []string{"channel: relay", "contrib/slack-relay"} {
+		if !strings.Contains(errs[0].Message, want) {
+			t.Errorf("message %q should point at %q", errs[0].Message, want)
+		}
+	}
+}
+
+func TestValidateTeamsPointsAtItsRelay(t *testing.T) {
+	cfg := approvalCfg(config.StepConfig{
+		Name: "gate", Type: "approval", Channel: "teams",
+	})
+	errs := findingsAt(runCheckPipelines(cfg), "error", ".channel")
+	if len(errs) == 0 || !strings.Contains(errs[0].Message, "contrib/teams-relay") {
+		t.Fatalf("channel 'teams' must error and point at its relay; got %+v", errs)
+	}
 }
 
 func TestValidateAcceptsImplementedChannel(t *testing.T) {
