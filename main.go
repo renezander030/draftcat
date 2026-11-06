@@ -1065,6 +1065,10 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 
 	// Pipeline data flows through this map
 	data := map[string]interface{}{}
+	// approvedRequests holds, per http_request step, the digest of the request
+	// an approval step showed and the operator released. It lives outside
+	// data so no run input can forge it.
+	approvedRequests := map[string]string{}
 
 	// Mock test data
 	data["input"] = `Title: Senior AI/LLM Engineer - Build RAG Pipeline for Legal Documents
@@ -1256,6 +1260,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				data["pdf_page_count"] = fmt.Sprintf("%d", len(doc.Pages))
 				log.Printf("[pipeline:%s][step:%s] parsed %s: %d pages", pipeline.Name, step.Name, doc.Filename, len(doc.Pages))
 
+			case httpRequestAction:
+				if err := runHTTPRequest(ctx, runID, pipeline.Name, step, data, approvedRequests[step.Name]); err != nil {
+					return fmt.Errorf("[step:%s] %w", step.Name, err)
+				}
+				stepFields["http_status"] = data["http_status"]
+
 			case "pdf_verify_cite":
 				doc, ok := data["pdf_doc"].(*pdf.PDFDoc)
 				if !ok {
@@ -1397,6 +1407,19 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				draftMsg = fmt.Sprintf("[draftcat] Draft for review:\n\n%v", v)
 			}
 
+			// An approval step that releases an http_request shows the request
+			// itself, so the operator approves the bytes that will be sent.
+			outbound := releasedHTTPRequest(pipeline.Steps, stepIndex)
+			var outboundDigest string
+			if outbound != nil {
+				desc, digest, oerr := outboundDraft(*outbound, runID, data)
+				if oerr != nil {
+					return fmt.Errorf("[step:%s] %w", step.Name, oerr)
+				}
+				draftMsg = "[draftcat] Outbound request for review:\n\n" + desc
+				outboundDigest = digest
+			}
+
 			// Send for approval via operator channel (TG buttons, Slack reactions, etc.)
 			// Unlike OperatorApprovalWindow, a negative value (reachable only
 			// with DRAFTCAT_SKIP_VALIDATE=1) is kept as is.
@@ -1514,6 +1537,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					}
 				}
 				data["approved"] = true
+				if outbound != nil {
+					approvedRequests[outbound.Name] = outboundDigest
+				}
 				break
 			}
 
@@ -1558,6 +1584,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
 					}
 					data["approved"] = true
+					if outbound != nil {
+						approvedRequests[outbound.Name] = outboundDigest
+					}
 					break
 				}
 				if action == "skip" {
@@ -1608,6 +1637,18 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 				// Revised draft re-enters the gate (at 0/N for quorum steps).
 				currentDraft = fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
+				if outbound != nil {
+					// The rewrite becomes the output the request is built from,
+					// and the operator reviews the request it now makes.
+					data["ai_output"] = revisedOutput(data["ai_output"], resp.Text)
+					data["ai_raw"] = resp.Text
+					desc, digest, oerr := outboundDraft(*outbound, runID, data)
+					if oerr != nil {
+						return fmt.Errorf("[step:%s] %w", step.Name, oerr)
+					}
+					currentDraft = "[draftcat] Revised outbound request for review:\n\n" + desc
+					outboundDigest = digest
+				}
 			}
 		}
 
@@ -1800,7 +1841,7 @@ func handleCommand(cmd string, args string, from int64, bot *TGBot, sched *Sched
 			_ = bot.Send(reloadHook())
 		}
 	case "/help":
-		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant\n/freeze [reason] - Stop every gated tool call\n/unfreeze - Lift the freeze")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant\n/freeze [reason] - Stop every gated tool call\n/unfreeze [agent] - Lift the freeze, or one agent's")
 	}
 }
 
@@ -2246,15 +2287,8 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 		bot.Send("[run] Usage: /run <pipeline-name>")
 		return
 	}
-	// Find pipeline config
-	var pipeline *config.PipelineConfig
-	for i := range cfg.Pipelines {
-		if cfg.Pipelines[i].Name == name {
-			pipeline = &cfg.Pipelines[i]
-			break
-		}
-	}
-	if pipeline == nil {
+	pipeline, ok := cfg.Pipeline(name)
+	if !ok {
 		bot.Send(fmt.Sprintf("[run] Unknown pipeline: %s", name))
 		return
 	}
@@ -2264,22 +2298,13 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 	}
 	bot.Send(fmt.Sprintf("[run] Starting: %s", name))
 	go func() {
-		err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil)
+		err := runPipeline(cfg, pipeline, budget, gateChannel(bot), skills, nil)
 		if err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
 			_ = bot.Send(fmt.Sprintf("[run] ERROR in %s: %s%s", name, err, haltNote(err)))
 		}
 		finishRun(sched, bot, name, err)
 	}()
-}
-
-func pipelineByName(cfg *config.Config, name string) (config.PipelineConfig, bool) {
-	for i := range cfg.Pipelines {
-		if cfg.Pipelines[i].Name == name {
-			return cfg.Pipelines[i], true
-		}
-	}
-	return config.PipelineConfig{}, false
 }
 
 // finishRun releases a run's claim and tells the operator when the failure
@@ -2308,6 +2333,13 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *conf
 		report += "\n" + line
 	}
 	_ = bot.Send(report)
+}
+
+func capReachedNote(used, limit int) string {
+	if used >= limit {
+		return " (reached; new calls are refused)"
+	}
+	return ""
 }
 
 // statusReport renders /status. Spend is shown against every cap that is
@@ -2340,11 +2372,13 @@ func statusReport(active, paused int, budget *BudgetTracker, cfg *config.Config,
 	if budget.pipelineCostLimit > 0 {
 		lines = append(lines, fmt.Sprintf("Per-pipeline cap: %.4f", budget.pipelineCostLimit))
 	}
+	// Voice usage is recorded by the voice plugin in the same ledger; a call
+	// is refused once either total reaches its cap.
 	if cap := cfg.Budgets.PerDayCalls; cap > 0 {
-		lines = append(lines, fmt.Sprintf("Calls today: %d / %d", budget.callsToday, cap))
+		lines = append(lines, fmt.Sprintf("Calls today: %d / %d%s", budget.callsToday, cap, capReachedNote(budget.callsToday, cap)))
 	}
 	if cap := cfg.Budgets.PerDayCallMinutes; cap > 0 {
-		lines = append(lines, fmt.Sprintf("Call minutes today: %d / %d", budget.callMinutesToday, cap))
+		lines = append(lines, fmt.Sprintf("Call minutes today: %d / %d%s", budget.callMinutesToday, cap, capReachedNote(budget.callMinutesToday, cap)))
 	}
 	switch {
 	case openErr != nil:
@@ -2494,6 +2528,7 @@ func main() {
 			fmt.Println("  draftcat pending [--json]              approval gates waiting on a human right now")
 			fmt.Println("  draftcat receipts <list|show|export|verify> inspect, export, or verify receipts")
 			fmt.Println("  draftcat receipts anchor [--json]      hash-chain anchor of the whole receipt history; keep it outside the store")
+			fmt.Println("  draftcat receipts verify-anchor --log <anchors.jsonl>  check the history against every anchor receipts.anchor wrote")
 			fmt.Println("  draftcat report [--since 30d] [--json]  who approved, skipped or let time out, per pipeline and step")
 			fmt.Println("  draftcat audit-verify <pipeline>       check approval-receipt signatures (needs DRAFTCAT_APPROVAL_SECRET)")
 			fmt.Println("  draftcat audit-verify <pipeline> --anchor <sha256:...|file.json>  also detect deleted, inserted or reordered receipts")
@@ -2502,7 +2537,12 @@ func main() {
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
 			fmt.Println("  draftcat gate verify-grant <grant>     check an execution grant before running the tool")
+			fmt.Println("  draftcat gate diff-definition <a> <b>  name what changed between two tool definitions")
 			fmt.Println("  draftcat gate <freeze|unfreeze|status> stop every gated tool call, lift the stop, show it")
+			fmt.Println("  draftcat gate hook --format <harness>  pre-tool hook for Claude Code, Codex, Copilot CLI, Gemini CLI")
+			fmt.Println("  draftcat gate install <harness>        write that hook into the harness's settings file")
+			fmt.Println("  draftcat gate unfreeze --agent <name>  lift one agent's freeze (tool_gate.trip)")
+			fmt.Println("  draftcat gate shadow [--since 7d]      live calls the tool_gate.shadow candidate decided differently")
 			return
 		}
 	}
@@ -2585,20 +2625,26 @@ func main() {
 	// boot a knowingly-imperfect config in an emergency.
 	if os.Getenv("DRAFTCAT_SKIP_VALIDATE") == "" {
 		findings := validate.CheckAtStartup(&cfg, skillsDir)
-		fatal := 0
 		for _, f := range findings {
 			if f.Level == "error" {
 				log.Printf("[config] ERROR %s: %s", f.Path, f.Message)
-				fatal++
 			} else {
 				log.Printf("[config] warn  %s: %s", f.Path, f.Message)
 			}
 		}
-		if fatal > 0 {
+		if fatal := validate.Summarize(findings).Errors; fatal > 0 {
 			log.Fatalf("[config] %d error(s) in %s — refusing to start. Fix them, or set DRAFTCAT_SKIP_VALIDATE=1 to override.", fatal, configPath)
 		}
 	} else {
 		log.Printf("[config] WARNING: startup validation skipped (DRAFTCAT_SKIP_VALIDATE set)")
+	}
+	// A served gate reads each rule's definition_file now and on every reload.
+	// Reading is not validation, so it is never skipped: a pin the gate does
+	// not have cannot be decided on.
+	if cfg.ToolGate.Enabled {
+		if err := loadToolDefinitions(&cfg.ToolGate); err != nil {
+			log.Fatalf("[config] %v — refusing to start", err)
+		}
 	}
 
 	// The relay channel is built here, before the state store and voice bridge
@@ -2649,10 +2695,6 @@ func main() {
 		log.Printf("[state] opened %s", statePath)
 	}
 
-	// Voice plugin (build-tag voice). No-op in lean builds.
-	vbridge = voicebridge.Boot(cfg.Voice, state, ghl)
-	defer vbridge.Shutdown()
-
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)
 
@@ -2684,6 +2726,17 @@ func main() {
 		log.Printf("[budget] usage ledger unavailable; model calls blocked: %v", err)
 	}
 	budget.configureAlerts(&cfg, func(msg string) { _ = opChan.Send(msg) })
+
+	// Voice plugin (build-tag voice). No-op in lean builds. Booted once the
+	// operator channel is chosen, since its call caps notify the operator.
+	vbridge = voicebridge.Boot(cfg.Voice, state, ghl, voicebridge.CallBudget{
+		Caps: func() (int, int) {
+			b := currentConfig(&cfg).Budgets
+			return b.PerDayCalls, b.PerDayCallMinutes
+		},
+		Notify: func(msg string) { _ = opChan.Send(msg) },
+	})
+	defer vbridge.Shutdown()
 	chatHistory := newChatHistory(20) // keep last 20 turns
 
 	// Any approval gate still marked pending was open when this process last
@@ -2732,6 +2785,9 @@ func main() {
 		}
 	}
 
+	// Shadow policy: a candidate tool_gate decides beside the live one.
+	startShadow(&cfg, func(m string) { _ = opChan.Send(m) })
+
 	// Webhook trigger server — opt-in; opens no port unless enabled.
 	var webhookSrv *http.Server
 	if cfg.Webhook.Enabled {
@@ -2769,6 +2825,11 @@ func main() {
 	digest, derr := newDigestJob(&cfg, func(m string) error { return opChan.Send(m) })
 	if derr != nil {
 		log.Printf("[digest] disabled: %v", derr)
+	}
+	// Scheduled receipt anchor kept off the store; absent receipts.anchor = none.
+	anchorJob, aerr := newReceiptAnchorJob(&cfg, func(m string) error { return opChan.Send(m) })
+	if aerr != nil {
+		log.Printf("[anchor] disabled: %v", aerr)
 	}
 
 	// Main event loop — polls for commands and runs scheduled pipelines
@@ -2996,11 +3057,12 @@ Conversation so far:
 			}
 
 			digest.tick(time.Now())
+			anchorJob.tick(time.Now())
 
 			// 2. Check for scheduled pipelines
 			for _, name := range sched.ClaimDue() {
 				runCfg, runSkills := currentConfig(&cfg), currentSkills(skillReg)
-				p, ok := pipelineByName(runCfg, name)
+				p, ok := runCfg.Pipeline(name)
 				if !ok {
 					sched.Release(name)
 					continue
@@ -3195,6 +3257,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		gateAuth := newGateAuthenticator(secret, cfg.ToolGate).middleware(maxBody, maxSkew, cfg.Webhook.RequireSignature)
 		mux.Handle(toolGatePath, gateAuth(http.HandlerFunc(gate.HandleCall)))
 		mux.Handle(toolGatePath+"/", gateAuth(http.HandlerFunc(gate.HandleStatus)))
+		mux.Handle(toolGateBudgetPath, gateAuth(http.HandlerFunc(gate.HandleBudget)))
 		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
 	}
 

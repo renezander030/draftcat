@@ -7,6 +7,9 @@ audit row. It is served on the webhook listener, so `tool_gate.enabled` requires
 bearer token. If `webhook.require_signature` is enabled, gate POST bodies also
 require `X-Draftcat-Signature`.
 
+Claude Code, Codex, GitHub Copilot CLI and Gemini CLI reach the gate through
+their pre-tool hooks with `draftcat gate hook`; see [harness hooks](harness-hooks.md).
+
 Two properties matter more than convenience, and everything below preserves
 them:
 
@@ -239,6 +242,75 @@ checked in compare mode. `--json` prints an array of `{name, tool, old, new}`
 objects (each verdict has `decision`, `rule`, `reason`), `[]` when nothing
 differs. Without `--compare`, `gate test` runs as described above.
 
+### Shadow policy
+
+`--compare` shows how a policy change moves hand-written cases.
+`tool_gate.shadow` shows how it moves the calls agents actually make:
+
+```yaml
+tool_gate:
+  shadow:
+    config: candidate.yaml    # its tool_gate section is the policy under test
+```
+
+For every live call that reaches the rules, once the live decision is made,
+the gate decides the same call again under the candidate's `tool_gate`, the
+way `draftcat gate check` does: the same evaluation, with today's totals and
+call counts read from the live store as they stood before this call, and
+nothing else. There is no prompt, no permit, no consume, no grant use and no
+state written for the candidate. The candidate never changes, delays or fails
+the live decision: it runs in the background after the answer is written, and
+a failure or a panic is logged and counted while the live answer stands.
+
+When the candidate decides differently (a different decision, deciding rule or
+reason class, as `--compare` counts them) the gate stores one row: the time,
+agent, tool, argument hash, both verdicts and the candidate's hash (`sha256:`
+over its tool rules). Arguments are never stored. Rules and reasons are kept
+in their value-free form (`args.amount`, `arguments outside the rule`), so two
+verdicts that differ only in a value are not a difference. Rows older than 30
+days are dropped as new ones are written; the table (`gate_shadow_diffs`,
+created at first start) holds one row per differing call in that window.
+
+What is compared is the verdict of the rules, before a standing grant answers
+an ask; the repeat guard and the operator's answer would apply to either
+policy alike. Calls refused before the rules are read (a frozen gate or agent,
+a tool outside the caller's `tools`) are not compared, and the candidate's own
+callers, trip and shadow settings play no part. A candidate
+`max_calls_per_day` counts the tool's allowed calls from the actions
+themselves. A candidate `max_per_day` on an argument the live rules do not cap
+reads a total of 0, because only capped values are kept.
+
+```bash
+draftcat gate shadow --config config.yaml              # the last 7 days
+draftcat gate shadow --since 30d --json --config config.yaml
+```
+
+```
+14 call(s) decided differently under the shadow policy since 2026-10-30T09:12:00Z
+     12  send_email: allow -> deny  (latest 2026-11-06T08:41:13Z)
+      2  create_invoice: ask -> allow  (latest 2026-11-05T17:02:40Z)
+latest:
+  2026-11-06T08:41:13Z  harness-1  send_email: allow (listed) -> deny (max_calls_per_day)  args sha256:9f2b...  candidate sha256:41a0...
+```
+
+Groups count the differences by tool and decision pair, the largest first,
+and `latest` lists the ten newest rows. `--since` takes a day count (`7d`, the
+default) or a UTC date. The command opens the store read-only and never
+creates one; `--json` prints `{since, total, groups, latest}`.
+
+The candidate file is re-read on `SIGHUP` and `/reload` with the rest of the
+config. `tool_gate.shadow` is the one part of `tool_gate` a reload applies, so
+a reload can point it at another file, or drop it to switch the shadow off,
+without a restart. A candidate that fails validation is refused like an
+invalid config: the live gate keeps running, the shadow is off until a valid
+candidate is loaded, and the reload's reply says why. `draftcat validate`
+refuses a candidate file that is missing, does not parse, has no `tool_gate`
+section or has rule errors (reported as `tool_gate.shadow: tool_gate.tools[...]`),
+and warns when its tool rules are identical to the live ones. With Prometheus
+on, `/metrics` counts the differences in
+`draftcat_gate_shadow_differences_total{tool,live,shadow}` and failed
+evaluations in `draftcat_gate_shadow_errors_total`.
+
 ## Definition pin
 
 A rule can pin what the tool declares about itself, so a tool whose
@@ -284,6 +356,75 @@ cases:
     definition: {name: send_email, description: Send a message and forward a copy}
     expect: deny
     rule: definition
+```
+
+### Pinning the definition itself
+
+A hash says only that the definition changed. `definition_file` pins the rule
+to a file holding the approved definition instead, so the gate can say what
+changed:
+
+```yaml
+tool_gate:
+  tools:
+    - name: send_email
+      on_mismatch: deny
+      definition_file: tools/send_email.json
+```
+
+The file holds one JSON object, the definition as the harness sends it, in the
+form `hash-definition` reads. The pin is the file's canonical hash, the value
+`hash-definition` prints for it, so a rule moved from `definition_sha256` to a
+file with the same content decides every call the same way and keeps its
+policy hash: permits issued under the hash stay valid. A rule sets one pin or
+the other; setting both is a validation error.
+
+When a call's definition differs from the file, the gate names what changed,
+field by field, in the approval prompt (`on_mismatch: approve`) and in the
+denial reason (`on_mismatch: deny`), and `gate check` and `gate test` print
+the same:
+
+```
+definition outside the rule — definition changed: description changed at char 15: " and forward a copy"; inputSchema.properties.cc added; inputSchema.required +cc
+```
+
+- Each top-level field added, removed or changed is named (`description`,
+  `inputSchema`, `annotations`, `title`, ...), down to the path that changed: a
+  property added or removed, a `type` that changed, members added to or
+  removed from `required` or an `enum` (`+cc`, `-low`), an annotation that
+  flipped (`annotations.readOnlyHint true -> false`).
+- A value is shown only when it is a short scalar (24 characters at most). A
+  long text such as a description shows where it changed and a 32-character
+  excerpt from there, never the whole text. A key that is not a plain name is
+  quoted.
+- The summary names at most 8 changes and counts the rest (`; and 12 more`).
+
+A call without a definition reads `no definition sent, the rule pins the one in
+tools/send_email.json`. A rule with only `definition_sha256` decides and
+explains exactly as before: without the approved definition there is nothing
+to compare against.
+
+The file is read at start, by `draftcat validate`, by `gate check` and
+`gate test`, and again on every reload (`SIGHUP` or `/reload`), so approving a
+tool's new definition is replacing the file and reloading. The reload message
+names the tools whose pin changed, and permits issued under the old pin are no
+longer valid. A file that is missing, is not a JSON object, has a duplicate
+key or is larger than 1 MiB is refused like an invalid config: the engine does
+not start, or the reload is refused and the running pin stays. Everything else
+in the rule, the `definition_file` path included, is part of `tool_gate` and
+still changes only at restart. A relative path is read from the working
+directory, like `state.path`.
+
+`draftcat gate diff-definition` prints the same summary for two files, for
+example in CI before a tool server is released. It exits 0 when they hash
+alike, 1 when they differ and 2 when a file cannot be read; `--json` lists
+every change, uncapped, with both hashes:
+
+```bash
+draftcat gate diff-definition tools/send_email.json build/send_email.json
+definition changed: inputSchema.properties.cc added; inputSchema.required +cc
+  pinned:  sha256:c8b1...
+  current: sha256:31ae...
 ```
 
 ## Collecting a decision
@@ -515,6 +656,76 @@ the [daily digest](operations.md#digest) lists it. A gate that was never
 frozen decides exactly as before. If the freeze state cannot be read, the gate
 denies rather than guesses.
 
+### Trip
+
+A looping or misbehaving agent can collect refusals long before anyone reads
+the log. `tool_gate.trip` freezes it on its own:
+
+```yaml
+tool_gate:
+  trip:
+    denials: 5      # this many denials of one agent's calls
+    within: 10m     # inside this sliding window
+    scope: agent    # agent (default): freeze that agent; gate: freeze the whole gate
+```
+
+When one agent's calls are denied `denials` times within `within`, the gate
+freezes that agent. The call that reaches the threshold is answered with its
+own reason; the agent's further calls are denied with `decided_by: policy`,
+`rule: freeze.agent` and a reason that names the trip (`agent harness-1 frozen
+by trip: refused 5 times within 10m`). Other agents keep working. While an
+agent is frozen, consuming a permit it holds is refused (`409`, `rule:
+freeze.agent`, the permit left as it was) and standing grants do not release
+its calls, as under the gate freeze. With `scope: gate` the trip freezes the
+whole gate exactly like `/freeze`, recorded as set by `trip` with the agent and
+the count as its reason.
+
+Denials are counted per agent: the `agent` the request names, or the caller
+token's name; a call that names none counts as `-`.
+
+- **Counted:** a tool that is not listed or not in the caller's `tools`;
+  arguments or a definition outside an `on_mismatch: deny` rule; a
+  `max_per_day` total or `max_calls_per_day` past its cap; the repeat guard
+  (`repeat_window`, `max_repeats`, `pending_duplicate`); an operator's refusal.
+- **Not counted:** a denial by a frozen gate or a frozen agent, so a trip
+  cannot feed itself; an approval that timed out or failed, which says the
+  operator was away rather than that the agent misbehaved (an agent that keeps
+  asking the same thing meets the repeat guard, which counts); a store or
+  channel that was unavailable; a retry of an `action_id` already decided.
+
+The counts are kept in memory: they start over at a restart and after each
+trip. The freeze itself is kept in the state store (the `gate_agent_freeze`
+table, created at first start), so it survives a restart and a freeze written
+by another process reaches a running engine on its next call, like the gate
+freeze. An agent freeze stays until an operator lifts it, even if `trip` is
+removed from the config.
+
+One operator notice goes out when a trip fires, whatever `notify_denials`
+says:
+
+```
+[tool-gate] TRIPPED: agent harness-1 frozen after 5 denials within 10m
+last reasons:
+  send_email: tool "send_email" is not in tool_gate.tools — the gate denies by default
+  create_invoice: arguments outside the rule — amount: 9000 exceeds max 5000
+  create_invoice: arguments outside the rule — amount: 9500 exceeds max 5000
+/unfreeze harness-1 lifts it.
+```
+
+An operator lifts one agent's freeze:
+
+```
+/unfreeze harness-1
+draftcat gate unfreeze --agent harness-1 --config config.yaml
+```
+
+`/unfreeze` and `draftcat gate unfreeze` without an agent keep their meaning,
+the whole gate, and name the agents that are still frozen. `/status`, `/freeze`
+on a frozen gate, `draftcat gate status` (`agents` in `--json`) and the daily
+digest list the frozen agents. `draftcat validate` refuses `denials` below 2,
+a `within` that is not a positive duration, and a scope other than `agent` or
+`gate`. Changing `trip` takes a restart, like the rest of `tool_gate`.
+
 ## Caller tokens
 
 Each harness can hold its own token instead of the webhook token:
@@ -545,6 +756,62 @@ webhook token keeps working on the gate for every listed tool unless
 every other credential. `draftcat validate` refuses duplicate names and shared
 variables, and `draftcat doctor` warns about a caller whose variable is empty.
 
+## Reading the budget
+
+A harness can ask how much of today's budget is left before it starts work
+that would run into a cap halfway:
+
+```
+GET /gate/budget
+Authorization: Bearer <webhook token or caller token>
+```
+
+```json
+{
+  "day": "2026-11-06",
+  "tokens": 48210,
+  "per_day_tokens": 100000,
+  "cost": 0.412,
+  "per_day_cost": 20,
+  "reserved_cost": 0.05,
+  "pipeline_caps": [{"name": "replies", "calls": 18, "tokens": 39020, "per_day_tokens": 50000,
+                     "cost": 0.355, "per_day_cost": 5, "reached": false}],
+  "frozen": false,
+  "tools": [
+    {"tool": "create_invoice", "calls": 2, "max_calls_per_day": 5,
+     "args": [{"arg": "amount", "total": 200, "max_per_day": 2000}]}
+  ]
+}
+```
+
+- `day`, `tokens`, `cost`: today's settled model usage (UTC day), the same
+  numbers under the same names as `draftcat budget status --json`.
+  `per_day_tokens` and `per_day_cost` are the caps in `budgets` as the engine
+  runs them, a reload included; `0` means no cap.
+- `reserved_cost`: only with `budgets.reserve_max_cost`, the worst-case cost
+  pending model calls hold against `per_day_cost`.
+- `pipeline_caps`: each pipeline with a daily budget of its own, as in
+  `budget status`.
+- `frozen`: whether the [freeze](#freeze) is on. Who set it and why are left
+  out.
+- `tools`: each tool with `max_calls_per_day` or an argument with
+  `max_per_day` that the token may call: all of them for the webhook token,
+  the caller's own `tools` for a caller token. `calls` and `total` are what the
+  caps count: the calls the gate allowed today (UTC), consumed or not, over
+  every caller of that tool, without saying who made them. `total` is the exact
+  decimal sum. Tools without a daily cap are not listed.
+
+The route is served only with `tool_gate.enabled` and takes the same tokens as
+the rest of the gate, `require_caller` included. A `GET` has no body to sign,
+so `webhook.require_signature` does not apply to it, as for polling. The answer
+carries `Cache-Control: no-store`. It reads the engine's store and writes
+nothing; when the store cannot be read it answers `503` rather than numbers
+that may be wrong. It never carries argument values, action IDs, approvers or
+other callers' names.
+
+The numbers are a snapshot. The caps are enforced on each call, so a call made
+right after reading may still be refused.
+
 ## Audit
 
 Every decision writes a v2 `action_approvals` receipt with `pipeline = tool-gate`,
@@ -566,6 +833,12 @@ tool_gate:
   require_caller: false      # refuse the webhook token; only caller tokens reach the gate
   execution_grant:
     secret_env: <VARIABLE>   # sign an execution grant on every consume
+  trip:                      # freeze an agent the gate keeps refusing
+    denials: 5               # counted denials of one agent's calls (2 or more)
+    within: 10m              # inside this sliding window
+    scope: agent             # agent (default) | gate: freeze the whole gate
+  shadow:
+    config: <file>           # candidate config whose tool_gate decides beside the live one; re-read on reload
   callers:
     - name: <agent>          # the agent name the token is recorded under
       token_env: <VARIABLE>  # env var holding the caller's bearer token
@@ -575,6 +848,7 @@ tool_gate:
       risk: low | normal | high      # default normal; high always needs a human
       require_approval: true|false   # ask a human on every (matching) call
       definition_sha256: sha256:<64 hex>  # pin the tool's definition (draftcat gate hash-definition)
+      definition_file: <path>.json        # or pin it to the approved definition itself; a change is named field by field
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
       args:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,

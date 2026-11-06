@@ -5,6 +5,8 @@ package voice
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"time"
 )
@@ -27,6 +29,13 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.StartedAt == 0 {
 		in.StartedAt = time.Now().UnixMilli()
+	}
+	// A refused call is not stored: it never appears as a completed call.
+	if s.gate != nil {
+		if err := s.gate.Admit(r.Context(), in.ID); err != nil {
+			writeRefused(w, err)
+			return
+		}
 	}
 	if err := s.store.InsertSessionStart(SessionStart{
 		ID:                 in.ID,
@@ -103,6 +112,15 @@ func (s *Server) handleSessionEnd(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if s.gate != nil {
+		if err := s.gate.End(r.Context(), in.SessionID, time.UnixMilli(in.EndedAt)); err != nil {
+			// The outcome is stored; a retry of this webhook records the
+			// usage without storing anything twice.
+			log.Printf("voice: call usage for %s not recorded: %v", in.SessionID, err)
+			http.Error(w, "call usage not recorded", http.StatusInternalServerError)
+			return
+		}
 	}
 	writeOK(w)
 }
@@ -184,8 +202,30 @@ func (s *Server) handlePreCallContext(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeout())
 	defer cancel()
+	// The one synchronous call before the greeting: refuse here once a daily
+	// cap is reached, so an orchestrator can end the call before it runs.
+	if s.gate != nil {
+		if err := s.gate.Check(ctx); err != nil {
+			writeRefused(w, err)
+			return
+		}
+	}
 	result := s.lookups.Run(ctx, in.CallerPhone)
 	writeJSON(w, result)
+}
+
+// writeRefused answers 429 for a call refused by a cap and 503 when the
+// caps could not be read: a call draftcat cannot decide on is not admitted.
+func writeRefused(w http.ResponseWriter, err error) {
+	status, reason := http.StatusServiceUnavailable, "call budget unavailable"
+	if errors.Is(err, ErrCallRefused) {
+		status, reason = http.StatusTooManyRequests, err.Error()
+	} else {
+		log.Printf("voice: %v", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "refused": true, "reason": reason})
 }
 
 func writeOK(w http.ResponseWriter) {

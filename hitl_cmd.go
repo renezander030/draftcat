@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -134,8 +135,16 @@ func runHitlCmd(args []string) int {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"recorded","resolved":true}`))
 	})
-	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = srv.ListenAndServe() }()
+	// Bind before dispatching. Listening in the background raced a relay that
+	// answers within milliseconds, and a port already in use left the suite
+	// waiting out its whole timeout for a decision with nowhere to land.
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", *addr)
+	if err != nil {
+		add("callback listener", false, err.Error())
+		return reportHitl(checks, *jsonOut)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close() }()
 
 	req := relay.Request{

@@ -1,12 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/renezander030/draftcat/internal/strictjson"
 )
 
 func readRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
@@ -23,60 +22,22 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byt
 	return body, true
 }
 
-// decodeStrictJSON preserves number tokens and rejects ambiguous envelopes.
-func decodeStrictJSON(body []byte, target interface{}) error {
-	tokens := json.NewDecoder(bytes.NewReader(body))
-	tokens.UseNumber()
-	if err := uniqueJSONValue(tokens, 0); err != nil {
-		return err
+// readStrictJSON reads a gate endpoint's JSON body of at most limit bytes into
+// v. A body it cannot use is answered here, 413 when too large and 400 when
+// unreadable, malformed or ambiguous, and it returns false.
+func readStrictJSON(w http.ResponseWriter, r *http.Request, limit int64, v interface{}) bool {
+	body, ok := readRequestBody(w, r, limit)
+	if !ok {
+		return false
 	}
-	if _, err := tokens.Token(); err != io.EOF {
-		return fmt.Errorf("trailing JSON content")
+	if err := decodeStrictJSON(body, v); err != nil {
+		http.Error(w, "malformed json", http.StatusBadRequest)
+		return false
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-	dec.DisallowUnknownFields()
-	return dec.Decode(target)
+	return true
 }
 
-func uniqueJSONValue(dec *json.Decoder, depth int) error {
-	if depth > 128 {
-		return fmt.Errorf("JSON nesting exceeds 128 levels")
-	}
-	token, err := dec.Token()
-	if err != nil {
-		return err
-	}
-	switch token {
-	case json.Delim('{'):
-		keys := map[string]bool{}
-		for dec.More() {
-			token, err := dec.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := token.(string)
-			if !ok {
-				return fmt.Errorf("object key must be a string")
-			}
-			if keys[key] {
-				return fmt.Errorf("duplicate JSON key %q", key)
-			}
-			keys[key] = true
-			if err := uniqueJSONValue(dec, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = dec.Token()
-		return err
-	case json.Delim('['):
-		for dec.More() {
-			if err := uniqueJSONValue(dec, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = dec.Token()
-		return err
-	}
-	return nil
+// decodeStrictJSON preserves number tokens and rejects ambiguous envelopes.
+func decodeStrictJSON(body []byte, target interface{}) error {
+	return strictjson.Decode(body, target)
 }

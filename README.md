@@ -109,8 +109,11 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Token budgets** — per-step / pipeline / day; any breach halts the run immediately.
 - **Cost budgets** — `per_day_cost` / `per_pipeline_cost` cap spend in money. On OpenRouter the caps are enforced on the charge the provider reports for each call (cached and reasoning tokens included); elsewhere on your configured per-1k rates. The approval prompt shows what the run has spent, and `/status` shows the day against every cap.
 - **Human-in-the-loop** — every outbound action requires an explicit operator decision, made live or declared in advance.
-- **Any operator channel** — the [`hitl/v0` protocol](docs/hitl-protocol.md) keeps draftcat as the gate and lets an untrusted relay own presentation. Teams runs through a Power Automate flow in your own tenant: no bot, no Azure app registration, no admin consent. Check yours with `draftcat hitl verify <relay-url>`.
+- **Any operator channel** — the [`hitl/v0` protocol](docs/hitl-protocol.md) keeps draftcat as the gate and lets an untrusted relay own presentation. Teams runs through a Power Automate flow in your own tenant: no bot, no Azure app registration, no admin consent. Slack runs through [`contrib/slack-relay`](contrib/slack-relay/README.md), a small relay that verifies every click. Check yours with `draftcat hitl verify <relay-url>`.
 - **Consume-once tool permits** - `POST /gate/tool-call` puts an agent's MCP or SDK call through the same gate as a pipeline step. Bearer authentication covers ask, poll, and consume. A stable `action_id` makes retries idempotent; the binding covers the exact arguments, policy, and expiry; only the first successful `POST /gate/tool-call/<id>/consume` carries `permit: execute`. See [`docs/tool-gate.md`](docs/tool-gate.md).
+- **Agent harness hooks** - `draftcat gate install claude-code|codex|copilot-cli|gemini-cli` puts every shell, file-writing and MCP call of that harness through the gate as a pre-tool hook that fails closed; see [`docs/harness-hooks.md`](docs/harness-hooks.md).
+- **Approved HTTP requests** - the `http_request` action sends one request after an approval step, bound to exactly the request the operator saw, with a credential draftcat holds and the agent never sees; see [`docs/http-action.md`](docs/http-action.md).
+- **Trip and shadow** - `tool_gate.trip` freezes an agent the gate keeps refusing, and `tool_gate.shadow` decides every live call a second time under a candidate policy and records where the two differ, without touching the live decision.
 - **Repeat guard** — inside `repeat_window` an identical tool call (same agent, tool, arguments) gets the gate's remembered answer instead of a new prompt: a denied call stays denied, an in-flight call joins the open prompt, and `max_repeats` stops a looping agent from paging you.
 - **Denial notices** — a refusal the gate makes on its own (unlisted tool, argument outside a rule, repeat guard) is reported to the operator channel, one notice per agent, tool and reason per window, so nothing is refused silently.
 - **Open gates** — `/pending` on the channel and `draftcat pending` on the host list every approval waiting on a human, pipeline steps and tool calls alike, with how long each has waited and how long it has left.
@@ -140,7 +143,7 @@ npm install -g draftcat
 draftcat --help
 ```
 
-The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required.
+The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required. Each download has a two-minute elapsed limit across redirects and a 30-second inactivity limit. Interrupted downloads fail installation; the existing executable stays in place until its verified replacement is ready.
 
 With a Go toolchain, install the CLI from the module:
 
@@ -258,6 +261,7 @@ pipelines:
 | `pdf_extract`                | Parse a PDF into text + per-fragment bounding boxes (pure-Go)           |
 | `pdf_verify_cite`            | Resolve `<cite>` tags in AI output against the parsed PDF               |
 | `notify`                     | Send AI output to the operator channel                                  |
+| `http_request`               | Send one approved HTTP request with a credential draftcat holds         |
 | `voice_*` / `dograh_*`       | Voice plugin actions (`-tags voice`)                                     |
 
 Add an action by appending a `case` to the deterministic switch in `main.go` and registering its name in `internal/validate/`. See `internal/ghl/` and `internal/dograh/` for connector patterns.
@@ -369,12 +373,16 @@ draftcat receipts list         # approval receipts and verification status (--js
 draftcat receipts show <id>    # one versioned receipt
 draftcat receipts export       # JSONL to stdout (--out path writes mode 0600)
 draftcat receipts anchor       # hash-chain anchor of every receipt, to keep outside the store
-draftcat receipts verify-anchor <anchor>  # name the first receipt changed since the anchor
+draftcat receipts verify-anchor <anchor>  # name the first receipt changed since the anchor (--log anchors.jsonl)
 draftcat audit-verify          # verify signed approval receipts
 draftcat report [--since 30d]  # oversight summary: who approved, skipped or let time out, per pipeline and step
 draftcat gate check <tool>     # what tool_gate decides for one call, without the engine (--args JSON)
 draftcat gate test cases.yaml  # a policy test suite for CI: exit 1 when a decision differs
 draftcat gate verify-grant <grant> --tool <tool>  # a tool checks its execution grant before acting
+draftcat gate diff-definition pinned.json current.json  # what changed in a tool definition (exit 1 if any)
+draftcat gate shadow [--since 7d]  # live calls a candidate policy would decide differently
+draftcat gate unfreeze --agent <name>  # lift one agent's freeze set by tool_gate.trip
+draftcat gate install <harness>  # put a harness's tool calls through the gate (claude-code, codex, copilot-cli, gemini-cli)
 draftcat hitl verify <url>     # run the hitl/v0 conformance suite against a relay
 ```
 

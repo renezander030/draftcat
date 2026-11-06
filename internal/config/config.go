@@ -8,6 +8,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"math/big"
@@ -17,9 +18,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/renezander030/draftcat/internal/outputschema"
+	"github.com/renezander030/draftcat/internal/schedule"
+	"github.com/renezander030/draftcat/internal/strictjson"
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -43,6 +47,7 @@ type Config struct {
 	Webhook     WebhookConfig          `yaml:"webhook"`
 	Observ      ObservabilityConfig    `yaml:"observability"`
 	Pipelines   []PipelineConfig       `yaml:"pipelines"`
+	Receipts    ReceiptsConfig         `yaml:"receipts"`
 	// Voice is parsed unconditionally as raw YAML. Decoded into voice.Config
 	// only when draftcat is built with -tags voice. Lean builds ignore it.
 	Voice yaml.Node `yaml:"voice"`
@@ -52,6 +57,69 @@ type Config struct {
 // run history). Empty Path defaults to "./state.db".
 type StateConfig struct {
 	Path string `yaml:"path"`
+}
+
+// DefaultStatePath is the state store when neither DRAFTCAT_STATE_PATH nor
+// state.path names one.
+const DefaultStatePath = "./state.db"
+
+// StatePath is where the engine and every subcommand find the state store:
+// DRAFTCAT_STATE_PATH first (so a container can point state at a mounted disk
+// without shadowing the baked config), then state.path, then ./state.db.
+func (c *Config) StatePath() string {
+	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
+		return v
+	}
+	if c != nil && c.State.Path != "" {
+		return c.State.Path
+	}
+	return DefaultStatePath
+}
+
+// ReceiptsConfig holds settings for the approval receipt history.
+type ReceiptsConfig struct {
+	// Anchor, when set, has the engine take an anchor of the whole receipt
+	// history on a schedule and keep it outside the store. Absent = none.
+	Anchor *ReceiptAnchorConfig `yaml:"anchor"`
+}
+
+// ReceiptAnchorConfig schedules the receipt anchor: Every is an interval
+// ("24h"), or At is "HH:MM" (24-hour) once a day in Timezone, an IANA zone
+// name (empty = the process's local zone). Exactly one of Every and At is
+// set. File, when set, gets one JSON line per anchor; Notify sends the anchor
+// to the operator channel.
+type ReceiptAnchorConfig struct {
+	Every    string `yaml:"every"`
+	At       string `yaml:"at"`
+	Timezone string `yaml:"timezone"`
+	File     string `yaml:"file"`
+	Notify   bool   `yaml:"notify"`
+}
+
+// MinReceiptAnchorEvery is the shortest interval receipts.anchor.every takes.
+const MinReceiptAnchorEvery = time.Minute
+
+// Schedule parses when the anchor is taken. It refuses neither or both of
+// every and at, an interval under MinReceiptAnchorEvery, a time that is not
+// HH:MM and an unknown zone.
+func (a ReceiptAnchorConfig) Schedule() (schedule.Schedule, error) {
+	every, at := strings.TrimSpace(a.Every), strings.TrimSpace(a.At)
+	switch {
+	case every == "" && at == "":
+		return schedule.Schedule{}, fmt.Errorf("set every (an interval such as 24h) or at (HH:MM)")
+	case every != "" && at != "":
+		return schedule.Schedule{}, fmt.Errorf("set every or at, not both")
+	case at != "":
+		return schedule.ParseDaily(at, a.Timezone)
+	}
+	d, err := time.ParseDuration(every)
+	if err != nil {
+		return schedule.Schedule{}, fmt.Errorf("every %q is not a duration such as 24h", every)
+	}
+	if d < MinReceiptAnchorEvery {
+		return schedule.Schedule{}, fmt.Errorf("every %s is shorter than the minimum %s", every, MinReceiptAnchorEvery)
+	}
+	return schedule.Parse(every, a.Timezone)
 }
 
 type TelegramConfig struct {
@@ -491,18 +559,27 @@ func (c *Config) CappedPipelines() []PipelineCap {
 	return out
 }
 
-// PipelineBudget returns the daily caps of the named pipeline, zero when the
-// pipeline is unknown or uncapped.
-func (c *Config) PipelineBudget(name string) PipelineBudgetConfig {
-	if c == nil || name == "" {
-		return PipelineBudgetConfig{}
+// Pipeline returns the first pipeline with this name, and whether there is one.
+func (c *Config) Pipeline(name string) (PipelineConfig, bool) {
+	if c == nil {
+		return PipelineConfig{}, false
 	}
 	for _, p := range c.Pipelines {
 		if p.Name == name {
-			return p.Budget
+			return p, true
 		}
 	}
-	return PipelineBudgetConfig{}
+	return PipelineConfig{}, false
+}
+
+// PipelineBudget returns the daily caps of the named pipeline, zero when the
+// pipeline is unknown or uncapped.
+func (c *Config) PipelineBudget(name string) PipelineBudgetConfig {
+	if name == "" {
+		return PipelineBudgetConfig{}
+	}
+	p, _ := c.Pipeline(name)
+	return p.Budget
 }
 
 type StepConfig struct {
@@ -681,6 +758,70 @@ type ToolGateConfig struct {
 	// ExecutionGrant adds a signed grant to every successful consume, which
 	// the tool checks before it acts.
 	ExecutionGrant ExecutionGrantConfig `yaml:"execution_grant"`
+	// Trip freezes an agent, or the whole gate, once the gate has refused
+	// that agent's calls Denials times within Within. Omitted = never.
+	Trip *GateTrip `yaml:"trip"`
+	// Shadow decides every live call a second time under a candidate config's
+	// tool_gate and records the calls the two decide differently. It never
+	// changes a live decision. Omitted = off.
+	Shadow *GateShadow `yaml:"shadow"`
+}
+
+// GateShadow is tool_gate.shadow.
+type GateShadow struct {
+	// Config is the candidate config file; its tool_gate section is the
+	// policy under test. It is re-read on reload.
+	Config string `yaml:"config"`
+}
+
+// LoadToolGateFile reads the tool_gate section of a config file, the way
+// tool_gate.shadow names one. A file without the section is an error.
+func LoadToolGateFile(path string) (ToolGateConfig, error) {
+	// #nosec G304 -- the operator's own candidate config.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ToolGateConfig{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var file struct {
+		ToolGate *ToolGateConfig `yaml:"tool_gate"`
+	}
+	if err := yaml.Unmarshal(raw, &file); err != nil {
+		return ToolGateConfig{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if file.ToolGate == nil {
+		return ToolGateConfig{}, fmt.Errorf("%s has no tool_gate section", path)
+	}
+	return *file.ToolGate, nil
+}
+
+// GateTrip is tool_gate.trip: the freeze an agent earns by being refused
+// again and again.
+type GateTrip struct {
+	// Denials is how many counted denials of one agent's calls trip it.
+	Denials int `yaml:"denials"`
+	// Within is the sliding window the denials have to fall in ("10m").
+	Within string `yaml:"within"`
+	// Scope is agent (default: freeze that agent only) or gate (freeze the
+	// whole gate, like /freeze).
+	Scope string `yaml:"scope"`
+}
+
+// WithinDuration parses within. Anything that is not a positive duration is
+// 0, which never trips; validate refuses it.
+func (t GateTrip) WithinDuration() time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(t.Within))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// ScopeOrDefault normalizes scope: gate, or agent for anything else.
+func (t GateTrip) ScopeOrDefault() string {
+	if strings.EqualFold(strings.TrimSpace(t.Scope), "gate") {
+		return "gate"
+	}
+	return "agent"
 }
 
 // ExecutionGrantConfig names the key execution grants are signed with. The
@@ -805,10 +946,96 @@ type ToolRule struct {
 	// is missing or hashes differently is handled like an argument mismatch
 	// (on_mismatch). Omitted = the definition is not checked.
 	DefinitionSHA256 string `yaml:"definition_sha256" json:",omitempty"`
+	// DefinitionFile pins the definition to the one held in this file (a JSON
+	// object, as `draftcat gate hash-definition` reads it) instead of to its
+	// hash. The pin is the file's canonical hash, so a rule moved from
+	// definition_sha256 to a file with the same content decides the same and
+	// keeps its policy hash, and a call whose definition differs is told what
+	// changed. Read at start and on every reload; a relative path is read from
+	// the working directory, like state.path. Not part of the policy hash: the
+	// pin it yields is.
+	DefinitionFile string `yaml:"definition_file" json:"-"`
+	// pinned holds what DefinitionFile read. Every copy of the rule shares it,
+	// so a reload that re-reads the file reaches the running gate, whose rules
+	// otherwise change only at restart.
+	pinned *definitionSlot
 }
 
 // DefinitionPinPattern is the form of a definition_sha256 value.
 const DefinitionPinPattern = `^sha256:[0-9a-f]{64}$`
+
+// MaxToolDefinitionBytes bounds a definition_file. A definition reaches the
+// gate inside a request body of at most 1 MiB, so a larger one could never
+// match.
+const MaxToolDefinitionBytes = 1 << 20
+
+// PinnedDefinition is a tool definition read from a rule's definition_file
+// and its canonical hash, the value definition_sha256 would hold for it.
+type PinnedDefinition struct {
+	Definition map[string]interface{}
+	SHA256     string
+}
+
+type definitionSlot struct {
+	cur atomic.Pointer[PinnedDefinition]
+}
+
+// Pinned returns the definition read from definition_file, or nil when the
+// rule has none or it has not been read.
+func (t ToolRule) Pinned() *PinnedDefinition {
+	if t.pinned == nil {
+		return nil
+	}
+	return t.pinned.cur.Load()
+}
+
+// SetPinned records what definition_file read. The first call gives the rule
+// the slot its copies share, so it has to happen before the rule is shared
+// (the engine makes it at start); a later call replaces the definition for
+// every copy at once and is safe while the gate runs.
+func (t *ToolRule) SetPinned(p *PinnedDefinition) {
+	if t.pinned == nil {
+		t.pinned = &definitionSlot{}
+	}
+	t.pinned.cur.Store(p)
+}
+
+// ParseToolDefinition decodes a tool definition: one non-empty JSON object,
+// numbers kept as written, no duplicate keys or trailing content. A
+// definition sent with a call is decoded the same way, so both hash alike.
+func ParseToolDefinition(raw []byte) (map[string]interface{}, error) {
+	var def map[string]interface{}
+	if err := strictjson.Decode(raw, &def); err != nil {
+		return nil, err
+	}
+	if len(def) == 0 {
+		return nil, fmt.Errorf("empty object")
+	}
+	return def, nil
+}
+
+// ReadToolDefinition reads and decodes a rule's definition_file, refusing one
+// larger than MaxToolDefinitionBytes.
+func ReadToolDefinition(file string) (map[string]interface{}, error) {
+	// #nosec G304 -- the operator's own definition_file.
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(f, MaxToolDefinitionBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+	if len(raw) > MaxToolDefinitionBytes {
+		return nil, fmt.Errorf("%s is larger than %d bytes", file, MaxToolDefinitionBytes)
+	}
+	def, err := ParseToolDefinition(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not a JSON object with a tool definition: %w", file, err)
+	}
+	return def, nil
+}
 
 // Grantable reports whether an operator may issue a standing grant for the
 // tool: the rule allows grants and the tool is not high risk.
@@ -1058,11 +1285,11 @@ func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg stri
 			return DailyCapReading{}, err
 		}
 		limit := *t.Args[arg].MaxPerDay
-		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, decimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
+		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, DecimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
 		after := new(big.Rat).Add(total, amount)
 		if r.OverArg == "" && after.Cmp(exactBound(limit)) > 0 {
 			r.OverArg, r.Rule = arg, "max_per_day."+arg
-			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, decimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
+			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, DecimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
 			if t.DeniesOnMismatch() {
 				return r, nil
 			}
@@ -1074,16 +1301,17 @@ func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg stri
 			return DailyCapReading{}, err
 		}
 		limit := *t.MaxCallsPerDay
-		r.Totals = append(r.Totals, fmt.Sprintf("calls: %s allowed today, max_calls_per_day %d", decimalString(calls), limit))
+		r.Totals = append(r.Totals, fmt.Sprintf("calls: %s allowed today, max_calls_per_day %d", DecimalString(calls), limit))
 		if r.OverArg == "" && new(big.Rat).Add(calls, big.NewRat(1, 1)).Cmp(big.NewRat(int64(limit), 1)) > 0 {
 			r.OverArg, r.Rule = CallCountKey, "max_calls_per_day"
-			r.Why = fmt.Sprintf("calls: %s already allowed today, max_calls_per_day %d", decimalString(calls), limit)
+			r.Why = fmt.Sprintf("calls: %s already allowed today, max_calls_per_day %d", DecimalString(calls), limit)
 		}
 	}
 	return r, nil
 }
 
-func decimalString(r *big.Rat) string {
+// DecimalString renders a running total exactly, without trailing zeros.
+func DecimalString(r *big.Rat) string {
 	if r.IsInt() {
 		return r.Num().String()
 	}

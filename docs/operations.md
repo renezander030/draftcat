@@ -155,7 +155,12 @@ configuration stays in place, and the operator is told why. Sections that built
 long-lived resources at start (`telegram`, `relay`, `provider`, `state`,
 `webhook`, `tool_gate`, `observability`, `gmail`, `gohighlevel`, `voice`) keep
 their running values; the reload message names any of them that changed in the
-file, so you know a restart is needed for those.
+file, so you know a restart is needed for those. Two parts of `tool_gate` are
+the exception: a reload re-reads the content of each tool rule's
+`definition_file` (see [the tool gate](tool-gate.md#pinning-the-definition-itself)),
+and `tool_gate.shadow`'s [candidate file](tool-gate.md#shadow-policy), where a
+candidate with errors switches the shadow off without holding up the rest of
+the reload.
 
 ## Spend warnings
 
@@ -202,6 +207,8 @@ what needs a person:
 - approvals waiting for more than 1 hour: the count and the five oldest, each
   as pipeline / step (a tool-gate approval shows the tool as the step);
 - the tool gate [freeze](tool-gate.md#freeze), when it is on;
+- agents frozen by a [trip](tool-gate.md#trip): the first five, each with
+  since when and why;
 - tool outcomes reported `failed` in the last 24 hours: the count.
 
 When none of these exists no message is sent, so the digest stays silent on a
@@ -215,6 +222,21 @@ its first check.
 `telegram`, which is restart-only: a reload that changes it reports that a
 restart is needed. `draftcat validate` rejects a time that is not `HH:MM` and
 an unknown zone.
+
+## Receipt anchors
+
+```yaml
+receipts:
+  anchor:
+    every: 24h                 # or at: "07:00" with timezone
+    file: /mnt/audit/anchors.jsonl
+    notify: true
+```
+
+On each slot the engine anchors the receipt history and, when it changed,
+appends the anchor to `file` and sends it to the operator channel as
+`[anchor] ...`, so a copy lives off the host. An unchanged history sends
+nothing. See [Anchoring on a schedule](action-receipts.md#anchoring-on-a-schedule).
 
 ## Metrics
 
@@ -232,6 +254,8 @@ next to the existing counters and histograms:
 | `draftcat_budget_unsettled_calls` | provider calls awaiting reconciliation |
 
 `draftcat_otlp_exports_dropped_total` counts OTLP span exports that failed and were dropped; it appears after the first drop, next to the `[obs] OTLP export dropped` log line.
+
+With a [shadow policy](tool-gate.md#shadow-policy), `draftcat_gate_shadow_differences_total{tool,live,shadow}` counts the live tool calls the candidate decided differently, and `draftcat_gate_shadow_errors_total` the candidate evaluations that failed; both appear after the first event.
 
 ## Oversight report
 

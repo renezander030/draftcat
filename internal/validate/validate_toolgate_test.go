@@ -1,6 +1,8 @@
 package validate
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -223,5 +225,51 @@ func TestToolGate_DefinitionPinForm(t *testing.T) {
 		if !anyHas(errs, "definition_sha256") {
 			t.Fatalf("%q must be an error, got %v", pin, errs)
 		}
+	}
+}
+
+func TestToolGate_DefinitionFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	good := write("send_email.json", `{"name":"send_email","description":"Send a message"}`)
+	pin := "sha256:" + strings.Repeat("a1", 32)
+
+	// A pin is what on_mismatch applies to, so neither pin draws the
+	// "never applies" warning.
+	for _, rule := range []config.ToolRule{
+		{Name: "send_email", OnMismatch: "deny", DefinitionFile: good},
+		{Name: "send_email", OnMismatch: "deny", DefinitionSHA256: pin},
+	} {
+		errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{rule}})
+		if len(errs) != 0 || len(warns) != 0 {
+			t.Fatalf("%+v: errors=%v warnings=%v", rule, errs, warns)
+		}
+	}
+
+	bad := map[string]string{
+		"missing":       filepath.Join(dir, "none.json"),
+		"a directory":   dir,
+		"not an object": write("array.json", `[{"name":"send_email"}]`),
+		"empty":         write("empty.json", `{}`),
+		"duplicate key": write("dup.json", `{"name":"a","name":"b"}`),
+		"too large":     write("large.json", `{"description":"`+strings.Repeat("a", config.MaxToolDefinitionBytes)+`"}`),
+	}
+	for name, path := range bad {
+		errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", DefinitionFile: path}}})
+		if !anyHas(errs, "tools[0].definition_file") {
+			t.Errorf("%s: want a definition_file error, got %v", name, errs)
+		}
+	}
+
+	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", DefinitionFile: good, DefinitionSHA256: pin}}})
+	if !anyHas(errs, "not both") {
+		t.Fatalf("both pins must be an error: %v", errs)
 	}
 }

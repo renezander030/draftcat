@@ -28,6 +28,8 @@ type digestSnapshot struct {
 	Now    time.Time
 	Open   []statestore.PendingApproval // every gate waiting on a person
 	Freeze statestore.GateFreeze
+	// Agents are the agents frozen on their own (tool_gate.trip).
+	Agents []statestore.AgentFreeze
 	// FailedOutcomes counts tool outcomes reported "failed" in the last 24 h.
 	FailedOutcomes int
 }
@@ -56,6 +58,13 @@ func buildDigest(s digestSnapshot) (text string, ok bool) {
 	if s.Freeze.Frozen {
 		lines = append(lines, describeFreeze(s.Freeze))
 	}
+	for i, a := range s.Agents {
+		if i == digestMaxListed {
+			lines = append(lines, fmt.Sprintf("  … and %d more frozen agent(s) (/status)", len(s.Agents)-digestMaxListed))
+			break
+		}
+		lines = append(lines, describeAgentFreeze(a))
+	}
 	if s.FailedOutcomes > 0 {
 		lines = append(lines, fmt.Sprintf("%d tool outcome(s) reported failed in the last 24h", s.FailedOutcomes))
 	}
@@ -73,6 +82,9 @@ func digestSnapshotAt(st *statestore.StateStore, now time.Time) (digestSnapshot,
 		return snap, err
 	}
 	if snap.Freeze, err = st.GateFreeze(); err != nil {
+		return snap, err
+	}
+	if snap.Agents, err = st.AgentFreezes(); err != nil {
 		return snap, err
 	}
 	if snap.FailedOutcomes, err = st.FailedToolOutcomesSince(now.Add(-digestFailedWin)); err != nil {

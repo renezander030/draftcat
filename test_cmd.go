@@ -154,14 +154,8 @@ func runTestCmd(args []string) int {
 
 	skills, _ := skillsapi.LoadSkills(skillsDir)
 
-	var pipeline *config.PipelineConfig
-	for i := range cfg.Pipelines {
-		if cfg.Pipelines[i].Name == pipelineName {
-			pipeline = &cfg.Pipelines[i]
-			break
-		}
-	}
-	if pipeline == nil {
+	pipeline, ok := cfg.Pipeline(pipelineName)
+	if !ok {
 		fmt.Fprintf(os.Stderr, "test: pipeline %q not found in %s\n", pipelineName, configPath)
 		return 1
 	}
@@ -176,7 +170,7 @@ func runTestCmd(args []string) int {
 	}
 
 	fmt.Printf("[test] pipeline=%s fixtures=%s\n", pipelineName, fixDir)
-	run := runTestPipeline(cfg, *pipeline, skills, stub, fixDir)
+	run := runTestPipeline(cfg, pipeline, skills, stub, fixDir)
 	if run.rc != 0 {
 		return run.rc
 	}

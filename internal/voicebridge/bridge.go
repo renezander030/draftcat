@@ -31,14 +31,16 @@ type Bridge struct {
 	server     *voice.Server
 	cfg        voice.Config
 	dedupStore *statestore.StateStore
+	gate       *callGate
 }
 
 // Boot decodes the raw `voice:` config node, and if enabled, starts the voice
-// webhook server (sharing the engine's SQLite file) and registers pre-call
-// lookups against the GHL connector (when configured). Returns nil when voice
-// is disabled, misconfigured, or no state store is available — that nil is a
-// valid "no voice" Bridge.
-func Boot(raw yaml.Node, st *statestore.StateStore, ghl *ghlapi.GHLConnector) *Bridge {
+// webhook server (sharing the engine's SQLite file), holds its calls to the
+// daily call caps in budget, and registers pre-call lookups against the GHL
+// connector (when configured). Returns nil when voice is disabled,
+// misconfigured, or no state store is available — that nil is a valid
+// "no voice" Bridge.
+func Boot(raw yaml.Node, st *statestore.StateStore, ghl *ghlapi.GHLConnector, budget CallBudget) *Bridge {
 	if st == nil {
 		return nil
 	}
@@ -58,13 +60,15 @@ func Boot(raw yaml.Node, st *statestore.StateStore, ghl *ghlapi.GHLConnector) *B
 	if srv == nil {
 		return nil
 	}
+	gate := newCallGate(st, srv.Store(), budget)
+	srv.SetCallGate(gate)
 	registerLookups(srv, ghl)
 	go func() {
 		if err := srv.Start(); err != nil && err.Error() != "http: Server closed" {
 			log.Printf("[voice] server stopped: %v", err)
 		}
 	}()
-	return &Bridge{server: srv, cfg: vcfg, dedupStore: st}
+	return &Bridge{server: srv, cfg: vcfg, dedupStore: st, gate: gate}
 }
 
 // registerLookups wires draftcat's existing connectors into the voice plugin's
@@ -130,6 +134,16 @@ func (b *Bridge) TryAction(action, pipelineName string, vars map[string]string, 
 		return true, false, nil
 
 	case "dograh_staging_smoke":
+		// This run places a call, so the daily call caps apply to it. It is
+		// counted when its session_start reaches the voice receivers.
+		if b.gate != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := b.gate.Check(ctx)
+			cancel()
+			if err != nil {
+				return true, false, fmt.Errorf("dograh_staging_smoke: %w", err)
+			}
+		}
 		runID, err := dograh.DograhTriggerRun(b.dograhConfig(), setEnv(vars, "staging"), data)
 		if err != nil {
 			return true, false, err

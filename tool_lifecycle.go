@@ -137,12 +137,7 @@ func (g *toolGate) handleRevoke(w http.ResponseWriter, r *http.Request, id strin
 	var body struct {
 		BindingHash string `json:"binding_hash"`
 	}
-	raw, ok := readRequestBody(w, r, 4096)
-	if !ok {
-		return
-	}
-	if err := decodeStrictJSON(raw, &body); err != nil {
-		http.Error(w, "malformed json", http.StatusBadRequest)
+	if !readStrictJSON(w, r, 4096, &body) {
 		return
 	}
 	if state == nil {
@@ -185,12 +180,7 @@ func (g *toolGate) handleComplete(w http.ResponseWriter, r *http.Request, id str
 		Status      string `json:"status"`
 		ResultHash  string `json:"result_hash"`
 	}
-	raw, ok := readRequestBody(w, r, 4096)
-	if !ok {
-		return
-	}
-	if err := decodeStrictJSON(raw, &body); err != nil {
-		http.Error(w, "malformed json", http.StatusBadRequest)
+	if !readStrictJSON(w, r, 4096, &body) {
 		return
 	}
 	if body.BindingHash == "" || (body.Status != "succeeded" && body.Status != "failed") || !validResultHash(body.ResultHash) {

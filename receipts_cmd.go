@@ -95,7 +95,8 @@ func runReceiptsCmd(args []string) int {
 		fmt.Println("  export [--pipeline name] [--limit N] [--out path] [--config path]")
 		fmt.Println("  verify <file.jsonl|-> [--json]  check signed fields without opening SQLite")
 		fmt.Println("  anchor [--json] [--config path]  hash-chain anchor of the whole receipt history")
-		fmt.Println("  verify-anchor <sha256:...|anchor.json|-> [--json] [--config path]  check the history against an anchor")
+		fmt.Println("  verify-anchor <sha256:...|anchor.json|anchor line|-> [--json] [--config path]  check the history against an anchor")
+		fmt.Println("  verify-anchor --log anchors.jsonl [--json] [--config path]  check it against every line of a scheduled anchor file")
 		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "receipts: unknown command %q\n", args[0])

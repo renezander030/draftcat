@@ -40,14 +40,20 @@ func (s *StateStore) RecordToolActionAmounts(actionID, day string, amounts map[s
 // permit that is revoked or expires unconsumed stops counting, because it can
 // no longer be executed.
 func (s *StateStore) ToolArgTotal(tool, arg, day string) (*big.Rat, error) {
+	return s.ToolArgTotalExcept(tool, arg, day, "")
+}
+
+// ToolArgTotalExcept is ToolArgTotal without one action's own amount: the
+// total a call saw before it was allowed.
+func (s *StateStore) ToolArgTotalExcept(tool, arg, day, exceptAction string) (*big.Rat, error) {
 	if s == nil || s.db == nil {
 		return nil, ErrNoStore
 	}
 	rows, err := s.db.QueryContext(context.Background(),
 		`SELECT a.amount FROM tool_action_amounts a
 		 JOIN tool_actions t ON t.action_id = a.action_id
-		 WHERE t.tool = ? AND a.arg = ? AND a.day = ? AND t.decision = 'allow'`,
-		tool, arg, day)
+		 WHERE t.tool = ? AND a.arg = ? AND a.day = ? AND t.decision = 'allow' AND t.action_id <> ?`,
+		tool, arg, day, exceptAction)
 	if err != nil {
 		return nil, err
 	}

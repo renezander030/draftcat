@@ -184,6 +184,82 @@ anchor check over the whole store; it exits 1 if either fails. Both commands
 open the store read-only and never create or migrate it; `verify-anchor` needs
 no `DRAFTCAT_APPROVAL_SECRET`. A malformed anchor exits 2.
 
+### Anchoring on a schedule
+
+An anchor only helps if it is taken regularly and kept where the host cannot
+rewrite it. The engine can do both:
+
+```yaml
+receipts:
+  anchor:
+    at: "07:00"                  # HH:MM once a day, in timezone
+    timezone: Europe/Berlin      # IANA zone; empty = the engine's local zone
+    # every: 24h                 # or an interval instead of at (at least 1m)
+    file: /mnt/audit/anchors.jsonl   # optional: append one JSON line per anchor
+    notify: true                 # optional: send the anchor to the operator channel
+```
+
+On each slot the engine computes the anchor exactly as `receipts anchor` does.
+When the history has not changed since the last anchor a destination got,
+nothing is written or sent. Otherwise:
+
+- `file` gets one line: the `receipts anchor --json` document, compact, with
+  `anchored_at` (UTC) added and the full trail. The file is created `0600`,
+  appended to and synced to disk after each line; draftcat never rewrites it.
+  A line carries one trail entry per receipt (about 80 bytes each), so the file
+  grows with the history. Keep it on another disk or host: a mounted volume,
+  a synced folder, a log shipper.
+- `notify: true` sends the operator channel a summary and the anchor without
+  its trail on one line, so a copy lives in the chat history, off the host:
+
+  ```text
+  [anchor] 1284 receipt(s) in the history, the last rcpt_9d4d... decided 2026-10-21T17:02:11Z
+  {"format":"draftcat-receipt-anchor/v1","anchored_at":"2026-10-22T05:00:00Z","count":1284,...,"link":"sha256:5be1..."}
+  ```
+
+If the stored history no longer reproduces the anchor taken at the previous
+slot (a receipt was changed, removed or inserted in between), the engine logs a
+warning and the message says so. It still anchors the history as it now is.
+
+Check the store against the file, every line oldest first:
+
+```bash
+draftcat receipts verify-anchor --log /mnt/audit/anchors.jsonl
+#   anchor log ok: all 12 anchor(s) match; the newest is line 12, anchored 2026-10-22T05:00:00Z
+#   anchor ok: 1284 receipt(s) match the anchor; 3 appended since (sha256:5be1...)
+```
+
+The result is the first line the store fails, or the newest when all match.
+Checking every line matters: an anchor taken after a receipt was changed
+matches the changed history, while the older lines still name the change. With
+`--json` the result adds `anchors`, `line` and `anchored_at`.
+
+A single line, from the file or from the message, is accepted as it is, as the
+argument or on stdin:
+
+```bash
+tail -n 1 /mnt/audit/anchors.jsonl | draftcat receipts verify-anchor -
+draftcat receipts verify-anchor '{"format":"draftcat-receipt-anchor/v1","anchored_at":...}'
+```
+
+A line from the file names the position of a mismatch; the message's line has
+no trail and says only whether the history still reproduces it.
+
+The engine keeps the time of the last slot and what each destination last got
+in the state store (the `receipt_anchor_state` table, created at first
+start). A restart does not repeat a line or a message. A slot missed while the
+engine was down runs once at its first check, and the first anchor is taken
+when the engine starts with the setting. A write or send that fails is retried
+after a minute; a destination that already got the anchor is not repeated.
+
+`receipts.anchor` is optional; absent means no scheduled anchor. It is
+restart-only: a reload that changes it reports that a restart is needed.
+`draftcat validate` refuses neither or both of `every` and `at`, a time that is
+not `HH:MM`, an unknown zone, an interval under one minute, a setting with
+neither `file` nor `notify`, and a `file` that is the state store. It warns
+when `file` sits in the state store's directory, on the same disk as the
+receipts it anchors.
+
 ## Skip reasons
 
 An operator can say why an action was skipped: **Skip with reason...** on the

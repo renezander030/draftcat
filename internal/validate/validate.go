@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ var validKnownActions = map[string]string{
 	"ghl_unread_conversations": "fetch unread GHL conversations",
 	"pdf_extract":              "parse a PDF into text + per-fragment bounding boxes (requires vars.path or data.pdf_path)",
 	"pdf_verify_cite":          "resolve <cite> tags in ai_raw against the parsed PDF (optional vars.fail_on_unresolved)",
+	"http_request":             "send one approved HTTP request with a credential from auth_env (requires vars.url and an approval step before it)",
 }
 
 var validStepTypes = map[string]bool{
@@ -46,6 +48,14 @@ var validStepTypes = map[string]bool{
 // Implemented operator channels come from internal/channels, which the engine
 // reads too. Keeping a second list here is what let `channel: slack` pass
 // validation for a channel that was never built.
+
+// relayedSurfaces are names an operator may write for a surface that draftcat
+// reaches only through the `relay` channel. They stay errors, since the engine
+// would never route to them; the message points at the relay that does.
+var relayedSurfaces = map[string]string{
+	"slack": "contrib/slack-relay",
+	"teams": "contrib/teams-relay",
+}
 
 type validateFinding struct {
 	Level   string `json:"level"`
@@ -140,6 +150,8 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkTimeouts(cfg, rep)
 	checkBudgetAlerts(cfg, rep)
 	checkReserveMaxCost(cfg, rep)
+	checkReceiptAnchor(cfg, rep)
+	checkVoiceCallCaps(cfg, rep)
 	checkRolesToModels(cfg, rep)
 	checkEnvVars(cfg, rep)
 	checkPipelines(cfg, skills, skillsDir, rep)
@@ -174,6 +186,32 @@ func CheckAtStartup(cfg *config.Config, skillsDir string) []Finding {
 		out = append(out, Finding(f))
 	}
 	return out
+}
+
+// Summary is the verdict on a set of findings for a caller that reports
+// counts rather than the list: errors, warnings, and the first error as
+// "path: message".
+type Summary struct {
+	Errors     int
+	Warnings   int
+	FirstError string
+}
+
+// Summarize counts findings by level; anything that is not an error is a
+// warning.
+func Summarize(findings []Finding) Summary {
+	var s Summary
+	for _, f := range findings {
+		if f.Level != "error" {
+			s.Warnings++
+			continue
+		}
+		if s.Errors == 0 {
+			s.FirstError = f.Path + ": " + f.Message
+		}
+		s.Errors++
+	}
+	return s
 }
 
 func loadSkillsForValidate(skillsDir string, rep *validateReport) map[string]*skillsapi.SkillDef {
@@ -315,6 +353,47 @@ func checkBudgetAlerts(cfg *config.Config, rep *validateReport) {
 	}
 	if len(cfg.Budgets.AlertAt) > 0 && cfg.Budgets.PerDayTokens <= 0 && cfg.Budgets.PerDayCost <= 0 && !pipelineCaps {
 		rep.warnf("budgets.alert_at", "set per_day_tokens or per_day_cost; alerts are fractions of a daily cap")
+	}
+}
+
+// checkReceiptAnchor checks the scheduled receipt anchor: a schedule it can
+// keep, and somewhere to put the anchor. An anchor file next to the state
+// store shares its host and disk, so whoever can rewrite the receipts can
+// rewrite the anchors too.
+func checkReceiptAnchor(cfg *config.Config, rep *validateReport) {
+	a := cfg.Receipts.Anchor
+	if a == nil {
+		return
+	}
+	const p = "receipts.anchor"
+	if _, err := a.Schedule(); err != nil {
+		rep.errf(p, "%v", err)
+	} else if strings.TrimSpace(a.Every) != "" && strings.TrimSpace(a.Timezone) != "" {
+		rep.warnf(p+".timezone", "applies to at only; every runs on its interval")
+	}
+	file := strings.TrimSpace(a.File)
+	if file == "" {
+		if !a.Notify {
+			rep.errf(p, "set file or notify: true; without either the anchor is kept nowhere")
+		}
+		return
+	}
+	absFile, ferr := filepath.Abs(file)
+	absState, serr := filepath.Abs(cfg.StatePath())
+	if ferr != nil || serr != nil {
+		return
+	}
+	switch absFile {
+	case absState, absState + "-wal", absState + "-shm", absState + "-journal":
+		rep.errf(p+".file", "%s is the state store itself", file)
+		return
+	}
+	if info, err := os.Stat(absFile); err == nil && info.IsDir() {
+		rep.errf(p+".file", "%s is a directory; name the file the anchors are appended to", file)
+		return
+	}
+	if rel, err := filepath.Rel(filepath.Dir(absState), absFile); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		rep.warnf(p+".file", "%s sits in the state directory, on the same host and disk as the receipts it anchors; keep it on another disk or host", file)
 	}
 }
 
@@ -462,6 +541,9 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 					rep.errf(spath+".action", "unknown action %q%s (known: %s)",
 						st.Action, didYouMean(st.Action, knownActionNames()), strings.Join(knownActionNames(), ", "))
 				}
+				if st.Action == "http_request" {
+					checkHTTPRequestStep(p.Steps, si, spath, rep)
+				}
 				if st.Action == "ghl_stale_opportunities" && st.Vars["pipeline_id"] == "" {
 					rep.errf(spath+".vars.pipeline_id", "ghl_stale_opportunities requires vars.pipeline_id")
 				}
@@ -514,6 +596,9 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				// channel the draft never reaches, while validate said OK.
 				if st.Channel == "" {
 					rep.errf(spath+".channel", "approval step requires 'channel'")
+				} else if relayDir, ok := relayedSurfaces[st.Channel]; ok {
+					rep.errf(spath+".channel", "channel %q is not implemented in draftcat — reach it with 'channel: relay' and the hitl/v0 relay in %s (see docs/hitl-protocol.md)",
+						st.Channel, relayDir)
 				} else if !channels.IsImplemented(st.Channel) {
 					rep.errf(spath+".channel", "channel %q is not implemented — approvals cannot be routed there (implemented: %s)",
 						st.Channel, strings.Join(knownApprovalChannels(), ", "))
@@ -663,14 +748,7 @@ func checkApprovalPolicy(cfg *config.Config, rep *validateReport) {
 			rep.errf(p+".max_cost", "must be >= 0 (got %.4f)", rule.MaxCost)
 		}
 		if rule.Pipeline != "" {
-			known := false
-			for _, pl := range cfg.Pipelines {
-				if pl.Name == rule.Pipeline {
-					known = true
-					break
-				}
-			}
-			if !known {
+			if _, known := cfg.Pipeline(rule.Pipeline); !known {
 				rep.errf(p+".pipeline", "no pipeline named %q — the rule can never match", rule.Pipeline)
 			}
 		}
@@ -702,6 +780,12 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if len(cfg.ToolGate.Tools) > 0 {
 			rep.warnf("tool_gate.enabled", "tools are listed but the tool gate is disabled — the endpoint is not served")
 		}
+		if cfg.ToolGate.Trip != nil {
+			rep.warnf("tool_gate.trip", "set but the tool gate is disabled — nothing is counted")
+		}
+		if cfg.ToolGate.Shadow != nil {
+			rep.warnf("tool_gate.shadow", "set but the tool gate is disabled — there are no calls to compare")
+		}
 		return
 	}
 	if !cfg.Webhook.Enabled {
@@ -730,6 +814,8 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 	if cfg.ToolGate.MaxRepeats < 0 {
 		rep.errf("tool_gate.max_repeats", "must be 0 (no cap) or a positive count (got %d)", cfg.ToolGate.MaxRepeats)
 	}
+	checkGateTrip(cfg.ToolGate.Trip, rep)
+	checkGateShadow(cfg, rep)
 	seen := map[string]bool{}
 	for i, t := range cfg.ToolGate.Tools {
 		p := fmt.Sprintf("tool_gate.tools[%d]", i)
@@ -755,7 +841,7 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		default:
 			rep.errf(p+".on_mismatch", "must be approve or deny (got %q)", t.OnMismatch)
 		}
-		if t.OnMismatch != "" && len(t.Args) == 0 {
+		if t.OnMismatch != "" && len(t.Args) == 0 && t.DefinitionSHA256 == "" && t.DefinitionFile == "" {
 			rep.warnf(p+".on_mismatch", "set without any args constraints — it never applies")
 		}
 		if t.RememberApproval && !t.RequireApproval {
@@ -776,11 +862,89 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.DefinitionSHA256 != "" && !definitionPinRE.MatchString(t.DefinitionSHA256) {
 			rep.errf(p+".definition_sha256", "must look like sha256:<64 lowercase hex> (got %q) — `draftcat gate hash-definition` prints it", t.DefinitionSHA256)
 		}
+		if t.DefinitionFile != "" {
+			checkDefinitionFile(t, p, rep)
+		}
 		checkArgConstraints(t, p, rep)
 	}
 	checkGateCallers(cfg.ToolGate, seen, rep)
 	if env := strings.TrimSpace(cfg.ToolGate.ExecutionGrant.SecretEnv); env != "" && os.Getenv(env) == "" {
 		rep.warnf("tool_gate.execution_grant.secret_env", "env var %s is empty — consumes return no execution grant", env)
+	}
+}
+
+// checkDefinitionFile reads a rule's definition_file the way the engine does
+// at start and on reload, so a file it would refuse is an error here first.
+func checkDefinitionFile(t config.ToolRule, p string, rep *validateReport) {
+	if t.DefinitionSHA256 != "" {
+		rep.errf(p+".definition_file", "set definition_sha256 or definition_file, not both")
+	}
+	if _, err := config.ReadToolDefinition(t.DefinitionFile); err != nil {
+		rep.errf(p+".definition_file", "%v", err)
+	}
+}
+
+// checkGateTrip validates tool_gate.trip. One denial is not a pattern, and a
+// window that is not a positive duration would never trip.
+func checkGateTrip(t *config.GateTrip, rep *validateReport) {
+	if t == nil {
+		return
+	}
+	if t.Denials < 2 {
+		rep.errf("tool_gate.trip.denials", "must be 2 or more (got %d)", t.Denials)
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(t.Within)); err != nil || d <= 0 {
+		rep.errf("tool_gate.trip.within", "must be a positive duration like 10m (got %q)", t.Within)
+	}
+	switch strings.ToLower(strings.TrimSpace(t.Scope)) {
+	case "", "agent", "gate":
+	default:
+		rep.errf("tool_gate.trip.scope", "must be agent or gate (got %q)", t.Scope)
+	}
+}
+
+// CheckToolGateShadow runs the tool_gate.shadow checks alone. The engine
+// uses it on reload: a candidate with errors is refused and the shadow is
+// switched off, while the live gate keeps running.
+func CheckToolGateShadow(cfg *config.Config) []Finding {
+	rep := &validateReport{}
+	checkGateShadow(cfg, rep)
+	out := make([]Finding, 0, len(rep.Findings))
+	for _, f := range rep.Findings {
+		out = append(out, Finding(f))
+	}
+	return out
+}
+
+// checkGateShadow validates tool_gate.shadow: the candidate file exists,
+// parses and has a tool_gate section whose rules pass the same checks as the
+// live ones. A candidate identical to the live rules can never differ.
+func checkGateShadow(cfg *config.Config, rep *validateReport) {
+	s := cfg.ToolGate.Shadow
+	if s == nil {
+		return
+	}
+	path := strings.TrimSpace(s.Config)
+	if path == "" {
+		rep.errf("tool_gate.shadow.config", "names the candidate config file; it is required")
+		return
+	}
+	cand, err := config.LoadToolGateFile(path)
+	if err != nil {
+		rep.errf("tool_gate.shadow.config", "%v", err)
+		return
+	}
+	// The candidate's rules, checked as a gate of their own; its callers,
+	// trip and shadow play no part in the comparison.
+	sub := &validateReport{}
+	checkToolGate(&config.Config{Webhook: config.WebhookConfig{Enabled: true},
+		ToolGate: config.ToolGateConfig{Enabled: true, Tools: cand.Tools}}, sub)
+	for _, f := range sub.Findings {
+		f.Path = "tool_gate.shadow: " + f.Path
+		rep.Findings = append(rep.Findings, f)
+	}
+	if reflect.DeepEqual(cand.Tools, cfg.ToolGate.Tools) {
+		rep.warnf("tool_gate.shadow.config", "%s has the same tool rules as the live gate — the shadow never records a difference", path)
 	}
 }
 
@@ -994,6 +1158,7 @@ func isCommonDataKey(k string) bool {
 		"voice_learnings", "voice_learning_count",
 		"voice_admin_commit_sha", "voice_admin_smoke_run_id", "voice_admin_publish_status",
 		"workflow_id", "workflow_uuid",
+		"http_response", "http_status", "http_response_body",
 		"ai_output", "ai_raw", "approved":
 		return true
 	}

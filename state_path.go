@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
@@ -9,21 +10,11 @@ import (
 	"github.com/renezander030/draftcat/internal/config"
 )
 
-const defaultStatePath = "./state.db"
+const defaultStatePath = config.DefaultStatePath
 
-// resolveStatePath is where the engine and every subcommand find the state store:
-// DRAFTCAT_STATE_PATH first (so a container can point state at a mounted disk
-// without shadowing the baked config), then the config's state.path, then
-// ./state.db.
-func resolveStatePath(cfg *config.Config) string {
-	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
-		return v
-	}
-	if cfg != nil && cfg.State.Path != "" {
-		return cfg.State.Path
-	}
-	return defaultStatePath
-}
+// resolveStatePath is where the engine and every subcommand find the state
+// store; see config.Config.StatePath.
+func resolveStatePath(cfg *config.Config) string { return cfg.StatePath() }
 
 // statePathFromConfigFile applies resolveStatePath for a subcommand that only has a
 // --config argument. The config is read only when the env override is unset;
@@ -32,11 +23,21 @@ func statePathFromConfigFile(configPath string) string {
 	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
 		return v
 	}
-	var cfg config.Config
-	// #nosec G304 -- configPath is the operator's own --config argument on
-	// their own machine; reading the file they named is the feature.
-	if data, err := os.ReadFile(configPath); err == nil && yaml.Unmarshal(data, &cfg) == nil {
-		return resolveStatePath(&cfg)
+	cfg, _ := loadConfigFile(configPath)
+	return resolveStatePath(cfg)
+}
+
+// loadConfigFile reads and parses a config file for a subcommand that reports
+// "<command>: read config: ..." or "<command>: parse config: ...".
+func loadConfigFile(path string) (*config.Config, error) {
+	// #nosec G304 -- the operator's own --config argument.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return defaultStatePath
+	var cfg config.Config
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	return &cfg, nil
 }

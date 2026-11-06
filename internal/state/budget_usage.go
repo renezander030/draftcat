@@ -72,3 +72,18 @@ func (s *StateStore) BudgetUsageBy(ctx context.Context, at time.Time, by string)
 	}
 	return out, rows.Err()
 }
+
+// ReservedBudgetCost is the worst-case cost the pending model calls hold
+// against the daily cost cap under reserve_max_cost. A store the engine has
+// not yet migrated holds none.
+func (s *StateStore) ReservedBudgetCost(ctx context.Context) (float64, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("budget store unavailable")
+	}
+	var reserved float64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(reserved_cost),0) FROM budget_calls WHERE status='pending'`).Scan(&reserved)
+	if err != nil && strings.Contains(err.Error(), "no such column") {
+		return 0, nil
+	}
+	return reserved, err
+}

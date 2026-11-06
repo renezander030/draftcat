@@ -111,6 +111,8 @@ type registry struct {
 	aiCost       *counterVec
 	approvals    *counterVec
 	otlpDropped  *counterVec
+	shadowDiffs  *counterVec
+	shadowErrors *counterVec
 }
 
 func newRegistry() *registry {
@@ -123,6 +125,8 @@ func newRegistry() *registry {
 		aiCost:       newCounter("draftcat_ai_cost_usd_total", "Total AI cost in USD."),
 		approvals:    newCounter("draftcat_approvals_total", "Total approval decisions by outcome."),
 		otlpDropped:  newCounter("draftcat_otlp_exports_dropped_total", "Total OTLP span exports that failed and were dropped."),
+		shadowDiffs:  newCounter("draftcat_gate_shadow_differences_total", "Tool calls the shadow candidate policy decided differently from the live policy."),
+		shadowErrors: newCounter("draftcat_gate_shadow_errors_total", "Shadow policy evaluations that failed; the live decision is unaffected."),
 	}
 }
 
@@ -147,6 +151,8 @@ func resetMetrics() {
 	reg.aiCost = fresh.aiCost
 	reg.approvals = fresh.approvals
 	reg.otlpDropped = fresh.otlpDropped
+	reg.shadowDiffs = fresh.shadowDiffs
+	reg.shadowErrors = fresh.shadowErrors
 }
 
 // RecordPipeline records a completed pipeline run. Pure registry update — always
@@ -197,6 +203,24 @@ func recordOTLPDropped() {
 	reg.otlpDropped.add("", 1)
 }
 
+// RecordShadowDifference counts one call the shadow candidate decided
+// differently. tool is a tool listed in the live or the candidate policy (an
+// unlisted tool is denied by both, which is no difference), so the label set
+// stays bounded by the config.
+func RecordShadowDifference(tool, live, shadow string) {
+	lbl := lbls("tool", tool, "live", live, "shadow", shadow)
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.shadowDiffs.add(lbl, 1)
+}
+
+// RecordShadowError counts one shadow evaluation that failed or panicked.
+func RecordShadowError() {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.shadowErrors.add("", 1)
+}
+
 // WriteMetrics renders the full text exposition to w.
 func WriteMetrics(w io.Writer) error {
 	reg.mu.Lock()
@@ -209,6 +233,8 @@ func WriteMetrics(w io.Writer) error {
 	reg.aiCost.render(&sb)
 	reg.approvals.render(&sb)
 	reg.otlpDropped.render(&sb)
+	reg.shadowDiffs.render(&sb)
+	reg.shadowErrors.render(&sb)
 	reg.mu.Unlock()
 	renderGauges(&sb)
 	_, err := io.WriteString(w, sb.String())

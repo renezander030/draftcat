@@ -16,7 +16,7 @@ import (
 
 type Bridge struct{}
 
-func Boot(_ yaml.Node, _ *statestore.StateStore, _ *ghlapi.GHLConnector) *Bridge {
+func Boot(_ yaml.Node, _ *statestore.StateStore, _ *ghlapi.GHLConnector, _ CallBudget) *Bridge {
 	return nil
 }
 

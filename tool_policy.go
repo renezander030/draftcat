@@ -43,10 +43,11 @@ type toolDailyTotal func(tool, arg string) (*big.Rat, error)
 // denied; arguments outside the rule escalate to a human or are refused per
 // on_mismatch; a call that would take a max_per_day total or the
 // max_calls_per_day count past its cap is handled the same way; a value above review_above goes to a human; anything
-// else is allowed on the strength of being listed. A rule that pins
-// definition_sha256 treats a missing or different definition (the one the
-// harness sent with the call) like an argument mismatch; a rule without a pin
-// ignores it. A failing total lookup is returned as an error, never guessed.
+// else is allowed on the strength of being listed. A rule that pins its
+// definition (definition_sha256 or definition_file) treats a missing or
+// different definition (the one the harness sent with the call) like an
+// argument mismatch; a rule without a pin ignores it. A failing total lookup
+// is returned as an error, never guessed.
 func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args, definition map[string]interface{}, total toolDailyTotal) (toolPolicyVerdict, error) {
 	rule, listed := gate.Lookup(tool)
 	if !listed {
@@ -116,9 +117,13 @@ func evaluateToolPolicy(gate config.ToolGateConfig, tool string, args, definitio
 }
 
 // matchToolDefinition checks the definition the harness sent against the
-// rule's definition_sha256 pin. A rule without a pin matches whatever was
-// sent, or nothing. The reason names the definition and both hashes.
+// rule's pin: definition_sha256, or the definition read from definition_file.
+// A rule without a pin matches whatever was sent, or nothing. For a hash pin
+// the reason names both hashes; for a file pin it names what changed.
 func matchToolDefinition(rule config.ToolRule, definition map[string]interface{}) (bool, string) {
+	if rule.DefinitionFile != "" {
+		return matchDefinitionFile(rule, definition)
+	}
 	if rule.DefinitionSHA256 == "" {
 		return true, ""
 	}
@@ -129,4 +134,22 @@ func matchToolDefinition(rule config.ToolRule, definition map[string]interface{}
 		return false, fmt.Sprintf("the tool definition hashes to %s, the rule pins %s", got, rule.DefinitionSHA256)
 	}
 	return true, ""
+}
+
+// matchDefinitionFile checks the definition sent against the one read from
+// the rule's definition_file. A file not read, or a rule that also pins a
+// hash, fails closed.
+func matchDefinitionFile(rule config.ToolRule, definition map[string]interface{}) (bool, string) {
+	pinned := rule.Pinned()
+	switch {
+	case rule.DefinitionSHA256 != "":
+		return false, "the rule sets both definition_sha256 and definition_file"
+	case pinned == nil:
+		return false, "the pinned definition in " + rule.DefinitionFile + " is not loaded"
+	case len(definition) == 0:
+		return false, "no definition sent, the rule pins the one in " + rule.DefinitionFile
+	case hashCanonical(definition) == pinned.SHA256:
+		return true, ""
+	}
+	return false, summarizeDefinitionChanges(definitionChanges(pinned.Definition, definition))
 }

@@ -2,7 +2,11 @@
 
 package voice
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"errors"
+)
 
 const migrationSQL = `
 CREATE TABLE IF NOT EXISTS voice_sessions (
@@ -87,6 +91,17 @@ func (s *Store) InsertSessionStart(ss SessionStart) error {
 			pre_call_context_json = excluded.pre_call_context_json
 	`, ss.ID, ss.CallerPhone, ss.Workflow, ss.StartedAt, ss.PreCallContextJSON)
 	return err
+}
+
+// SessionStartedAt returns when a session started, in unix milliseconds, and
+// whether its session_start was recorded.
+func (s *Store) SessionStartedAt(ctx context.Context, id string) (int64, bool, error) {
+	var at int64
+	err := s.db.QueryRowContext(ctx, `SELECT started_at FROM voice_sessions WHERE id = ?`, id).Scan(&at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return at, err == nil, err
 }
 
 type Event struct {

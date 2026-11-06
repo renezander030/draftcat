@@ -42,3 +42,25 @@ func TestStatePathFromConfigFile(t *testing.T) {
 		})
 	}
 }
+
+// budget status reads the pipelines' caps from the same --config; a file it
+// cannot read or parse shows no caps rather than failing the command.
+func TestPipelineCapsFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	capped := filepath.Join(dir, "capped.yaml")
+	if err := os.WriteFile(capped, []byte("pipelines:\n  - name: leads\n    budget:\n      per_day_tokens: 500\n  - name: digest\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(dir, "broken.yaml")
+	if err := os.WriteFile(broken, []byte("pipelines: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := pipelineCapsFromConfigFile(capped); len(got) != 1 || got[0].Name != "leads" || got[0].Budget.PerDayTokens != 500 {
+		t.Fatalf("caps = %+v", got)
+	}
+	for _, p := range []string{broken, filepath.Join(dir, "absent.yaml")} {
+		if got := pipelineCapsFromConfigFile(p); got != nil {
+			t.Fatalf("caps from %s = %+v, want none", p, got)
+		}
+	}
+}

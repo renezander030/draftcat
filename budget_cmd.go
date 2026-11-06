@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
@@ -83,7 +81,7 @@ func runBudgetCmd(args []string) int {
 			return code
 		}
 		defer closeStore()
-		return printBudgetStatus(st, jsonOut, pipelineCapsFromConfigFile(path))
+		return printBudgetStatus(st, jsonOut, pipelineCapsFromConfigFile(path), callCapsFromConfigFile(path))
 	}
 	// This administrative write requires an existing regular database. It must
 	// never turn a misspelled path into a fresh store with an empty spend ledger.
@@ -124,13 +122,36 @@ type pipelineDayCap struct {
 // pipelineCapsFromConfigFile lists the pipelines with a daily budget in config
 // order. An unreadable or unparsable config shows no pipeline caps.
 func pipelineCapsFromConfigFile(configPath string) []config.PipelineCap {
-	var cfg config.Config
-	// #nosec G304 -- configPath is the operator's own --config argument.
-	data, err := os.ReadFile(configPath)
-	if err != nil || yaml.Unmarshal(data, &cfg) != nil {
+	cfg, _ := loadConfigFile(configPath)
+	return cfg.CappedPipelines()
+}
+
+// callCapsFromConfigFile reads budgets.per_day_calls and
+// budgets.per_day_call_minutes. An unreadable config shows no call caps.
+func callCapsFromConfigFile(configPath string) statestore.VoiceCallCaps {
+	cfg, err := loadConfigFile(configPath)
+	if err != nil {
+		return statestore.VoiceCallCaps{}
+	}
+	return statestore.VoiceCallCaps{Calls: cfg.Budgets.PerDayCalls, Minutes: cfg.Budgets.PerDayCallMinutes}
+}
+
+// callDayCaps is today's recorded voice usage against the daily call caps
+// (0 = that cap is off).
+type callDayCaps struct {
+	PerDayCalls       int  `json:"per_day_calls"`
+	PerDayCallMinutes int  `json:"per_day_call_minutes"`
+	Reached           bool `json:"reached"`
+}
+
+func voiceDayCaps(caps statestore.VoiceCallCaps, day statestore.BudgetDay) *callDayCaps {
+	if !caps.Capped() {
 		return nil
 	}
-	return cfg.CappedPipelines()
+	return &callDayCaps{
+		PerDayCalls: caps.Calls, PerDayCallMinutes: caps.Minutes,
+		Reached: (caps.Calls > 0 && day.Calls >= caps.Calls) || (caps.Minutes > 0 && day.CallMinutes >= caps.Minutes),
+	}
 }
 
 func pipelineDayCaps(caps []config.PipelineCap, byPipeline []statestore.UsageShare) []pipelineDayCap {
@@ -150,7 +171,7 @@ func pipelineDayCaps(caps []config.PipelineCap, byPipeline []statestore.UsageSha
 	return out
 }
 
-func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.PipelineCap) int {
+func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.PipelineCap, calls statestore.VoiceCallCaps) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	now := time.Now().UTC()
@@ -175,6 +196,7 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.Pi
 		return 1
 	}
 	capped := pipelineDayCaps(caps, byPipeline)
+	callCaps := voiceDayCaps(calls, day)
 	if jsonOut {
 		report := struct {
 			Day         string                         `json:"day"`
@@ -186,7 +208,8 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.Pi
 			ByModel     []statestore.UsageShare        `json:"by_model"`
 			ByPipeline  []statestore.UsageShare        `json:"by_pipeline"`
 			PipelineCap []pipelineDayCap               `json:"pipeline_caps,omitempty"`
-		}{statestore.UTCDay(now), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending, nonNilShares(byModel), nonNilShares(byPipeline), capped}
+			CallCaps    *callDayCaps                   `json:"call_caps,omitempty"`
+		}{statestore.UTCDay(now), day.Tokens, day.Cost, day.Calls, day.CallMinutes, pending, nonNilShares(byModel), nonNilShares(byPipeline), capped, callCaps}
 		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
 			fmt.Fprintf(os.Stderr, "budget: output: %v\n", err)
 			return 1
@@ -194,6 +217,7 @@ func printBudgetStatus(st *statestore.StateStore, jsonOut bool, caps []config.Pi
 		return 0
 	}
 	fmt.Printf("%s UTC: %d tokens, %.6f cost, %d voice calls, %d call minutes\n", statestore.UTCDay(now), day.Tokens, day.Cost, day.Calls, day.CallMinutes)
+	printCallCaps(callCaps, day)
 	printUsageShares("model", byModel)
 	printUsageShares("pipeline", byPipeline)
 	printPipelineCaps(capped)
@@ -227,6 +251,25 @@ func printUsageShares(by string, shares []statestore.UsageShare) {
 		}
 		fmt.Printf("  %-40s %4d call(s) %9d tokens %12.6f cost\n", name, u.Calls, u.Tokens, u.Cost)
 	}
+}
+
+// printCallCaps shows today's voice usage against the daily call caps.
+func printCallCaps(c *callDayCaps, day statestore.BudgetDay) {
+	if c == nil {
+		return
+	}
+	calls, minutes := "no cap", "no cap"
+	if c.PerDayCalls > 0 {
+		calls = strconv.Itoa(c.PerDayCalls)
+	}
+	if c.PerDayCallMinutes > 0 {
+		minutes = strconv.Itoa(c.PerDayCallMinutes)
+	}
+	line := fmt.Sprintf("Voice call caps: %d of %s calls, %d of %s call minutes", day.Calls, calls, day.CallMinutes, minutes)
+	if c.Reached {
+		line += "  REACHED (new calls are refused)"
+	}
+	fmt.Println(line)
 }
 
 // printPipelineCaps lists each capped pipeline's usage today against its caps.

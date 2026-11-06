@@ -201,6 +201,14 @@ CREATE TABLE IF NOT EXISTS budget_calls (
     settled_at   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_budget_calls_status ON budget_calls(status);
+CREATE TABLE IF NOT EXISTS budget_voice_calls (
+    call_id      TEXT PRIMARY KEY,           -- the voice session id
+    day          TEXT NOT NULL,              -- UTC date the call is counted on
+    status       TEXT NOT NULL,              -- open|ended|refused
+    admitted_at  INTEGER NOT NULL,
+    ended_at     INTEGER NOT NULL DEFAULT 0,
+    minutes      INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS webhook_admissions (
     id          TEXT PRIMARY KEY,
     pipeline    TEXT NOT NULL,
@@ -219,9 +227,39 @@ CREATE TABLE IF NOT EXISTS gate_freeze (
     by           TEXT NOT NULL DEFAULT '',
     at           INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS gate_agent_freeze (
+    agent        TEXT PRIMARY KEY,
+    frozen       INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    by           TEXT NOT NULL DEFAULT '',   -- who set the current state: trip, cli, telegram:<id>
+    at           INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS gate_shadow_diffs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    at              INTEGER NOT NULL,
+    agent           TEXT NOT NULL DEFAULT '',
+    tool            TEXT NOT NULL,
+    args_hash       TEXT NOT NULL,             -- the arguments themselves are never stored
+    live_decision   TEXT NOT NULL,
+    live_rule       TEXT NOT NULL DEFAULT '',
+    live_reason     TEXT NOT NULL DEFAULT '',
+    shadow_decision TEXT NOT NULL,
+    shadow_rule     TEXT NOT NULL DEFAULT '',
+    shadow_reason   TEXT NOT NULL DEFAULT '',
+    candidate_hash  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gate_shadow_at ON gate_shadow_diffs(at);
 CREATE TABLE IF NOT EXISTS operator_digest (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     last_day     TEXT NOT NULL DEFAULT ''     -- local date the digest was last evaluated for
+);
+CREATE TABLE IF NOT EXISTS receipt_anchor_state (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    slot_at      INTEGER NOT NULL DEFAULT 0,  -- when the last scheduled anchor was handled
+    link         TEXT NOT NULL DEFAULT '',    -- the anchor taken then
+    file         TEXT NOT NULL DEFAULT '',    -- the file the last anchor line went to
+    file_link    TEXT NOT NULL DEFAULT '',    -- the anchor in that line
+    notify_link  TEXT NOT NULL DEFAULT ''     -- the anchor last sent to the operator
 );
 `
 	if _, err := tx.ExecContext(context.Background(), schema); err != nil {
@@ -263,6 +301,7 @@ CREATE TABLE IF NOT EXISTS operator_digest (
  CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
  CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_idempotency ON webhook_admissions(pipeline, idempotency_key) WHERE idempotency_key <> '';
  CREATE INDEX IF NOT EXISTS idx_budget_calls_day_pipeline ON budget_calls(day, pipeline);
+ CREATE INDEX IF NOT EXISTS idx_tool_actions_tool_created ON tool_actions(tool, created_at);
  `); err != nil {
 		return err
 	}
@@ -367,8 +406,7 @@ func (s *StateStore) RecordRunForID(runID, pipeline string, started, ended time.
 	return err
 }
 
-// RecentRuns returns the last n runs for a pipeline, newest first. Used by
-// the /status operator command.
+// RunRecord is one row of pipeline_runs.
 type RunRecord struct {
 	RunID     string
 	Pipeline  string
@@ -378,15 +416,29 @@ type RunRecord struct {
 	Error     string
 }
 
+// RecentRuns returns the last n runs for a pipeline, newest first. Used by
+// the /status operator command.
 func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
-	rows, err := s.db.Query(
-		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`,
-		pipeline, n,
-	)
+	return s.queryRuns(`WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`, pipeline, n)
+}
+
+// AllRecentRuns is RecentRuns across every pipeline, newest first. Used by
+// `draftcat runs` when no pipeline is named.
+func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	return s.queryRuns(`ORDER BY started_at DESC LIMIT ?`, n)
+}
+
+func (s *StateStore) queryRuns(tail string, args ...interface{}) ([]RunRecord, error) {
+	// #nosec G202 -- tail is a constant clause at every call site; values are bound parameters.
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs `+tail, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []RunRecord
 	for rows.Next() {
 		var r RunRecord
@@ -413,33 +465,6 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 // Signature are the tamper-evidence receipt: empty on rows written before signing
 // was configured (or when no secret is set), otherwise an HMAC over the other
 // fields under the operator's approval-signing secret.
-// AllRecentRuns is RecentRuns across every pipeline, newest first. Used by
-// `draftcat runs` when no pipeline is named.
-func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
-	if s == nil || s.db == nil {
-		return nil, nil
-	}
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'')
-		   FROM pipeline_runs ORDER BY started_at DESC LIMIT ?`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []RunRecord
-	for rows.Next() {
-		var r RunRecord
-		var st, en int64
-		if err := rows.Scan(&r.RunID, &r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
-			return nil, err
-		}
-		r.StartedAt = time.Unix(st, 0)
-		r.EndedAt = time.Unix(en, 0)
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
 type ApprovalRecord struct {
 	ID          int64
 	Version     int
@@ -889,33 +914,6 @@ func (s *StateStore) DecideToolAction(id, status, decision, reason, decidedBy st
 	return err
 }
 
-// ConsumeToolAction atomically spends one allowed permit. Only the first
-// matching caller before expiry succeeds.
-func (s *StateStore) ConsumeToolAction(id, bindingHash string, at time.Time) (ToolAction, bool, error) {
-	if s == nil || s.db == nil {
-		return ToolAction{}, false, nil
-	}
-	res, err := s.db.ExecContext(context.Background(),
-		`UPDATE tool_actions SET status='consumed', consumed_at=?, updated_at=?
-		 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at>?`,
-		at.Unix(), at.Unix(), id, bindingHash, at.Unix())
-	if err != nil {
-		return ToolAction{}, false, err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		if _, err := s.db.ExecContext(context.Background(),
-			`UPDATE tool_actions SET status='expired', decision='deny',
-			 reason='permit expired before consumption', updated_at=?
-			 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at<=?`,
-			at.Unix(), id, bindingHash, at.Unix()); err != nil {
-			return ToolAction{}, false, err
-		}
-	}
-	a, err := s.ToolAction(id)
-	return a, n == 1, err
-}
-
 // ExpireToolActions closes pending work that cannot safely resume after a
 // restart and allowed permits whose signed validity window has elapsed. A
 // still-valid allowed permit remains consumable because its complete binding
@@ -954,12 +952,6 @@ type WebhookAdmission struct {
 	Error          string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
-}
-
-// BeginWebhookAdmission writes the accepted record before the handler returns 202.
-func (s *StateStore) BeginWebhookAdmission(a WebhookAdmission) error {
-	_, _, err := s.AdmitWebhook(a)
-	return err
 }
 
 // AdmitWebhook atomically reserves a pipeline-scoped retry identity.
@@ -1027,12 +1019,6 @@ func scanWebhookAdmission(scan func(...interface{}) error) (WebhookAdmission, er
 	}
 	a.CreatedAt, a.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 	return a, nil
-}
-
-// RevokeToolAction closes an allowed permit whose policy no longer applies.
-func (s *StateStore) RevokeToolAction(id, policy string, at time.Time) error {
-	_, err := s.db.ExecContext(context.Background(), `UPDATE tool_actions SET status='expired', decision='deny', reason='policy changed; request a new approval', updated_at=? WHERE action_id=? AND policy_hash=? AND status='allowed'`, at.Unix(), id, policy)
-	return err
 }
 
 // InterruptWebhookAdmissions makes accepted work visible after a restart.
