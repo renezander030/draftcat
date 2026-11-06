@@ -51,6 +51,47 @@ budgets:
 
 Run behind Caddy or nginx for TLS termination. Dograh requires HTTPS webhooks.
 
+## Daily call caps
+
+`budgets.per_day_calls` and `budgets.per_day_call_minutes` cap the voice calls
+of one UTC day, like the other daily caps. Both are optional; 0 or absent = no
+cap. A config reload applies new values to the next call.
+
+What draftcat can know decides when each cap applies:
+
+| When | What happens |
+|---|---|
+| `POST /voice/pre_call_context` | Refused with `429` once today's calls have reached `per_day_calls` or today's minutes have reached `per_day_call_minutes`. Nothing is counted here (the request carries no session id). This is the only synchronous call in the Dograh wiring, so it is where a Dograh workflow can stop a call before it runs. |
+| `POST /voice/session_start` | The same check, and the call is counted, in one transaction. A refused call answers `429` and is not stored, so it never shows up as a completed call. A repeated `session_start` for a call already counted is accepted without counting it again. |
+| `POST /voice/session_end` | The call's minutes are recorded: from its `session_start` time to this end time, rounded up to whole minutes. A call whose `session_start` never arrived is counted here, with no minutes (its length is unknown); the end of a refused call records nothing. |
+| `dograh_staging_smoke` | The run places a call, so the action is refused once a cap is reached. The call itself is counted when its `session_start` reaches draftcat. |
+
+A refusal answers `{"ok": false, "refused": true, "reason": "BUDGET_BLOCKED: daily voice call limit 200 reached (used: 200, UTC day 2026-11-06)"}`.
+The orchestrator decides what to do with it; wire the workflow to end the call
+on a non-2xx answer. When the caps are set and the usage ledger cannot be read,
+the call is refused with `503` (`"call budget unavailable"`), because draftcat
+does not admit a call it cannot count.
+
+Minutes are known only when a call ends, so the minute cap stops new calls
+once the minutes of ended calls reach it; calls already running finish and
+their minutes can carry the day past the cap. A call's count and minutes land
+on the UTC day it was admitted, even when it ends after midnight.
+
+The operator gets one notice per cap and UTC day, on the first refusal:
+`[budget] Daily voice call cap reached: 200 of 200 calls (UTC day 2026-11-06). New calls are refused until the next UTC day.`
+A restart does not repeat it.
+
+Usage is recorded in the same state database as the token and cost caps, so it
+survives a restart, and both `/status` (`Calls today: 12 / 200`) and
+`draftcat budget status` (text and `--json`, field `call_caps`) show it. Calls
+are counted whether or not a cap is set; without a cap nothing is refused and a
+failure to record is only logged.
+
+Send `started_at_ms` with `session_start` and `ended_at_ms` with
+`session_end` when the orchestrator posts its webhooks after the call rather
+than as it happens: without them draftcat uses the arrival times, and the
+minutes come out short.
+
 ## Endpoints
 
 All endpoints require `Authorization: Bearer <token>` when `auth.method=bearer`.
@@ -59,12 +100,12 @@ success.
 
 | Endpoint                       | Direction | Purpose                                                           |
 | ------------------------------ | --------- | ----------------------------------------------------------------- |
-| `POST /voice/session_start`    | Dograh → draftcat | Call connected. Persists to `voice_sessions`.            |
+| `POST /voice/session_start`    | Dograh → draftcat | Call connected. Counts the call, or refuses it with `429` at a daily cap. Persists to `voice_sessions`. |
 | `POST /voice/event`            | Dograh → draftcat | Mid-call event (utterance, intent, tool call). `voice_events`. |
-| `POST /voice/session_end`      | Dograh → draftcat | Call ended with outcome, transcript, cost. `voice_outcomes`. |
+| `POST /voice/session_end`      | Dograh → draftcat | Call ended with outcome, transcript, cost. `voice_outcomes`. Records the call's minutes. |
 | `POST /voice/handoff`          | Dograh → draftcat | Transfer-to-human request. `voice_handoffs`. Response carries routing target. |
 | `POST /voice/learning`         | Dograh → draftcat | Agent-flagged Learning-Item. `voice_learnings`.          |
-| `POST /voice/pre_call_context` | Dograh → draftcat | Enrich greeting with account context. Sub-300ms p95 budget. |
+| `POST /voice/pre_call_context` | Dograh → draftcat | Enrich greeting with account context. Sub-300ms p95 budget. Refused with `429` at a daily call cap. |
 
 ## Wiring Dograh
 
@@ -118,7 +159,7 @@ Seven new actions are available once draftcat is built with `-tags voice`.
 | Action                       | Behavior                                                                                                                |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `git_commit_workflow_update` | Optionally writes `data[content_var]` to `vars.path`, then `git add` + `git commit` in `vars.repo_dir`. Sets `data.voice_admin_commit_sha`. |
-| `dograh_staging_smoke`       | POST `/api/v1/public/agent/workflow/{workflow_uuid}` to `voice.dograh.staging_url`. Sets `data.voice_admin_smoke_run_id`. |
+| `dograh_staging_smoke`       | POST `/api/v1/public/agent/workflow/{workflow_uuid}` to `voice.dograh.staging_url`. Sets `data.voice_admin_smoke_run_id`. Refused once a daily call cap is reached. |
 | `dograh_prod_publish`        | PUT `/api/v1/workflow/{workflow_id}` to `voice.dograh.base_url` with the JSON read from `vars.definition_path`. Dograh auto-versions on PUT, preserving prior versions. Sets `data.voice_admin_publish_status`. |
 
 ## Example pipelines
@@ -131,7 +172,9 @@ Seven new actions are available once draftcat is built with `-tags voice`.
 The plugin reuses draftcat's existing SQLite state database (`state.db` by
 default). On first start with `-tags voice`, five new tables are created:
 `voice_sessions`, `voice_events`, `voice_outcomes`, `voice_handoffs`,
-`voice_learnings`.
+`voice_learnings`. Call usage goes to the budget tables every build creates:
+`budget_days` (the daily totals) and `budget_voice_calls` (one row per call, so
+a repeated webhook is never counted twice).
 
 ## Smoke test
 

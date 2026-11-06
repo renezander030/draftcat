@@ -2335,6 +2335,13 @@ func handleStatus(bot *TGBot, budget *BudgetTracker, sched *Scheduler, cfg *conf
 	_ = bot.Send(report)
 }
 
+func capReachedNote(used, limit int) string {
+	if used >= limit {
+		return " (reached; new calls are refused)"
+	}
+	return ""
+}
+
 // statusReport renders /status. Spend is shown against every cap that is
 // configured — the person paying should see how close the day is to its cap
 // without waiting for the next approval prompt to tell them — and open gates
@@ -2365,11 +2372,13 @@ func statusReport(active, paused int, budget *BudgetTracker, cfg *config.Config,
 	if budget.pipelineCostLimit > 0 {
 		lines = append(lines, fmt.Sprintf("Per-pipeline cap: %.4f", budget.pipelineCostLimit))
 	}
+	// Voice usage is recorded by the voice plugin in the same ledger; a call
+	// is refused once either total reaches its cap.
 	if cap := cfg.Budgets.PerDayCalls; cap > 0 {
-		lines = append(lines, fmt.Sprintf("Calls today: %d / %d", budget.callsToday, cap))
+		lines = append(lines, fmt.Sprintf("Calls today: %d / %d%s", budget.callsToday, cap, capReachedNote(budget.callsToday, cap)))
 	}
 	if cap := cfg.Budgets.PerDayCallMinutes; cap > 0 {
-		lines = append(lines, fmt.Sprintf("Call minutes today: %d / %d", budget.callMinutesToday, cap))
+		lines = append(lines, fmt.Sprintf("Call minutes today: %d / %d%s", budget.callMinutesToday, cap, capReachedNote(budget.callMinutesToday, cap)))
 	}
 	switch {
 	case openErr != nil:
@@ -2684,10 +2693,6 @@ func main() {
 		log.Printf("[state] opened %s", statePath)
 	}
 
-	// Voice plugin (build-tag voice). No-op in lean builds.
-	vbridge = voicebridge.Boot(cfg.Voice, state, ghl)
-	defer vbridge.Shutdown()
-
 	// Init scheduler
 	sched := newScheduler(cfg.Pipelines)
 
@@ -2719,6 +2724,17 @@ func main() {
 		log.Printf("[budget] usage ledger unavailable; model calls blocked: %v", err)
 	}
 	budget.configureAlerts(&cfg, func(msg string) { _ = opChan.Send(msg) })
+
+	// Voice plugin (build-tag voice). No-op in lean builds. Booted once the
+	// operator channel is chosen, since its call caps notify the operator.
+	vbridge = voicebridge.Boot(cfg.Voice, state, ghl, voicebridge.CallBudget{
+		Caps: func() (int, int) {
+			b := currentConfig(&cfg).Budgets
+			return b.PerDayCalls, b.PerDayCallMinutes
+		},
+		Notify: func(msg string) { _ = opChan.Send(msg) },
+	})
+	defer vbridge.Shutdown()
 	chatHistory := newChatHistory(20) // keep last 20 turns
 
 	// Any approval gate still marked pending was open when this process last

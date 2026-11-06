@@ -3,6 +3,7 @@
 package validate
 
 func init() {
+	voicePluginBuilt = true
 	validKnownActions["voice_calls_completed"] = "harvest completed voice calls from Dograh writeback (deduped per pipeline)"
 	validKnownActions["voice_handoffs_pending"] = "harvest unresolved handoff requests for human routing"
 	validKnownActions["voice_handoffs_resolve"] = "resolve handoffs by writing ai_output.resolutions[].{handoff_id,target} back to the voice store"

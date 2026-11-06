@@ -187,52 +187,9 @@ func (b *BudgetTracker) RecordCost(cost float64) {
 	}
 }
 
-func (b *BudgetTracker) CheckCalls(limit int) error {
-	r := b.root()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.refreshLocked(time.Now())
-	if err := b.checkLocked(0, 0, 0, 0); err != nil {
-		return err
-	}
-	if limit > 0 && r.callsToday >= limit {
-		return fmt.Errorf("BUDGET_BLOCKED: daily call limit %d would be exceeded (used: %d)", limit, r.callsToday)
-	}
-	return nil
-}
-
-func (b *BudgetTracker) CheckCallMinutes(limit, requested int) error {
-	r := b.root()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.refreshLocked(time.Now())
-	if err := b.checkLocked(0, 0, 0, 0); err != nil {
-		return err
-	}
-	if requested < 0 {
-		return fmt.Errorf("BUDGET_BLOCKED: invalid call minutes")
-	}
-	if limit > 0 && requested > limit-r.callMinutesToday {
-		return fmt.Errorf("BUDGET_BLOCKED: daily call-minute limit %d would be exceeded (used: %d, requested: %d)", limit, r.callMinutesToday, requested)
-	}
-	return nil
-}
-
-func (b *BudgetTracker) RecordCall(minutes int) {
-	r := b.root()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.refreshLocked(time.Now())
-	if minutes < 0 {
-		r.stateErr = fmt.Errorf("invalid call duration")
-		return
-	}
-	r.callsToday++
-	r.callMinutesToday += minutes
-	if r.store != nil {
-		r.stateErr = r.store.AddBudgetUsage(context.Background(), time.Now(), 0, 0, 1, minutes)
-	}
-}
+// Voice calls are counted and capped by the voice plugin directly on the
+// store (state.AdmitVoiceCall); refreshLocked reads their totals back so
+// /status shows them.
 
 func (b *BudgetTracker) snapshot() *BudgetTracker { return b.snapshotAt(time.Now()) }
 

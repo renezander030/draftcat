@@ -201,6 +201,14 @@ CREATE TABLE IF NOT EXISTS budget_calls (
     settled_at   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_budget_calls_status ON budget_calls(status);
+CREATE TABLE IF NOT EXISTS budget_voice_calls (
+    call_id      TEXT PRIMARY KEY,           -- the voice session id
+    day          TEXT NOT NULL,              -- UTC date the call is counted on
+    status       TEXT NOT NULL,              -- open|ended|refused
+    admitted_at  INTEGER NOT NULL,
+    ended_at     INTEGER NOT NULL DEFAULT 0,
+    minutes      INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS webhook_admissions (
     id          TEXT PRIMARY KEY,
     pipeline    TEXT NOT NULL,

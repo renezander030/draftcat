@@ -150,6 +150,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkBudgetAlerts(cfg, rep)
 	checkReserveMaxCost(cfg, rep)
 	checkReceiptAnchor(cfg, rep)
+	checkVoiceCallCaps(cfg, rep)
 	checkRolesToModels(cfg, rep)
 	checkEnvVars(cfg, rep)
 	checkPipelines(cfg, skills, skillsDir, rep)

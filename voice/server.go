@@ -19,7 +19,25 @@ type Server struct {
 	lookups *LookupRunner
 	token   string
 	srv     *http.Server
+	gate    CallGate
 }
+
+// CallGate holds calls to the operator's daily call caps. Check answers
+// whether a new call may start; Admit counts one or refuses it; End records
+// how long it ran, up to endedAt. An error wrapping ErrCallRefused is a
+// refusal, any other error means the gate could not decide or record.
+type CallGate interface {
+	Check(ctx context.Context) error
+	Admit(ctx context.Context, sessionID string) error
+	End(ctx context.Context, sessionID string, endedAt time.Time) error
+}
+
+// ErrCallRefused marks a call refused by a daily cap.
+var ErrCallRefused = errors.New("call refused")
+
+// SetCallGate attaches the call caps. Without a gate every call is accepted
+// and nothing is counted.
+func (s *Server) SetCallGate(g CallGate) { s.gate = g }
 
 func NewServer(cfg Config, db *sql.DB) (*Server, error) {
 	if !cfg.Enabled {
@@ -70,6 +88,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	return s.srv.Shutdown(ctx)
 }
+
+// Handler is the server's routes, for serving them on another listener or
+// driving them in a test.
+func (s *Server) Handler() http.Handler { return s.srv.Handler }
 
 func (s *Server) Store() *Store          { return s.store }
 func (s *Server) Lookups() *LookupRunner { return s.lookups }
