@@ -779,6 +779,9 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if len(cfg.ToolGate.Tools) > 0 {
 			rep.warnf("tool_gate.enabled", "tools are listed but the tool gate is disabled — the endpoint is not served")
 		}
+		if cfg.ToolGate.Trip != nil {
+			rep.warnf("tool_gate.trip", "set but the tool gate is disabled — nothing is counted")
+		}
 		return
 	}
 	if !cfg.Webhook.Enabled {
@@ -807,6 +810,7 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 	if cfg.ToolGate.MaxRepeats < 0 {
 		rep.errf("tool_gate.max_repeats", "must be 0 (no cap) or a positive count (got %d)", cfg.ToolGate.MaxRepeats)
 	}
+	checkGateTrip(cfg.ToolGate.Trip, rep)
 	seen := map[string]bool{}
 	for i, t := range cfg.ToolGate.Tools {
 		p := fmt.Sprintf("tool_gate.tools[%d]", i)
@@ -872,6 +876,25 @@ func checkDefinitionFile(t config.ToolRule, p string, rep *validateReport) {
 	}
 	if _, err := config.ReadToolDefinition(t.DefinitionFile); err != nil {
 		rep.errf(p+".definition_file", "%v", err)
+	}
+}
+
+// checkGateTrip validates tool_gate.trip. One denial is not a pattern, and a
+// window that is not a positive duration would never trip.
+func checkGateTrip(t *config.GateTrip, rep *validateReport) {
+	if t == nil {
+		return
+	}
+	if t.Denials < 2 {
+		rep.errf("tool_gate.trip.denials", "must be 2 or more (got %d)", t.Denials)
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(t.Within)); err != nil || d <= 0 {
+		rep.errf("tool_gate.trip.within", "must be a positive duration like 10m (got %q)", t.Within)
+	}
+	switch strings.ToLower(strings.TrimSpace(t.Scope)) {
+	case "", "agent", "gate":
+	default:
+		rep.errf("tool_gate.trip.scope", "must be agent or gate (got %q)", t.Scope)
 	}
 }
 

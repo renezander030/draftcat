@@ -227,6 +227,13 @@ CREATE TABLE IF NOT EXISTS gate_freeze (
     by           TEXT NOT NULL DEFAULT '',
     at           INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS gate_agent_freeze (
+    agent        TEXT PRIMARY KEY,
+    frozen       INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    by           TEXT NOT NULL DEFAULT '',   -- who set the current state: trip, cli, telegram:<id>
+    at           INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS operator_digest (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     last_day     TEXT NOT NULL DEFAULT ''     -- local date the digest was last evaluated for

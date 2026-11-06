@@ -758,6 +758,39 @@ type ToolGateConfig struct {
 	// ExecutionGrant adds a signed grant to every successful consume, which
 	// the tool checks before it acts.
 	ExecutionGrant ExecutionGrantConfig `yaml:"execution_grant"`
+	// Trip freezes an agent, or the whole gate, once the gate has refused
+	// that agent's calls Denials times within Within. Omitted = never.
+	Trip *GateTrip `yaml:"trip"`
+}
+
+// GateTrip is tool_gate.trip: the freeze an agent earns by being refused
+// again and again.
+type GateTrip struct {
+	// Denials is how many counted denials of one agent's calls trip it.
+	Denials int `yaml:"denials"`
+	// Within is the sliding window the denials have to fall in ("10m").
+	Within string `yaml:"within"`
+	// Scope is agent (default: freeze that agent only) or gate (freeze the
+	// whole gate, like /freeze).
+	Scope string `yaml:"scope"`
+}
+
+// WithinDuration parses within. Anything that is not a positive duration is
+// 0, which never trips; validate refuses it.
+func (t GateTrip) WithinDuration() time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(t.Within))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+// ScopeOrDefault normalizes scope: gate, or agent for anything else.
+func (t GateTrip) ScopeOrDefault() string {
+	if strings.EqualFold(strings.TrimSpace(t.Scope), "gate") {
+		return "gate"
+	}
+	return "agent"
 }
 
 // ExecutionGrantConfig names the key execution grants are signed with. The

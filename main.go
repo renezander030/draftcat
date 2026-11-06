@@ -1841,7 +1841,7 @@ func handleCommand(cmd string, args string, from int64, bot *TGBot, sched *Sched
 			_ = bot.Send(reloadHook())
 		}
 	case "/help":
-		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant\n/freeze [reason] - Stop every gated tool call\n/unfreeze - Lift the freeze")
+		_ = bot.Send("Commands:\n/emails [query] - Check emails\n/reply <number> [text] - Reply to an email\n/cron - Manage pipeline schedules\n/skills - List skills\n/run <pipeline> - Run a pipeline now\n/status - Engine status, spend against caps, open gates\n/pending - Approval gates waiting on you\n/reload - Re-read config.yaml and skills/\n/grant <tool> <duration> [uses] [agent] - Pre-approve a tool's calls for a while\n/grants - Live grants\n/ungrant <id> - End a grant\n/freeze [reason] - Stop every gated tool call\n/unfreeze [agent] - Lift the freeze, or one agent's")
 	}
 }
 
@@ -2541,6 +2541,7 @@ func main() {
 			fmt.Println("  draftcat gate <freeze|unfreeze|status> stop every gated tool call, lift the stop, show it")
 			fmt.Println("  draftcat gate hook --format <harness>  pre-tool hook for Claude Code, Codex, Copilot CLI, Gemini CLI")
 			fmt.Println("  draftcat gate install <harness>        write that hook into the harness's settings file")
+			fmt.Println("  draftcat gate unfreeze --agent <name>  lift one agent's freeze (tool_gate.trip)")
 			return
 		}
 	}

@@ -204,6 +204,8 @@ what needs a person:
 - approvals waiting for more than 1 hour: the count and the five oldest, each
   as pipeline / step (a tool-gate approval shows the tool as the step);
 - the tool gate [freeze](tool-gate.md#freeze), when it is on;
+- agents frozen by a [trip](tool-gate.md#trip): the first five, each with
+  since when and why;
 - tool outcomes reported `failed` in the last 24 hours: the count.
 
 When none of these exists no message is sent, so the digest stays silent on a

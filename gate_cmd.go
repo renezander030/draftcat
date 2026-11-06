@@ -22,7 +22,7 @@ const gateUsage = `Usage:
   draftcat gate diff-definition <pinned.json> <current.json> [--json]
   draftcat gate verify-grant <grant> --tool <tool> [--args JSON] [--max-age 5m] [--config path] [--json]
   draftcat gate freeze [--reason text] [--config path]
-  draftcat gate unfreeze [--config path]
+  draftcat gate unfreeze [--agent name] [--config path]
   draftcat gate status [--json] [--config path]
   draftcat gate hook --format claude|codex|copilot|gemini [--url URL] [--token-env VAR] [--agent NAME] [--wait 5m]
   draftcat gate install claude-code|codex|copilot-cli|gemini-cli [--matcher REGEX] [--dir DIR | --user] [--dry-run] [--remove]
@@ -47,8 +47,10 @@ diff-definition and verify-grant do not read or write the state store.
 
 freeze        deny every gated tool call until unfreeze; a running engine sees it
               on its next call (also /freeze and /unfreeze in Telegram)
-unfreeze      lift the freeze
-status        show whether the gate is frozen, by whom, since when and why
+unfreeze      lift the freeze; with --agent, lift that one agent's freeze
+              (set by tool_gate.trip) instead
+status        show whether the gate is frozen, by whom, since when and why, and
+              which agents are frozen
 freeze, unfreeze and status use the state store of --config.
 
 hook          an agent harness's pre-tool hook: ask the gate about the call on
@@ -109,7 +111,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	definitionPath, comparePath := "", ""
 	spent := map[string]string{}
 	calls := 0
-	tool, maxAge, reason := "", time.Duration(0), ""
+	tool, maxAge, reason, agent := "", time.Duration(0), "", ""
 	var positional []string
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
@@ -191,6 +193,15 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			reason = strings.TrimSpace(v)
+		case "--agent":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			if agent = strings.TrimSpace(v); agent == "" {
+				_, _ = fmt.Fprintln(stderr, "gate: --agent wants an agent name")
+				return 2
+			}
 		case "--json":
 			asJSON = true
 		default:
@@ -203,7 +214,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	if sub == "freeze" || sub == "unfreeze" || sub == "status" {
 		if len(positional) != 0 || argsJSON != "" || len(spent) > 0 || calls > 0 || tool != "" || maxAge != 0 {
-			_, _ = fmt.Fprintf(stderr, "gate: %s takes only --config (and --reason for freeze, --json for status)\n", sub)
+			_, _ = fmt.Fprintf(stderr, "gate: %s takes only --config (and --reason for freeze, --agent for unfreeze, --json for status)\n", sub)
 			return 2
 		}
 		if reason != "" && sub != "freeze" {
@@ -214,7 +225,15 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "gate: --json belongs to status\n")
 			return 2
 		}
-		return gateFreezeCmd(sub, configPath, reason, asJSON, stdout, stderr)
+		if agent != "" && sub != "unfreeze" {
+			_, _ = fmt.Fprintf(stderr, "gate: --agent belongs to unfreeze\n")
+			return 2
+		}
+		return gateFreezeCmd(sub, configPath, reason, agent, asJSON, stdout, stderr)
+	}
+	if agent != "" {
+		_, _ = fmt.Fprintln(stderr, "gate: --agent belongs to unfreeze")
+		return 2
 	}
 	if sub == "diff-definition" {
 		if len(positional) != 2 {

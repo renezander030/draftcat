@@ -587,6 +587,76 @@ the [daily digest](operations.md#digest) lists it. A gate that was never
 frozen decides exactly as before. If the freeze state cannot be read, the gate
 denies rather than guesses.
 
+### Trip
+
+A looping or misbehaving agent can collect refusals long before anyone reads
+the log. `tool_gate.trip` freezes it on its own:
+
+```yaml
+tool_gate:
+  trip:
+    denials: 5      # this many denials of one agent's calls
+    within: 10m     # inside this sliding window
+    scope: agent    # agent (default): freeze that agent; gate: freeze the whole gate
+```
+
+When one agent's calls are denied `denials` times within `within`, the gate
+freezes that agent. The call that reaches the threshold is answered with its
+own reason; the agent's further calls are denied with `decided_by: policy`,
+`rule: freeze.agent` and a reason that names the trip (`agent harness-1 frozen
+by trip: refused 5 times within 10m`). Other agents keep working. While an
+agent is frozen, consuming a permit it holds is refused (`409`, `rule:
+freeze.agent`, the permit left as it was) and standing grants do not release
+its calls, as under the gate freeze. With `scope: gate` the trip freezes the
+whole gate exactly like `/freeze`, recorded as set by `trip` with the agent and
+the count as its reason.
+
+Denials are counted per agent: the `agent` the request names, or the caller
+token's name; a call that names none counts as `-`.
+
+- **Counted:** a tool that is not listed or not in the caller's `tools`;
+  arguments or a definition outside an `on_mismatch: deny` rule; a
+  `max_per_day` total or `max_calls_per_day` past its cap; the repeat guard
+  (`repeat_window`, `max_repeats`, `pending_duplicate`); an operator's refusal.
+- **Not counted:** a denial by a frozen gate or a frozen agent, so a trip
+  cannot feed itself; an approval that timed out or failed, which says the
+  operator was away rather than that the agent misbehaved (an agent that keeps
+  asking the same thing meets the repeat guard, which counts); a store or
+  channel that was unavailable; a retry of an `action_id` already decided.
+
+The counts are kept in memory: they start over at a restart and after each
+trip. The freeze itself is kept in the state store (the `gate_agent_freeze`
+table, created at first start), so it survives a restart and a freeze written
+by another process reaches a running engine on its next call, like the gate
+freeze. An agent freeze stays until an operator lifts it, even if `trip` is
+removed from the config.
+
+One operator notice goes out when a trip fires, whatever `notify_denials`
+says:
+
+```
+[tool-gate] TRIPPED: agent harness-1 frozen after 5 denials within 10m
+last reasons:
+  send_email: tool "send_email" is not in tool_gate.tools — the gate denies by default
+  create_invoice: arguments outside the rule — amount: 9000 exceeds max 5000
+  create_invoice: arguments outside the rule — amount: 9500 exceeds max 5000
+/unfreeze harness-1 lifts it.
+```
+
+An operator lifts one agent's freeze:
+
+```
+/unfreeze harness-1
+draftcat gate unfreeze --agent harness-1 --config config.yaml
+```
+
+`/unfreeze` and `draftcat gate unfreeze` without an agent keep their meaning,
+the whole gate, and name the agents that are still frozen. `/status`, `/freeze`
+on a frozen gate, `draftcat gate status` (`agents` in `--json`) and the daily
+digest list the frozen agents. `draftcat validate` refuses `denials` below 2,
+a `within` that is not a positive duration, and a scope other than `agent` or
+`gate`. Changing `trip` takes a restart, like the rest of `tool_gate`.
+
 ## Caller tokens
 
 Each harness can hold its own token instead of the webhook token:
@@ -694,6 +764,10 @@ tool_gate:
   require_caller: false      # refuse the webhook token; only caller tokens reach the gate
   execution_grant:
     secret_env: <VARIABLE>   # sign an execution grant on every consume
+  trip:                      # freeze an agent the gate keeps refusing
+    denials: 5               # counted denials of one agent's calls (2 or more)
+    within: 10m              # inside this sliding window
+    scope: agent             # agent (default) | gate: freeze the whole gate
   callers:
     - name: <agent>          # the agent name the token is recorded under
       token_env: <VARIABLE>  # env var holding the caller's bearer token

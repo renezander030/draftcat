@@ -130,6 +130,8 @@ type ToolCallResponse struct {
 	// tool can check before it acts (tool_gate.execution_grant).
 	ExecutionGrant string `json:"execution_grant,omitempty"`
 	unavailable    bool
+	// trip marks a denial that counts toward tool_gate.trip.
+	trip bool
 }
 
 const toolGatePath = "/gate/tool-call"
@@ -207,6 +209,10 @@ type toolGate struct {
 	tickets  map[string]*toolTicket
 	recent   map[string]*repeatEntry
 	notified map[string]time.Time
+
+	tripMu    sync.Mutex // guards the tool_gate.trip counts
+	trips     map[string][]tripEvent
+	tripSwept time.Time
 }
 
 func newToolGate(cfg *config.Config, ch OperatorChannel) *toolGate {
@@ -217,6 +223,7 @@ func newToolGate(cfg *config.Config, ch OperatorChannel) *toolGate {
 		tickets:  map[string]*toolTicket{},
 		recent:   map[string]*repeatEntry{},
 		notified: map[string]time.Time{},
+		trips:    map[string][]tripEvent{},
 	}
 	if state != nil {
 		if err := state.ExpireToolActions(time.Now()); err != nil {
@@ -347,6 +354,9 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	if frozen, why := g.frozen(); frozen {
 		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
 		verdict = freezeVerdict(why)
+	} else if frozen, why := g.agentFrozen(req.Agent); frozen {
+		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
+		verdict = agentFreezeVerdict(why)
 	} else if caller != nil && !caller.Allows(req.Tool) {
 		verdict = callerDenial(caller, req.Tool)
 	} else {
@@ -384,8 +394,11 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		if verdict.Class != "" {
 			g.notifyDenial(req, verdict.Class, verdict.Reason)
 		}
+		// A denial with a Class is the rules refusing the call itself; a
+		// freeze or an unreadable total says nothing about the agent.
 		resp := g.finishAction(req, ToolCallResponse{
 			Decision: "deny", Reason: verdict.Reason, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
+			trip: verdict.Class != "",
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
@@ -436,7 +449,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		}
 		reason := "an identical action is already pending under action_id " + tk.ID
 		resp := g.finishAction(req, ToolCallResponse{
-			Decision: "deny", Reason: reason, DecidedBy: "repeat-guard", Rule: "pending_duplicate",
+			Decision: "deny", Reason: reason, DecidedBy: "repeat-guard", Rule: "pending_duplicate", trip: true,
 		})
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
@@ -586,6 +599,13 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		writeToolDecision(w, http.StatusServiceUnavailable, unavailableToolResponse(id))
 		return
 	}
+	// So does a frozen agent's, for the permits it holds.
+	if frozen, why := g.agentFrozen(a.Agent); frozen {
+		resp.Permit, resp.Consume = "", ""
+		resp.Decision, resp.Rule, resp.Reason = "deny", agentFreezeRule, why
+		writeToolDecision(w, http.StatusConflict, resp)
+		return
+	}
 	if ok, why := preconditionHolds(a, body.Precondition); !ok {
 		resp.Permit, resp.Rule, resp.Reason = "", "precondition_failed", why
 		writeToolDecision(w, http.StatusConflict, resp)
@@ -720,7 +740,7 @@ func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule) (*tool
 
 		g.notifyDenial(req, "repeat", reason)
 		return nil, ToolCallResponse{Decision: "deny", Reason: reason,
-			DecidedBy: "repeat-guard", Rule: "repeat_window", ApprovalID: tk.ID}, true
+			DecidedBy: "repeat-guard", Rule: "repeat_window", ApprovalID: tk.ID, trip: true}, true
 	case "allow":
 		if rule.RememberApproval {
 			reason := fmt.Sprintf("identical call approved %s ago — remember_approval reuses it inside repeat_window", ago)
@@ -736,7 +756,7 @@ func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule) (*tool
 
 		g.notifyDenial(req, "max_repeats", reason)
 		return nil, ToolCallResponse{Decision: "deny", Reason: reason,
-			DecidedBy: "repeat-guard", Rule: "max_repeats"}, true
+			DecidedBy: "repeat-guard", Rule: "max_repeats", trip: true}, true
 	}
 	return nil, ToolCallResponse{}, false
 }
@@ -781,6 +801,8 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 		return
 	}
 	req.approverID = dec.ApproverID
+	// Only an operator's refusal counts toward the trip: a timeout or a
+	// failed channel says nothing about the agent.
 	resp := ToolCallResponse{Decision: "deny", Reason: "operator did not approve", DecidedBy: "operator"}
 	switch {
 	case derr != nil:
@@ -789,6 +811,8 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 		resp.Reason = "approval timed out — the gate denies rather than assumes yes"
 	case dec.Action == "approve":
 		resp.Decision, resp.Reason = "allow", "operator approved"
+	default:
+		resp.trip = true
 	}
 	g.finishAction(req, resp)
 }
@@ -1002,6 +1026,7 @@ func (g *toolGate) reserveAction(req ToolCallRequest) (ToolCallResponse, int, bo
 // identity and permit window on resp, seals the decision receipt, and resolves
 // the call's ticket. Callers name only the decision.
 func (g *toolGate) finishAction(req ToolCallRequest, resp ToolCallResponse) ToolCallResponse {
+	countTrip, tripReason := resp.Decision == "deny" && resp.trip, resp.Reason
 	now := g.now()
 	expires := req.expires
 	resp.ActionID, resp.ApprovalID = req.ActionID, req.ActionID
@@ -1042,6 +1067,11 @@ func (g *toolGate) finishAction(req ToolCallRequest, resp ToolCallResponse) Tool
 		}
 	}
 	obs.RecordApproval("tool-gate", req.Tool, decision)
+	if countTrip {
+		// Counted before the ticket resolves: the call that trips is answered
+		// with its own reason, and the agent's next call meets the freeze.
+		g.countDenial(req, tripReason)
+	}
 	g.mu.Lock()
 	tk := g.tickets[req.ActionID]
 	if tk == nil {
