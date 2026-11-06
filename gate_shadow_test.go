@@ -346,3 +346,27 @@ func TestGateHelpListsShadow(t *testing.T) {
 		t.Fatalf("gate --help: %d %s", code, out.String())
 	}
 }
+
+// A candidate rule can pin its definition with definition_file; the shadow
+// reads the file the way the live gate does, and refuses a candidate whose
+// file it cannot read.
+func TestShadowCandidateReadsDefinitionFiles(t *testing.T) {
+	dir := t.TempDir()
+	def := filepath.Join(dir, "send_email.json")
+	writeFile(t, def, `{"name":"send_email","description":"Send one email"}`)
+	cand := filepath.Join(dir, "candidate.yaml")
+	writeFile(t, cand, "tool_gate:\n  tools:\n    - name: send_email\n      definition_file: "+def+"\n")
+	cfg := gateCfg(config.ToolRule{Name: "send_email"})
+	cfg.ToolGate.Shadow = &config.GateShadow{Config: cand}
+	c, err := loadShadowCandidate(cfg)
+	if err != nil || c == nil {
+		t.Fatalf("candidate: %+v, %v", c, err)
+	}
+	if p := c.Gate.Tools[0].Pinned(); p == nil || p.SHA256 == "" {
+		t.Fatalf("candidate rule is not pinned to its file: %+v", p)
+	}
+	writeFile(t, def, "{")
+	if _, err := loadShadowCandidate(cfg); err == nil {
+		t.Fatal("an unreadable definition_file must refuse the candidate")
+	}
+}

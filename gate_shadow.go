@@ -68,6 +68,11 @@ func loadShadowCandidate(cfg *config.Config) (*shadowCandidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A candidate rule pinned by definition_file decides on that file, as a
+	// live rule does; unread, every call to it would count as a difference.
+	if err := loadToolDefinitions(&gate); err != nil {
+		return nil, err
+	}
 	return &shadowCandidate{Path: path, Gate: gate, Hash: hashCanonical(gate.Tools)}, nil
 }
 
