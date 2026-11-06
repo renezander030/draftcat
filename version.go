@@ -1,4 +1,4 @@
 package main
 
 // version is overridden by the native release build.
-var version = "0.14.1"
+var version = "0.15.0"
