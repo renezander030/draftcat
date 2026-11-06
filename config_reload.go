@@ -98,20 +98,10 @@ func buildReload(configPath, skillsDir string, running, boot *config.Config) (*c
 	next.ModelPolicy = raw.ModelPolicy
 	next.Pipelines = raw.Pipelines
 
-	errs := 0
-	var first string
-	for _, f := range validate.CheckAtStartup(&next, skillsDir) {
-		if f.Level == "error" {
-			if errs == 0 {
-				first = f.Path + ": " + f.Message
-			}
-			errs++
-		} else {
-			res.Warnings++
-		}
-	}
-	if errs > 0 {
-		return nil, nil, res, fmt.Errorf("%d error(s); first: %s", errs, first)
+	verdict := validate.Summarize(validate.CheckAtStartup(&next, skillsDir))
+	res.Warnings = verdict.Warnings
+	if verdict.Errors > 0 {
+		return nil, nil, res, fmt.Errorf("%d error(s); first: %s", verdict.Errors, verdict.FirstError)
 	}
 
 	skills, err := skillsapi.LoadSkills(skillsDir)

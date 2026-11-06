@@ -28,10 +28,10 @@ func TestToolActionIdempotencyAndConsumeOnce(t *testing.T) {
 	if err = s.DecideToolAction(a.ActionID, "allowed", "allow", "approved", "operator", now); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := s.ConsumeToolAction(a.ActionID, a.BindingHash, now.Add(time.Minute)); err != nil || !ok {
+	if _, ok, err := s.ConsumeToolActionWithReceipt(a.ActionID, a.BindingHash, now.Add(time.Minute), lifecycleReceipt(a, now.Add(time.Minute), "consume")); err != nil || !ok {
 		t.Fatalf("first consume ok=%v err=%v", ok, err)
 	}
-	if final, ok, err := s.ConsumeToolAction(a.ActionID, a.BindingHash, now.Add(2*time.Minute)); err != nil || ok || final.Status != "consumed" {
+	if final, ok, err := s.ConsumeToolActionWithReceipt(a.ActionID, a.BindingHash, now.Add(2*time.Minute), lifecycleReceipt(a, now.Add(2*time.Minute), "consume-again")); err != nil || ok || final.Status != "consumed" {
 		t.Fatalf("second consume = %+v ok=%v err=%v", final, ok, err)
 	}
 }
@@ -40,7 +40,7 @@ func TestWebhookAdmissionSurvivesAndInterrupts(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Unix(1_800_000_000, 0)
 	a := WebhookAdmission{ID: "wh_1", Pipeline: "p", BodyHash: "sha256:body", CreatedAt: now, UpdatedAt: now}
-	if err := s.BeginWebhookAdmission(a); err != nil {
+	if _, _, err := s.AdmitWebhook(a); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InterruptWebhookAdmissions(now.Add(time.Minute)); err != nil {

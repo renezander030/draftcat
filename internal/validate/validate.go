@@ -176,6 +176,32 @@ func CheckAtStartup(cfg *config.Config, skillsDir string) []Finding {
 	return out
 }
 
+// Summary is the verdict on a set of findings for a caller that reports
+// counts rather than the list: errors, warnings, and the first error as
+// "path: message".
+type Summary struct {
+	Errors     int
+	Warnings   int
+	FirstError string
+}
+
+// Summarize counts findings by level; anything that is not an error is a
+// warning.
+func Summarize(findings []Finding) Summary {
+	var s Summary
+	for _, f := range findings {
+		if f.Level != "error" {
+			s.Warnings++
+			continue
+		}
+		if s.Errors == 0 {
+			s.FirstError = f.Path + ": " + f.Message
+		}
+		s.Errors++
+	}
+	return s
+}
+
 func loadSkillsForValidate(skillsDir string, rep *validateReport) map[string]*skillsapi.SkillDef {
 	skills := map[string]*skillsapi.SkillDef{}
 	skillFiles, _ := filepath.Glob(filepath.Join(skillsDir, "*.yaml"))
@@ -663,14 +689,7 @@ func checkApprovalPolicy(cfg *config.Config, rep *validateReport) {
 			rep.errf(p+".max_cost", "must be >= 0 (got %.4f)", rule.MaxCost)
 		}
 		if rule.Pipeline != "" {
-			known := false
-			for _, pl := range cfg.Pipelines {
-				if pl.Name == rule.Pipeline {
-					known = true
-					break
-				}
-			}
-			if !known {
+			if _, known := cfg.Pipeline(rule.Pipeline); !known {
 				rep.errf(p+".pipeline", "no pipeline named %q — the rule can never match", rule.Pipeline)
 			}
 		}

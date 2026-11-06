@@ -91,6 +91,9 @@ type ToolCallRequest struct {
 	// a target that changed after the decision is not acted on.
 	Precondition string `json:"precondition"`
 
+	// The call's bound identity, set once by HandleCall before any decision:
+	// every response, ticket and receipt for this call carries these values.
+	argsHash         string
 	policyHash       string
 	bindingHash      string
 	expires          time.Time
@@ -245,13 +248,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	body, ok := readRequestBody(w, r, 1<<20)
-	if !ok {
-		return
-	}
 	var req ToolCallRequest
-	if err := decodeStrictJSON(body, &req); err != nil {
-		http.Error(w, "malformed json", http.StatusBadRequest)
+	if !readStrictJSON(w, r, 1<<20, &req) {
 		return
 	}
 	if req.Tool == "" {
@@ -326,9 +324,9 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	bindingHash := hashToolBinding(req, argsHash, policyHash, expires)
-	req.policyHash, req.bindingHash, req.expires = policyHash, bindingHash, expires
-	replay, code, handled := g.reserveAction(req, argsHash, policyHash, bindingHash, expires)
+	req.argsHash, req.policyHash, req.expires = argsHash, policyHash, expires
+	req.bindingHash = hashToolBinding(req, argsHash, policyHash, expires)
+	replay, code, handled := g.reserveAction(req)
 	if handled {
 		writeToolDecision(w, code, replay)
 		return
@@ -384,12 +382,10 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, verdict.Reason, req.Agent)
 		}
 		if verdict.Class != "" {
-			g.notifyDenial(req, argsHash, verdict.Class, verdict.Reason)
+			g.notifyDenial(req, verdict.Class, verdict.Reason)
 		}
-		resp := g.finishAction(req, expires, ToolCallResponse{
-			Decision: "deny", Reason: verdict.Reason,
-			ArgsHash: argsHash, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
-			PolicyHash: policyHash, BindingHash: bindingHash,
+		resp := g.finishAction(req, ToolCallResponse{
+			Decision: "deny", Reason: verdict.Reason, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
@@ -403,10 +399,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[tool-gate] ALLOW %s (allowlisted, risk=%s) agent=%q", req.Tool, rule.RiskOf(), req.Agent)
 		}
 
-		resp := g.finishAction(req, expires, ToolCallResponse{
-			Decision: "allow", Reason: verdict.Reason,
-			ArgsHash: argsHash, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
-			PolicyHash: policyHash, BindingHash: bindingHash,
+		resp := g.finishAction(req, ToolCallResponse{
+			Decision: "allow", Reason: verdict.Reason, DecidedBy: verdict.DecidedBy, Rule: verdict.Rule,
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
@@ -415,20 +409,18 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 
 	// Needs a human.
 	if g.ch == nil {
-		resp := g.finishAction(req, expires, ToolCallResponse{
+		resp := g.finishAction(req, ToolCallResponse{
 			Decision: "deny", Reason: "tool requires approval but no operator channel is running",
-			ArgsHash: argsHash, PolicyHash: policyHash, BindingHash: bindingHash,
 		})
 		writeToolDecision(w, http.StatusOK, resp)
 		return
 	}
 
 	// The repeat guard: what does the gate already know about this exact call?
-	tk, remembered, ok := g.repeatCheck(req, rule, argsHash)
+	tk, remembered, ok := g.repeatCheck(req, rule)
 	if ok {
 		// A remembered decision — no prompt.
-		remembered.PolicyHash, remembered.BindingHash = policyHash, bindingHash
-		writeToolDecision(w, http.StatusOK, g.finishAction(req, expires, remembered))
+		writeToolDecision(w, http.StatusOK, g.finishAction(req, remembered))
 		return
 	}
 	if tk != nil && tk.ID != req.ActionID {
@@ -443,10 +435,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reason := "an identical action is already pending under action_id " + tk.ID
-		resp := g.finishAction(req, expires, ToolCallResponse{
-			Decision: "deny", Reason: reason, ArgsHash: argsHash,
-			PolicyHash: policyHash, BindingHash: bindingHash,
-			DecidedBy: "repeat-guard", Rule: "pending_duplicate",
+		resp := g.finishAction(req, ToolCallResponse{
+			Decision: "deny", Reason: reason, DecidedBy: "repeat-guard", Rule: "pending_duplicate",
 		})
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
@@ -455,7 +445,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		// Fresh ask. The approval context is the request's own in the plain
 		// sync case (a harness that hangs up cancels the gate, as before) and
 		// detached whenever the caller may legitimately come back later.
-		tk = g.newTicket(req, argsHash, policyHash, bindingHash, expires)
+		tk = g.newTicket(req)
 		parent := r.Context()
 		if async || wait > 0 {
 			parent = context.Background()
@@ -566,12 +556,7 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		BindingHash  string `json:"binding_hash"`
 		Precondition string `json:"precondition"`
 	}
-	raw, ok := readRequestBody(w, r, 4096)
-	if !ok {
-		return
-	}
-	if err := decodeStrictJSON(raw, &body); err != nil {
-		http.Error(w, "malformed json", http.StatusBadRequest)
+	if !readStrictJSON(w, r, 4096, &body) {
 		return
 	}
 	if state == nil {
@@ -634,13 +619,9 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 
 // newTicket registers a fresh human-path decision and remembers the call for
 // the repeat guard. Also the moment old tickets are swept.
-func (g *toolGate) newTicket(req ToolCallRequest, argsHash, policyHash, bindingHash string, expires time.Time) *toolTicket {
+func (g *toolGate) newTicket(req ToolCallRequest) *toolTicket {
 	now := g.now()
-	tk := &toolTicket{
-		ID: req.ActionID, Tool: req.Tool, Agent: req.Agent, RunID: req.RunID, ArgsHash: argsHash,
-		PolicyHash: policyHash, BindingHash: bindingHash,
-		Created: now, Expires: expires, done: make(chan struct{}),
-	}
+	tk := ticketFor(req, now)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	// Sweep: decided tickets past retention, repeat-guard memory past its
@@ -670,7 +651,7 @@ func (g *toolGate) newTicket(req ToolCallRequest, argsHash, policyHash, bindingH
 		}
 	}
 	g.tickets[tk.ID] = tk
-	key := repeatKey(req, argsHash)
+	key := repeatKey(req)
 	e := g.recent[key]
 	if e == nil {
 		e = &repeatEntry{}
@@ -682,8 +663,17 @@ func (g *toolGate) newTicket(req ToolCallRequest, argsHash, policyHash, bindingH
 	return tk
 }
 
-func repeatKey(req ToolCallRequest, argsHash string) string {
-	return req.Agent + "\x00" + req.Tool + "\x00" + argsHash
+// ticketFor is the in-memory ticket of a bound call, created at now.
+func ticketFor(req ToolCallRequest, now time.Time) *toolTicket {
+	return &toolTicket{
+		ID: req.ActionID, Tool: req.Tool, Agent: req.Agent, RunID: req.RunID, ArgsHash: req.argsHash,
+		PolicyHash: req.policyHash, BindingHash: req.bindingHash,
+		Created: now, Expires: req.expires, done: make(chan struct{}),
+	}
+}
+
+func repeatKey(req ToolCallRequest) string {
+	return req.Agent + "\x00" + req.Tool + "\x00" + req.argsHash
 }
 
 // repeatCheck consults the gate's memory of this exact call. It returns:
@@ -693,13 +683,13 @@ func repeatKey(req ToolCallRequest, argsHash string) string {
 //   - (nil, verdict, true) when the memory settles it without a human: a
 //     denial inside the window, a remembered approval, or the repeat cap;
 //   - (nil, _, false) when the human must be asked afresh.
-func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule, argsHash string) (*toolTicket, ToolCallResponse, bool) {
+func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule) (*toolTicket, ToolCallResponse, bool) {
 	window := g.cfg.ToolGate.RepeatWindowOrDefault()
 	if window <= 0 {
 		return nil, ToolCallResponse{}, false
 	}
 	now := g.now()
-	key := repeatKey(req, argsHash)
+	key := repeatKey(req)
 
 	g.mu.Lock()
 	e := g.recent[key]
@@ -728,15 +718,15 @@ func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule, argsHa
 		reason := fmt.Sprintf("repeat of a call denied %s ago (%s) — not asking again inside repeat_window", ago, resp.Reason)
 		log.Printf("[tool-gate] DENY %s (repeat guard: denied %s ago) agent=%q", req.Tool, ago, req.Agent)
 
-		g.notifyDenial(req, argsHash, "repeat", reason)
-		return nil, ToolCallResponse{Decision: "deny", Reason: reason, ArgsHash: argsHash,
+		g.notifyDenial(req, "repeat", reason)
+		return nil, ToolCallResponse{Decision: "deny", Reason: reason,
 			DecidedBy: "repeat-guard", Rule: "repeat_window", ApprovalID: tk.ID}, true
 	case "allow":
 		if rule.RememberApproval {
 			reason := fmt.Sprintf("identical call approved %s ago — remember_approval reuses it inside repeat_window", ago)
 			log.Printf("[tool-gate] ALLOW %s (repeat guard: approved %s ago) agent=%q", req.Tool, ago, req.Agent)
 
-			return nil, ToolCallResponse{Decision: "allow", Reason: reason, ArgsHash: argsHash,
+			return nil, ToolCallResponse{Decision: "allow", Reason: reason,
 				DecidedBy: "repeat-guard", Rule: "remember_approval", ApprovalID: tk.ID}, true
 		}
 	}
@@ -744,8 +734,8 @@ func (g *toolGate) repeatCheck(req ToolCallRequest, rule config.ToolRule, argsHa
 		reason := fmt.Sprintf("asked %d times inside repeat_window — max_repeats reached, not asking again", asks)
 		log.Printf("[tool-gate] DENY %s (repeat guard: %d asks) agent=%q", req.Tool, asks, req.Agent)
 
-		g.notifyDenial(req, argsHash, "max_repeats", reason)
-		return nil, ToolCallResponse{Decision: "deny", Reason: reason, ArgsHash: argsHash,
+		g.notifyDenial(req, "max_repeats", reason)
+		return nil, ToolCallResponse{Decision: "deny", Reason: reason,
 			DecidedBy: "repeat-guard", Rule: "max_repeats"}, true
 	}
 	return nil, ToolCallResponse{}, false
@@ -791,7 +781,7 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 		return
 	}
 	req.approverID = dec.ApproverID
-	resp := ToolCallResponse{Decision: "deny", Reason: "operator did not approve", ArgsHash: tk.ArgsHash, PolicyHash: tk.PolicyHash, BindingHash: tk.BindingHash, DecidedBy: "operator"}
+	resp := ToolCallResponse{Decision: "deny", Reason: "operator did not approve", DecidedBy: "operator"}
 	switch {
 	case derr != nil:
 		resp.Reason = "approval failed: " + derr.Error()
@@ -800,7 +790,7 @@ func (g *toolGate) askHuman(parent context.Context, tk *toolTicket, req ToolCall
 	case dec.Action == "approve":
 		resp.Decision, resp.Reason = "allow", "operator approved"
 	}
-	g.finishAction(req, tk.Expires, resp)
+	g.finishAction(req, resp)
 }
 
 // decidePolicy records the call's capped amounts, then evaluates the rules
@@ -822,7 +812,7 @@ func (g *toolGate) decidePolicy(req ToolCallRequest, rule config.ToolRule, liste
 // notifyDenial tells the operator about a refusal the gate made on its own.
 // One notice per agent+tool+class inside notify_window: an agent that loops
 // on a denied call produces one line, not a page of them.
-func (g *toolGate) notifyDenial(req ToolCallRequest, argsHash, class, reason string) {
+func (g *toolGate) notifyDenial(req ToolCallRequest, class, reason string) {
 	if g.ch == nil || !g.cfg.ToolGate.NotifyDenialsOn() {
 		return
 	}
@@ -837,7 +827,7 @@ func (g *toolGate) notifyDenial(req ToolCallRequest, argsHash, class, reason str
 	g.mu.Unlock()
 
 	msg := fmt.Sprintf("[tool-gate] DENIED %s (agent: %s)\nreason: %s\nargs sha256: %s",
-		req.Tool, orDash(req.Agent), reason, argsHash)
+		req.Tool, orDash(req.Agent), reason, req.argsHash)
 	if err := g.ch.Send(msg); err != nil {
 		log.Printf("[tool-gate] denial notice failed: %v", err)
 	}
@@ -967,11 +957,11 @@ func responseFromToolAction(a statestore.ToolAction) ToolCallResponse {
 
 // reserveAction is the idempotency gate. The first request reserves its action
 // id; matching retries return the existing state and drift is rejected.
-func (g *toolGate) reserveAction(req ToolCallRequest, argsHash, policyHash, bindingHash string, expires time.Time) (ToolCallResponse, int, bool) {
+func (g *toolGate) reserveAction(req ToolCallRequest) (ToolCallResponse, int, bool) {
 	if state != nil {
-		a, created, err := state.ReserveToolAction(statestore.ToolAction{ActionID: req.ActionID, Tool: req.Tool, Agent: req.Agent, RunID: req.RunID, ArgsHash: argsHash, PolicyHash: policyHash, BindingHash: bindingHash, CreatedAt: g.now(), UpdatedAt: g.now(), ExpiresAt: expires})
+		a, created, err := state.ReserveToolAction(statestore.ToolAction{ActionID: req.ActionID, Tool: req.Tool, Agent: req.Agent, RunID: req.RunID, ArgsHash: req.argsHash, PolicyHash: req.policyHash, BindingHash: req.bindingHash, CreatedAt: g.now(), UpdatedAt: g.now(), ExpiresAt: req.expires})
 		if err != nil {
-			if a.ActionID != "" && a.BindingHash != bindingHash {
+			if a.ActionID != "" && a.BindingHash != req.bindingHash {
 				return ToolCallResponse{ActionID: req.ActionID, Decision: "deny", State: "denied", Reason: "action_id is already bound to different action data"}, http.StatusConflict, true
 			}
 			return unavailableToolResponse(req.ActionID), http.StatusServiceUnavailable, true
@@ -989,7 +979,7 @@ func (g *toolGate) reserveAction(req ToolCallRequest, argsHash, policyHash, bind
 	if tk == nil {
 		return ToolCallResponse{}, 0, false
 	}
-	if tk.BindingHash != bindingHash {
+	if tk.BindingHash != req.bindingHash {
 		return ToolCallResponse{ActionID: req.ActionID, Decision: "deny", State: "denied", Reason: "action_id is already bound to different action data"}, http.StatusConflict, true
 	}
 	resp, code := g.actionResponse(req.ActionID)
@@ -999,9 +989,14 @@ func (g *toolGate) reserveAction(req ToolCallRequest, argsHash, policyHash, bind
 	return resp, code, true
 }
 
-func (g *toolGate) finishAction(req ToolCallRequest, expires time.Time, resp ToolCallResponse) ToolCallResponse {
+// finishAction records the decision on a bound call: it stamps the call's
+// identity and permit window on resp, seals the decision receipt, and resolves
+// the call's ticket. Callers name only the decision.
+func (g *toolGate) finishAction(req ToolCallRequest, resp ToolCallResponse) ToolCallResponse {
 	now := g.now()
+	expires := req.expires
 	resp.ActionID, resp.ApprovalID = req.ActionID, req.ActionID
+	resp.ArgsHash, resp.PolicyHash, resp.BindingHash = req.argsHash, req.policyHash, req.bindingHash
 	resp.ExpiresAt = expires.UTC().Format(time.RFC3339)
 	resp.Poll = toolGatePath + "/" + req.ActionID
 	resp.State = "denied"
@@ -1021,7 +1016,7 @@ func (g *toolGate) finishAction(req ToolCallRequest, expires time.Time, resp Too
 		decision = "deny"
 	}
 	if state != nil {
-		e, err := toolDecisionReceipt(req, resp.ArgsHash, decision, req.approverID, resp.Reason, now)
+		e, err := toolDecisionReceipt(req, decision, resp.Reason, now)
 		if err != nil {
 			resp = unavailableToolResponse(req.ActionID)
 		} else {
@@ -1041,7 +1036,7 @@ func (g *toolGate) finishAction(req ToolCallRequest, expires time.Time, resp Too
 	g.mu.Lock()
 	tk := g.tickets[req.ActionID]
 	if tk == nil {
-		tk = &toolTicket{ID: req.ActionID, Tool: req.Tool, Agent: req.Agent, RunID: req.RunID, ArgsHash: hashToolArgs(req.Args), PolicyHash: req.policyHash, BindingHash: req.bindingHash, Created: now, Expires: expires, done: make(chan struct{})}
+		tk = ticketFor(req, now)
 		g.tickets[tk.ID] = tk
 	}
 	g.mu.Unlock()
@@ -1049,7 +1044,7 @@ func (g *toolGate) finishAction(req ToolCallRequest, expires time.Time, resp Too
 	return resp
 }
 
-func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operator int64, reason string, decidedAt time.Time) (statestore.ApprovalEnvelope, error) {
+func toolDecisionReceipt(req ToolCallRequest, decision, reason string, decidedAt time.Time) (statestore.ApprovalEnvelope, error) {
 	receiptID := newReceiptID()
 	expires := req.expires
 	if expires.IsZero() {
@@ -1062,7 +1057,7 @@ func toolDecisionReceipt(req ToolCallRequest, argsHash, decision string, operato
 	envelope := statestore.ApprovalEnvelope{
 		ReceiptID: receiptID, RunID: req.RunID, ActionID: req.ActionID,
 		Pipeline: "tool-gate", Step: req.Tool, DecidedAt: decidedAt,
-		Decision: decision, OperatorID: operator, PayloadHash: argsHash,
+		Decision: decision, OperatorID: req.approverID, PayloadHash: req.argsHash,
 		QuorumN: 1, QuorumGot: quorumGot, Policy: reason, PolicyHash: req.policyHash,
 		BindingHash: req.bindingHash, ExpiresAt: expires, Lifecycle: "decided",
 	}

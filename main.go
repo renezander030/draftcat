@@ -2246,15 +2246,8 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 		bot.Send("[run] Usage: /run <pipeline-name>")
 		return
 	}
-	// Find pipeline config
-	var pipeline *config.PipelineConfig
-	for i := range cfg.Pipelines {
-		if cfg.Pipelines[i].Name == name {
-			pipeline = &cfg.Pipelines[i]
-			break
-		}
-	}
-	if pipeline == nil {
+	pipeline, ok := cfg.Pipeline(name)
+	if !ok {
 		bot.Send(fmt.Sprintf("[run] Unknown pipeline: %s", name))
 		return
 	}
@@ -2264,22 +2257,13 @@ func handleRun(args string, bot *TGBot, sched *Scheduler, cfg *config.Config, bu
 	}
 	bot.Send(fmt.Sprintf("[run] Starting: %s", name))
 	go func() {
-		err := runPipeline(cfg, *pipeline, budget, gateChannel(bot), skills, nil)
+		err := runPipeline(cfg, pipeline, budget, gateChannel(bot), skills, nil)
 		if err != nil {
 			log.Printf("[run] pipeline %s error: %v", name, err)
 			_ = bot.Send(fmt.Sprintf("[run] ERROR in %s: %s%s", name, err, haltNote(err)))
 		}
 		finishRun(sched, bot, name, err)
 	}()
-}
-
-func pipelineByName(cfg *config.Config, name string) (config.PipelineConfig, bool) {
-	for i := range cfg.Pipelines {
-		if cfg.Pipelines[i].Name == name {
-			return cfg.Pipelines[i], true
-		}
-	}
-	return config.PipelineConfig{}, false
 }
 
 // finishRun releases a run's claim and tells the operator when the failure
@@ -2585,16 +2569,14 @@ func main() {
 	// boot a knowingly-imperfect config in an emergency.
 	if os.Getenv("DRAFTCAT_SKIP_VALIDATE") == "" {
 		findings := validate.CheckAtStartup(&cfg, skillsDir)
-		fatal := 0
 		for _, f := range findings {
 			if f.Level == "error" {
 				log.Printf("[config] ERROR %s: %s", f.Path, f.Message)
-				fatal++
 			} else {
 				log.Printf("[config] warn  %s: %s", f.Path, f.Message)
 			}
 		}
-		if fatal > 0 {
+		if fatal := validate.Summarize(findings).Errors; fatal > 0 {
 			log.Fatalf("[config] %d error(s) in %s — refusing to start. Fix them, or set DRAFTCAT_SKIP_VALIDATE=1 to override.", fatal, configPath)
 		}
 	} else {
@@ -3000,7 +2982,7 @@ Conversation so far:
 			// 2. Check for scheduled pipelines
 			for _, name := range sched.ClaimDue() {
 				runCfg, runSkills := currentConfig(&cfg), currentSkills(skillReg)
-				p, ok := pipelineByName(runCfg, name)
+				p, ok := runCfg.Pipeline(name)
 				if !ok {
 					sched.Release(name)
 					continue

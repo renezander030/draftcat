@@ -152,3 +152,20 @@ func TestCheckAtStartupReportsErrors(t *testing.T) {
 		t.Fatalf("startup check must surface the unimplemented-channel error; got %+v", findings)
 	}
 }
+
+// The engine, a config reload and the doctor read one verdict off the
+// startup findings.
+func TestSummarizeFindings(t *testing.T) {
+	got := Summarize([]Finding{
+		{Level: "warn", Path: "skills/", Message: "unused"},
+		{Level: "error", Path: "pipelines.a.role", Message: "unknown role"},
+		{Level: "error", Path: "pipelines.b.role", Message: "unknown role"},
+		{Level: "warn", Path: "timeouts", Message: "long"},
+	})
+	if got != (Summary{Errors: 2, Warnings: 2, FirstError: "pipelines.a.role: unknown role"}) {
+		t.Fatalf("Summarize = %+v", got)
+	}
+	if got := Summarize(nil); got != (Summary{}) {
+		t.Fatalf("Summarize(nil) = %+v", got)
+	}
+}

@@ -248,24 +248,9 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintln(stderr, "gate: --args, --spent and --calls belong to check; test reads them from the file")
 			return 2
 		}
-		// #nosec G304 -- the operator's own cases file.
-		raw, err := os.ReadFile(positional[0])
-		if err != nil {
-			_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
-			return 1
-		}
-		var file struct {
-			Cases []gateCase `yaml:"cases"`
-		}
-		dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-		dec.KnownFields(true)
-		if err := dec.Decode(&file); err != nil {
-			_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", positional[0], err)
-			return 2
-		}
-		if len(file.Cases) == 0 {
-			_, _ = fmt.Fprintf(stderr, "gate: %s has no cases\n", positional[0])
-			return 2
+		cases, code := readGateCases(positional[0], stderr)
+		if code != 0 {
+			return code
 		}
 		if comparePath != "" {
 			older, err := loadConfigFile(comparePath)
@@ -273,44 +258,9 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
 				return 1
 			}
-			return gateCompare(file.Cases, older.ToolGate, cfg.ToolGate, asJSON, stdout, stderr)
+			return gateCompare(cases, older.ToolGate, cfg.ToolGate, asJSON, stdout, stderr)
 		}
-		results, failed := make([]gateResult, 0, len(file.Cases)), 0
-		for i, c := range file.Cases {
-			if c.Name == "" {
-				c.Name = fmt.Sprintf("case %d", i+1)
-			}
-			expect := strings.ToLower(strings.TrimSpace(c.Expect))
-			if expect != "allow" && expect != "deny" && expect != "ask" {
-				_, _ = fmt.Fprintf(stderr, "gate: %s: expect must be allow, deny or ask (got %q)\n", c.Name, c.Expect)
-				return 2
-			}
-			r, err := decideGateCase(cfg.ToolGate, c)
-			if err != nil {
-				_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", c.Name, err)
-				return 2
-			}
-			r.Expect = expect
-			pass := r.Decision == expect
-			if !pass {
-				r.Problem = fmt.Sprintf("decided %s, expected %s", r.Decision, expect)
-			} else if c.Rule != "" && r.Rule != c.Rule {
-				pass, r.Problem = false, fmt.Sprintf("decided by rule %q, expected %q", r.Rule, c.Rule)
-			}
-			r.Pass = &pass
-			if !pass {
-				failed++
-			}
-			results = append(results, r)
-		}
-		printGateResults(stdout, results, asJSON)
-		if !asJSON {
-			_, _ = fmt.Fprintf(stdout, "%d case(s), %d failed\n", len(results), failed)
-		}
-		if failed > 0 {
-			return 1
-		}
-		return 0
+		return gateTest(cases, cfg.ToolGate, asJSON, stdout, stderr)
 	case "verify-grant":
 		if tool == "" {
 			_, _ = fmt.Fprintln(stderr, "gate: verify-grant needs --tool")
@@ -389,6 +339,76 @@ func gateHashDefinition(path string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// readGateCases reads a `draftcat gate test` file: strict YAML with at least
+// one case, every unnamed case named "case N" by its position. A file it
+// cannot use is reported on stderr with the exit code to return (1 unreadable,
+// 2 invalid or empty).
+func readGateCases(path string, stderr io.Writer) ([]gateCase, int) {
+	// #nosec G304 -- the operator's own cases file.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+		return nil, 1
+	}
+	var file struct {
+		Cases []gateCase `yaml:"cases"`
+	}
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&file); err != nil {
+		_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", path, err)
+		return nil, 2
+	}
+	if len(file.Cases) == 0 {
+		_, _ = fmt.Fprintf(stderr, "gate: %s has no cases\n", path)
+		return nil, 2
+	}
+	for i := range file.Cases {
+		if file.Cases[i].Name == "" {
+			file.Cases[i].Name = fmt.Sprintf("case %d", i+1)
+		}
+	}
+	return file.Cases, 0
+}
+
+// gateTest decides every case against gate and checks it against its expect
+// (and its rule, when the case pins one). It exits 1 when any case fails.
+func gateTest(cases []gateCase, gate config.ToolGateConfig, asJSON bool, stdout, stderr io.Writer) int {
+	results, failed := make([]gateResult, 0, len(cases)), 0
+	for _, c := range cases {
+		expect := strings.ToLower(strings.TrimSpace(c.Expect))
+		if expect != "allow" && expect != "deny" && expect != "ask" {
+			_, _ = fmt.Fprintf(stderr, "gate: %s: expect must be allow, deny or ask (got %q)\n", c.Name, c.Expect)
+			return 2
+		}
+		r, err := decideGateCase(gate, c)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", c.Name, err)
+			return 2
+		}
+		r.Expect = expect
+		pass := r.Decision == expect
+		if !pass {
+			r.Problem = fmt.Sprintf("decided %s, expected %s", r.Decision, expect)
+		} else if c.Rule != "" && r.Rule != c.Rule {
+			pass, r.Problem = false, fmt.Sprintf("decided by rule %q, expected %q", r.Rule, c.Rule)
+		}
+		r.Pass = &pass
+		if !pass {
+			failed++
+		}
+		results = append(results, r)
+	}
+	printGateResults(stdout, results, asJSON)
+	if !asJSON {
+		_, _ = fmt.Fprintf(stdout, "%d case(s), %d failed\n", len(results), failed)
+	}
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
 // gateDiff is one case that decides differently under the two configs.
 type gateDiff struct {
 	Name string      `json:"name"`
@@ -415,15 +435,13 @@ func reasonClass(r gateResult) string {
 	return class
 }
 
-// gateCompare runs every case against both configs through decideGateCase and
-// reports the ones whose decision, rule or reason class differ. Expectations
-// are not checked. It exits 1 when any case differs, like diff.
+// gateCompare runs every case (named by readGateCases) against both configs
+// through decideGateCase and reports the ones whose decision, rule or reason
+// class differ. Expectations are not checked. It exits 1 when any case
+// differs, like diff.
 func gateCompare(cases []gateCase, older, newer config.ToolGateConfig, asJSON bool, stdout, stderr io.Writer) int {
 	diffs := []gateDiff{}
-	for i, c := range cases {
-		if c.Name == "" {
-			c.Name = fmt.Sprintf("case %d", i+1)
-		}
+	for _, c := range cases {
 		ro, err := decideGateCase(older, c)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "gate: %s: %v\n", c.Name, err)
@@ -462,21 +480,6 @@ func gateCompare(cases []gateCase, older, newer config.ToolGateConfig, asJSON bo
 		return 1
 	}
 	return 0
-}
-
-// loadConfigFile reads and parses a config file for a subcommand that reports
-// "<command>: read config: ..." or "<command>: parse config: ...".
-func loadConfigFile(path string) (*config.Config, error) {
-	// #nosec G304 -- the operator's own --config argument.
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	var cfg config.Config
-	if err := yaml.Unmarshal(raw, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	return &cfg, nil
 }
 
 // decideGateCase runs one case through the same evaluation the gate endpoint

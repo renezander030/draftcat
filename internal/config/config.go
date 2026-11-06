@@ -491,18 +491,27 @@ func (c *Config) CappedPipelines() []PipelineCap {
 	return out
 }
 
-// PipelineBudget returns the daily caps of the named pipeline, zero when the
-// pipeline is unknown or uncapped.
-func (c *Config) PipelineBudget(name string) PipelineBudgetConfig {
-	if c == nil || name == "" {
-		return PipelineBudgetConfig{}
+// Pipeline returns the first pipeline with this name, and whether there is one.
+func (c *Config) Pipeline(name string) (PipelineConfig, bool) {
+	if c == nil {
+		return PipelineConfig{}, false
 	}
 	for _, p := range c.Pipelines {
 		if p.Name == name {
-			return p.Budget
+			return p, true
 		}
 	}
-	return PipelineBudgetConfig{}
+	return PipelineConfig{}, false
+}
+
+// PipelineBudget returns the daily caps of the named pipeline, zero when the
+// pipeline is unknown or uncapped.
+func (c *Config) PipelineBudget(name string) PipelineBudgetConfig {
+	if name == "" {
+		return PipelineBudgetConfig{}
+	}
+	p, _ := c.Pipeline(name)
+	return p.Budget
 }
 
 type StepConfig struct {

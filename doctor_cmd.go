@@ -121,23 +121,12 @@ func doctor(configPath, skillsDir string, now time.Time, online bool) (rep docto
 	}
 	rep.add("config", "ok", fmt.Sprintf("%s: %d pipeline(s)", configPath, len(cfg.Pipelines)), "")
 
-	errs, warns := 0, 0
-	var firstErr string
-	for _, f := range validate.CheckAtStartup(&cfg, skillsDir) {
-		if f.Level == "error" {
-			if errs == 0 {
-				firstErr = f.Path + ": " + f.Message
-			}
-			errs++
-		} else {
-			warns++
-		}
-	}
+	verdict := validate.Summarize(validate.CheckAtStartup(&cfg, skillsDir))
 	switch {
-	case errs > 0:
-		rep.add("validate", "fail", fmt.Sprintf("%d error(s), %d warning(s); first: %s", errs, warns, firstErr), "run draftcat validate for the full list")
-	case warns > 0:
-		rep.add("validate", "warn", fmt.Sprintf("%d warning(s)", warns), "run draftcat validate for details")
+	case verdict.Errors > 0:
+		rep.add("validate", "fail", fmt.Sprintf("%d error(s), %d warning(s); first: %s", verdict.Errors, verdict.Warnings, verdict.FirstError), "run draftcat validate for the full list")
+	case verdict.Warnings > 0:
+		rep.add("validate", "warn", fmt.Sprintf("%d warning(s)", verdict.Warnings), "run draftcat validate for details")
 	default:
 		rep.add("validate", "ok", "no findings", "")
 	}

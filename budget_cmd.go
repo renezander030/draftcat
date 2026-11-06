@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/renezander030/draftcat/internal/config"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
@@ -124,12 +122,7 @@ type pipelineDayCap struct {
 // pipelineCapsFromConfigFile lists the pipelines with a daily budget in config
 // order. An unreadable or unparsable config shows no pipeline caps.
 func pipelineCapsFromConfigFile(configPath string) []config.PipelineCap {
-	var cfg config.Config
-	// #nosec G304 -- configPath is the operator's own --config argument.
-	data, err := os.ReadFile(configPath)
-	if err != nil || yaml.Unmarshal(data, &cfg) != nil {
-		return nil
-	}
+	cfg, _ := loadConfigFile(configPath)
 	return cfg.CappedPipelines()
 }
 

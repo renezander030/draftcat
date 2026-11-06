@@ -104,3 +104,24 @@ func TestStateStore_EmptyInputs(t *testing.T) {
 		t.Errorf("MarkSeen nil: %v", err)
 	}
 }
+
+func TestStateStore_RecentRunsFiltersByPipelineAndLimit(t *testing.T) {
+	s := newTempStore(t)
+	t0 := time.Unix(1_800_000_000, 0)
+	for i, name := range []string{"p", "q", "p", "p"} {
+		start := t0.Add(time.Duration(i) * time.Minute)
+		if err := s.RecordRun(name, start, start.Add(time.Second), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runs, err := s.RecentRuns("p", 2)
+	if err != nil {
+		t.Fatalf("RecentRuns: %v", err)
+	}
+	if len(runs) != 2 || runs[0].Pipeline != "p" || runs[1].Pipeline != "p" {
+		t.Fatalf("runs = %+v, want the two newest of p", runs)
+	}
+	if !runs[0].StartedAt.Equal(t0.Add(3*time.Minute)) || !runs[1].StartedAt.Equal(t0.Add(2*time.Minute)) || !runs[0].EndedAt.Equal(t0.Add(3*time.Minute+time.Second)) {
+		t.Fatalf("run times = %v/%v, %v", runs[0].StartedAt, runs[0].EndedAt, runs[1].StartedAt)
+	}
+}

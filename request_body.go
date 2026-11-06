@@ -23,6 +23,21 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byt
 	return body, true
 }
 
+// readStrictJSON reads a gate endpoint's JSON body of at most limit bytes into
+// v. A body it cannot use is answered here, 413 when too large and 400 when
+// unreadable, malformed or ambiguous, and it returns false.
+func readStrictJSON(w http.ResponseWriter, r *http.Request, limit int64, v interface{}) bool {
+	body, ok := readRequestBody(w, r, limit)
+	if !ok {
+		return false
+	}
+	if err := decodeStrictJSON(body, v); err != nil {
+		http.Error(w, "malformed json", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
 // decodeStrictJSON preserves number tokens and rejects ambiguous envelopes.
 func decodeStrictJSON(body []byte, target interface{}) error {
 	tokens := json.NewDecoder(bytes.NewReader(body))

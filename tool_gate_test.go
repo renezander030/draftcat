@@ -146,6 +146,41 @@ func TestToolGate_ArgsHashBindsTheCall(t *testing.T) {
 	}
 }
 
+// Every decision path stamps the call's bound identity on its response: the
+// args hash, the policy hash, the binding hash and the permit window.
+func TestToolGate_EveryDecisionCarriesTheBinding(t *testing.T) {
+	approve := config.ToolRule{Name: "send_email", RequireApproval: true}
+	cases := []struct {
+		name     string
+		cfg      *config.Config
+		ch       OperatorChannel
+		decision string
+	}{
+		{"unlisted", gateCfg(config.ToolRule{Name: "read_calendar"}), &stubApprovalChannel{action: "approve"}, "deny"},
+		{"listed", gateCfg(config.ToolRule{Name: "send_email"}), nil, "allow"},
+		{"no channel", gateCfg(approve), nil, "deny"},
+		{"operator approves", gateCfg(approve), &stubApprovalChannel{action: "approve", id: 7}, "allow"},
+		{"operator refuses", gateCfg(approve), &stubApprovalChannel{action: "skip"}, "deny"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := callToolGate(t, tc.cfg, tc.ch, `{"tool":"send_email","action_id":"bind-1","args":{"to":"anna@example.com"}}`)
+			if resp.Decision != tc.decision {
+				t.Fatalf("decision = %q, want %q (%+v)", resp.Decision, tc.decision, resp)
+			}
+			if resp.ArgsHash != hashToolArgs(map[string]interface{}{"to": "anna@example.com"}) {
+				t.Fatalf("args hash = %q", resp.ArgsHash)
+			}
+			if !strings.HasPrefix(resp.PolicyHash, "sha256:") || !strings.HasPrefix(resp.BindingHash, "sha256:") || resp.ExpiresAt == "" {
+				t.Fatalf("response lacks its binding: %+v", resp)
+			}
+			if resp.ActionID != "bind-1" || resp.ApprovalID != "bind-1" {
+				t.Fatalf("action id = %q, approval id = %q", resp.ActionID, resp.ApprovalID)
+			}
+		})
+	}
+}
+
 func TestToolGate_RejectsNonPost(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handleToolCall(gateCfg(), nil)(rec, httptest.NewRequest(http.MethodGet, toolGatePath, nil))

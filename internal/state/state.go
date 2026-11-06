@@ -367,8 +367,7 @@ func (s *StateStore) RecordRunForID(runID, pipeline string, started, ended time.
 	return err
 }
 
-// RecentRuns returns the last n runs for a pipeline, newest first. Used by
-// the /status operator command.
+// RunRecord is one row of pipeline_runs.
 type RunRecord struct {
 	RunID     string
 	Pipeline  string
@@ -378,15 +377,29 @@ type RunRecord struct {
 	Error     string
 }
 
+// RecentRuns returns the last n runs for a pipeline, newest first. Used by
+// the /status operator command.
 func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
-	rows, err := s.db.Query(
-		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`,
-		pipeline, n,
-	)
+	return s.queryRuns(`WHERE pipeline=? ORDER BY started_at DESC LIMIT ?`, pipeline, n)
+}
+
+// AllRecentRuns is RecentRuns across every pipeline, newest first. Used by
+// `draftcat runs` when no pipeline is named.
+func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	return s.queryRuns(`ORDER BY started_at DESC LIMIT ?`, n)
+}
+
+func (s *StateStore) queryRuns(tail string, args ...interface{}) ([]RunRecord, error) {
+	// #nosec G202 -- tail is a constant clause at every call site; values are bound parameters.
+	rows, err := s.db.QueryContext(context.Background(),
+		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'') FROM pipeline_runs `+tail, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []RunRecord
 	for rows.Next() {
 		var r RunRecord
@@ -413,33 +426,6 @@ func (s *StateStore) RecentRuns(pipeline string, n int) ([]RunRecord, error) {
 // Signature are the tamper-evidence receipt: empty on rows written before signing
 // was configured (or when no secret is set), otherwise an HMAC over the other
 // fields under the operator's approval-signing secret.
-// AllRecentRuns is RecentRuns across every pipeline, newest first. Used by
-// `draftcat runs` when no pipeline is named.
-func (s *StateStore) AllRecentRuns(n int) ([]RunRecord, error) {
-	if s == nil || s.db == nil {
-		return nil, nil
-	}
-	rows, err := s.db.QueryContext(context.Background(),
-		`SELECT run_id, pipeline, started_at, ended_at, status, COALESCE(error_text,'')
-		   FROM pipeline_runs ORDER BY started_at DESC LIMIT ?`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []RunRecord
-	for rows.Next() {
-		var r RunRecord
-		var st, en int64
-		if err := rows.Scan(&r.RunID, &r.Pipeline, &st, &en, &r.Status, &r.Error); err != nil {
-			return nil, err
-		}
-		r.StartedAt = time.Unix(st, 0)
-		r.EndedAt = time.Unix(en, 0)
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
 type ApprovalRecord struct {
 	ID          int64
 	Version     int
@@ -889,33 +875,6 @@ func (s *StateStore) DecideToolAction(id, status, decision, reason, decidedBy st
 	return err
 }
 
-// ConsumeToolAction atomically spends one allowed permit. Only the first
-// matching caller before expiry succeeds.
-func (s *StateStore) ConsumeToolAction(id, bindingHash string, at time.Time) (ToolAction, bool, error) {
-	if s == nil || s.db == nil {
-		return ToolAction{}, false, nil
-	}
-	res, err := s.db.ExecContext(context.Background(),
-		`UPDATE tool_actions SET status='consumed', consumed_at=?, updated_at=?
-		 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at>?`,
-		at.Unix(), at.Unix(), id, bindingHash, at.Unix())
-	if err != nil {
-		return ToolAction{}, false, err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		if _, err := s.db.ExecContext(context.Background(),
-			`UPDATE tool_actions SET status='expired', decision='deny',
-			 reason='permit expired before consumption', updated_at=?
-			 WHERE action_id=? AND binding_hash=? AND status='allowed' AND expires_at<=?`,
-			at.Unix(), id, bindingHash, at.Unix()); err != nil {
-			return ToolAction{}, false, err
-		}
-	}
-	a, err := s.ToolAction(id)
-	return a, n == 1, err
-}
-
 // ExpireToolActions closes pending work that cannot safely resume after a
 // restart and allowed permits whose signed validity window has elapsed. A
 // still-valid allowed permit remains consumable because its complete binding
@@ -954,12 +913,6 @@ type WebhookAdmission struct {
 	Error          string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
-}
-
-// BeginWebhookAdmission writes the accepted record before the handler returns 202.
-func (s *StateStore) BeginWebhookAdmission(a WebhookAdmission) error {
-	_, _, err := s.AdmitWebhook(a)
-	return err
 }
 
 // AdmitWebhook atomically reserves a pipeline-scoped retry identity.
@@ -1027,12 +980,6 @@ func scanWebhookAdmission(scan func(...interface{}) error) (WebhookAdmission, er
 	}
 	a.CreatedAt, a.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 	return a, nil
-}
-
-// RevokeToolAction closes an allowed permit whose policy no longer applies.
-func (s *StateStore) RevokeToolAction(id, policy string, at time.Time) error {
-	_, err := s.db.ExecContext(context.Background(), `UPDATE tool_actions SET status='expired', decision='deny', reason='policy changed; request a new approval', updated_at=? WHERE action_id=? AND policy_hash=? AND status='allowed'`, at.Unix(), id, policy)
-	return err
 }
 
 // InterruptWebhookAdmissions makes accepted work visible after a restart.

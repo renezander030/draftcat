@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"strings"
 
@@ -32,11 +33,21 @@ func statePathFromConfigFile(configPath string) string {
 	if v := strings.TrimSpace(os.Getenv("DRAFTCAT_STATE_PATH")); v != "" {
 		return v
 	}
-	var cfg config.Config
-	// #nosec G304 -- configPath is the operator's own --config argument on
-	// their own machine; reading the file they named is the feature.
-	if data, err := os.ReadFile(configPath); err == nil && yaml.Unmarshal(data, &cfg) == nil {
-		return resolveStatePath(&cfg)
+	cfg, _ := loadConfigFile(configPath)
+	return resolveStatePath(cfg)
+}
+
+// loadConfigFile reads and parses a config file for a subcommand that reports
+// "<command>: read config: ..." or "<command>: parse config: ...".
+func loadConfigFile(path string) (*config.Config, error) {
+	// #nosec G304 -- the operator's own --config argument.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return defaultStatePath
+	var cfg config.Config
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	return &cfg, nil
 }
