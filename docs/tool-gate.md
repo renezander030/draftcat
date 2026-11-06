@@ -289,6 +289,75 @@ cases:
     rule: definition
 ```
 
+### Pinning the definition itself
+
+A hash says only that the definition changed. `definition_file` pins the rule
+to a file holding the approved definition instead, so the gate can say what
+changed:
+
+```yaml
+tool_gate:
+  tools:
+    - name: send_email
+      on_mismatch: deny
+      definition_file: tools/send_email.json
+```
+
+The file holds one JSON object, the definition as the harness sends it, in the
+form `hash-definition` reads. The pin is the file's canonical hash, the value
+`hash-definition` prints for it, so a rule moved from `definition_sha256` to a
+file with the same content decides every call the same way and keeps its
+policy hash: permits issued under the hash stay valid. A rule sets one pin or
+the other; setting both is a validation error.
+
+When a call's definition differs from the file, the gate names what changed,
+field by field, in the approval prompt (`on_mismatch: approve`) and in the
+denial reason (`on_mismatch: deny`), and `gate check` and `gate test` print
+the same:
+
+```
+definition outside the rule — definition changed: description changed at char 15: " and forward a copy"; inputSchema.properties.cc added; inputSchema.required +cc
+```
+
+- Each top-level field added, removed or changed is named (`description`,
+  `inputSchema`, `annotations`, `title`, ...), down to the path that changed: a
+  property added or removed, a `type` that changed, members added to or
+  removed from `required` or an `enum` (`+cc`, `-low`), an annotation that
+  flipped (`annotations.readOnlyHint true -> false`).
+- A value is shown only when it is a short scalar (24 characters at most). A
+  long text such as a description shows where it changed and a 32-character
+  excerpt from there, never the whole text. A key that is not a plain name is
+  quoted.
+- The summary names at most 8 changes and counts the rest (`; and 12 more`).
+
+A call without a definition reads `no definition sent, the rule pins the one in
+tools/send_email.json`. A rule with only `definition_sha256` decides and
+explains exactly as before: without the approved definition there is nothing
+to compare against.
+
+The file is read at start, by `draftcat validate`, by `gate check` and
+`gate test`, and again on every reload (`SIGHUP` or `/reload`), so approving a
+tool's new definition is replacing the file and reloading. The reload message
+names the tools whose pin changed, and permits issued under the old pin are no
+longer valid. A file that is missing, is not a JSON object, has a duplicate
+key or is larger than 1 MiB is refused like an invalid config: the engine does
+not start, or the reload is refused and the running pin stays. Everything else
+in the rule, the `definition_file` path included, is part of `tool_gate` and
+still changes only at restart. A relative path is read from the working
+directory, like `state.path`.
+
+`draftcat gate diff-definition` prints the same summary for two files, for
+example in CI before a tool server is released. It exits 0 when they hash
+alike, 1 when they differ and 2 when a file cannot be read; `--json` lists
+every change, uncapped, with both hashes:
+
+```bash
+draftcat gate diff-definition tools/send_email.json build/send_email.json
+definition changed: inputSchema.properties.cc added; inputSchema.required +cc
+  pinned:  sha256:c8b1...
+  current: sha256:31ae...
+```
+
 ## Collecting a decision
 
 A decision the rule settles comes back at once. A decision that needs a human
@@ -634,6 +703,7 @@ tool_gate:
       risk: low | normal | high      # default normal; high always needs a human
       require_approval: true|false   # ask a human on every (matching) call
       definition_sha256: sha256:<64 hex>  # pin the tool's definition (draftcat gate hash-definition)
+      definition_file: <path>.json        # or pin it to the approved definition itself; a change is named field by field
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
       args:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,

@@ -23,4 +23,15 @@ func TestToolGateHashesAreStable(t *testing.T) {
 	if got := g.policyHash("send_email", config.ToolRule{Name: "send_email", RequireApproval: true}, true); got != "sha256:f32b80070c17fef0359bb67abde97a34fe8c9196f596d2550b7d36dd9215a63c" {
 		t.Fatalf("policy hash: %s", got)
 	}
+	// A rule pinned by definition_sha256, and the same pin moved into a
+	// definition_file (keys in another order): one policy hash.
+	const pinnedPolicy = "sha256:f46dc5621d1f691036bf88e6e20cc8bfe7a6de57b146076096a2666200377c82"
+	byHash := config.ToolRule{Name: "send_email", RequireApproval: true, DefinitionSHA256: pinOf(t, pinDefinition)}
+	if got := g.policyHash("send_email", byHash, true); got != pinnedPolicy {
+		t.Fatalf("definition_sha256 policy hash: %s", got)
+	}
+	byFile := pinToFile(t, config.ToolRule{Name: "send_email", RequireApproval: true}, pinDefinitionReordered)
+	if got := g.policyHash("send_email", byFile, true); got != pinnedPolicy {
+		t.Fatalf("definition_file policy hash: %s", got)
+	}
 }

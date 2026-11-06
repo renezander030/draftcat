@@ -827,7 +827,7 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		default:
 			rep.errf(p+".on_mismatch", "must be approve or deny (got %q)", t.OnMismatch)
 		}
-		if t.OnMismatch != "" && len(t.Args) == 0 {
+		if t.OnMismatch != "" && len(t.Args) == 0 && t.DefinitionSHA256 == "" && t.DefinitionFile == "" {
 			rep.warnf(p+".on_mismatch", "set without any args constraints — it never applies")
 		}
 		if t.RememberApproval && !t.RequireApproval {
@@ -848,11 +848,25 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.DefinitionSHA256 != "" && !definitionPinRE.MatchString(t.DefinitionSHA256) {
 			rep.errf(p+".definition_sha256", "must look like sha256:<64 lowercase hex> (got %q) — `draftcat gate hash-definition` prints it", t.DefinitionSHA256)
 		}
+		if t.DefinitionFile != "" {
+			checkDefinitionFile(t, p, rep)
+		}
 		checkArgConstraints(t, p, rep)
 	}
 	checkGateCallers(cfg.ToolGate, seen, rep)
 	if env := strings.TrimSpace(cfg.ToolGate.ExecutionGrant.SecretEnv); env != "" && os.Getenv(env) == "" {
 		rep.warnf("tool_gate.execution_grant.secret_env", "env var %s is empty — consumes return no execution grant", env)
+	}
+}
+
+// checkDefinitionFile reads a rule's definition_file the way the engine does
+// at start and on reload, so a file it would refuse is an error here first.
+func checkDefinitionFile(t config.ToolRule, p string, rep *validateReport) {
+	if t.DefinitionSHA256 != "" {
+		rep.errf(p+".definition_file", "set definition_sha256 or definition_file, not both")
+	}
+	if _, err := config.ReadToolDefinition(t.DefinitionFile); err != nil {
+		rep.errf(p+".definition_file", "%v", err)
 	}
 }
 

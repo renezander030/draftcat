@@ -19,6 +19,7 @@ const gateUsage = `Usage:
   draftcat gate check <tool> [--args JSON] [--definition file.json] [--spent arg=N]... [--calls N] [--config path] [--json]
   draftcat gate test <cases.yaml> [--config path] [--compare old.yaml] [--json]
   draftcat gate hash-definition <file.json|->
+  draftcat gate diff-definition <pinned.json> <current.json> [--json]
   draftcat gate verify-grant <grant> --tool <tool> [--args JSON] [--max-age 5m] [--config path] [--json]
   draftcat gate freeze [--reason text] [--config path]
   draftcat gate unfreeze [--config path]
@@ -32,14 +33,17 @@ test          decide every case in a file and fail when one differs from its exp
               and print only the cases that decide differently (exit 1 when any
               does; expect is not checked)
 hash-definition  print the sha256 value to paste into a rule's definition_sha256
+diff-definition  name what changed between a pinned tool definition and a
+              current one, field by field: exit 0 when they hash alike, 1 when
+              they differ (--json lists every change)
 verify-grant  check an execution grant before running the tool: exit 0 valid, 1 not
 
 A decision is allow, deny, or ask (a human decides). --spent sets an
 argument's total already allowed today, for rules with max_per_day, and
 --calls the tool's calls already allowed today, for max_calls_per_day (both
 default 0). verify-grant reads the key named by
-tool_gate.execution_grant.secret_env. check, test, hash-definition and
-verify-grant do not read or write the state store.
+tool_gate.execution_grant.secret_env. check, test, hash-definition,
+diff-definition and verify-grant do not read or write the state store.
 
 freeze        deny every gated tool call until unfreeze; a running engine sees it
               on its next call (also /freeze and /unfreeze in Telegram)
@@ -64,7 +68,7 @@ type gateCase struct {
 	Calls  int    `yaml:"calls" json:"calls,omitempty"`
 	Expect string `yaml:"expect" json:"expect"`
 	// Definition is the tool definition the harness would send with the call,
-	// for rules with definition_sha256.
+	// for rules with definition_sha256 or definition_file.
 	Definition map[string]interface{} `yaml:"definition" json:"definition,omitempty"`
 	// Rule optionally pins the rule that decides (listed, not listed,
 	// args.<why>, max_per_day.<arg>, max_calls_per_day), for a deny or allow.
@@ -212,6 +216,13 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 		}
 		return gateFreezeCmd(sub, configPath, reason, asJSON, stdout, stderr)
 	}
+	if sub == "diff-definition" {
+		if len(positional) != 2 {
+			_, _ = fmt.Fprintln(stderr, "gate: diff-definition wants two files: <pinned.json> <current.json>")
+			return 2
+		}
+		return gateDiffDefinition(positional[0], positional[1], asJSON, stdout, stderr)
+	}
 	if len(positional) != 1 {
 		_, _ = fmt.Fprintln(stderr, gateUsage)
 		return 2
@@ -227,7 +238,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "gate: --compare belongs to test")
 		return 2
 	}
-	cfg, err := loadConfigFile(configPath)
+	cfg, err := loadGateConfig(configPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
 		return 1
@@ -267,7 +278,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			return code
 		}
 		if comparePath != "" {
-			older, err := loadConfigFile(comparePath)
+			older, err := loadGateConfig(comparePath)
 			if err != nil {
 				_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
 				return 1
@@ -317,6 +328,19 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+// loadGateConfig reads a config for the offline checks, with every rule's
+// definition_file read the way the engine reads it.
+func loadGateConfig(path string) (*config.Config, error) {
+	cfg, err := loadConfigFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadToolDefinitions(&cfg.ToolGate); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
 // readDefinitionFile reads a tool definition (a JSON object) from a file, or
 // from standard input when the path is "-".
 func readDefinitionFile(path string) (map[string]interface{}, error) {
@@ -331,11 +355,8 @@ func readDefinitionFile(path string) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	var def map[string]interface{}
-	if err := decodeStrictJSON(raw, &def); err != nil || len(def) == 0 {
-		if err == nil {
-			err = fmt.Errorf("empty object")
-		}
+	def, err := config.ParseToolDefinition(raw)
+	if err != nil {
 		return nil, fmt.Errorf("%s is not a JSON object with a tool definition: %w", path, err)
 	}
 	return def, nil
@@ -350,6 +371,49 @@ func gateHashDefinition(path string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	_, _ = fmt.Fprintln(stdout, hashCanonical(def))
+	return 0
+}
+
+// gateDiffDefinition compares a pinned tool definition with a current one the
+// way the gate compares a call's definition with a rule's definition_file:
+// exit 0 when they hash alike, 1 when they differ, 2 when either cannot be
+// read. The text form is the summary the gate shows; --json lists every
+// change.
+func gateDiffDefinition(pinnedPath, currentPath string, asJSON bool, stdout, stderr io.Writer) int {
+	pinned, err := readDefinitionFile(pinnedPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+		return 2
+	}
+	current, err := readDefinitionFile(currentPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "gate: %v\n", err)
+		return 2
+	}
+	pinnedHash, currentHash := hashCanonical(pinned), hashCanonical(current)
+	changes := []string{}
+	if pinnedHash != currentHash {
+		changes = definitionChanges(pinned, current)
+	}
+	switch {
+	case asJSON:
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(struct {
+			Changed bool     `json:"changed"`
+			Pinned  string   `json:"pinned_sha256"`
+			Current string   `json:"current_sha256"`
+			Changes []string `json:"changes"`
+		}{pinnedHash != currentHash, pinnedHash, currentHash, changes})
+	case pinnedHash == currentHash:
+		_, _ = fmt.Fprintf(stdout, "definition unchanged: %s\n", pinnedHash)
+	default:
+		_, _ = fmt.Fprintln(stdout, summarizeDefinitionChanges(changes))
+		_, _ = fmt.Fprintf(stdout, "  pinned:  %s\n  current: %s\n", pinnedHash, currentHash)
+	}
+	if pinnedHash != currentHash {
+		return 1
+	}
 	return 0
 }
 

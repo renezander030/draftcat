@@ -8,6 +8,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"math/big"
@@ -17,10 +18,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/renezander030/draftcat/internal/outputschema"
 	"github.com/renezander030/draftcat/internal/schedule"
+	"github.com/renezander030/draftcat/internal/strictjson"
 	"gopkg.in/yaml.v3"
 
 	ghlapi "github.com/renezander030/draftcat/internal/ghl"
@@ -879,10 +882,96 @@ type ToolRule struct {
 	// is missing or hashes differently is handled like an argument mismatch
 	// (on_mismatch). Omitted = the definition is not checked.
 	DefinitionSHA256 string `yaml:"definition_sha256" json:",omitempty"`
+	// DefinitionFile pins the definition to the one held in this file (a JSON
+	// object, as `draftcat gate hash-definition` reads it) instead of to its
+	// hash. The pin is the file's canonical hash, so a rule moved from
+	// definition_sha256 to a file with the same content decides the same and
+	// keeps its policy hash, and a call whose definition differs is told what
+	// changed. Read at start and on every reload; a relative path is read from
+	// the working directory, like state.path. Not part of the policy hash: the
+	// pin it yields is.
+	DefinitionFile string `yaml:"definition_file" json:"-"`
+	// pinned holds what DefinitionFile read. Every copy of the rule shares it,
+	// so a reload that re-reads the file reaches the running gate, whose rules
+	// otherwise change only at restart.
+	pinned *definitionSlot
 }
 
 // DefinitionPinPattern is the form of a definition_sha256 value.
 const DefinitionPinPattern = `^sha256:[0-9a-f]{64}$`
+
+// MaxToolDefinitionBytes bounds a definition_file. A definition reaches the
+// gate inside a request body of at most 1 MiB, so a larger one could never
+// match.
+const MaxToolDefinitionBytes = 1 << 20
+
+// PinnedDefinition is a tool definition read from a rule's definition_file
+// and its canonical hash, the value definition_sha256 would hold for it.
+type PinnedDefinition struct {
+	Definition map[string]interface{}
+	SHA256     string
+}
+
+type definitionSlot struct {
+	cur atomic.Pointer[PinnedDefinition]
+}
+
+// Pinned returns the definition read from definition_file, or nil when the
+// rule has none or it has not been read.
+func (t ToolRule) Pinned() *PinnedDefinition {
+	if t.pinned == nil {
+		return nil
+	}
+	return t.pinned.cur.Load()
+}
+
+// SetPinned records what definition_file read. The first call gives the rule
+// the slot its copies share, so it has to happen before the rule is shared
+// (the engine makes it at start); a later call replaces the definition for
+// every copy at once and is safe while the gate runs.
+func (t *ToolRule) SetPinned(p *PinnedDefinition) {
+	if t.pinned == nil {
+		t.pinned = &definitionSlot{}
+	}
+	t.pinned.cur.Store(p)
+}
+
+// ParseToolDefinition decodes a tool definition: one non-empty JSON object,
+// numbers kept as written, no duplicate keys or trailing content. A
+// definition sent with a call is decoded the same way, so both hash alike.
+func ParseToolDefinition(raw []byte) (map[string]interface{}, error) {
+	var def map[string]interface{}
+	if err := strictjson.Decode(raw, &def); err != nil {
+		return nil, err
+	}
+	if len(def) == 0 {
+		return nil, fmt.Errorf("empty object")
+	}
+	return def, nil
+}
+
+// ReadToolDefinition reads and decodes a rule's definition_file, refusing one
+// larger than MaxToolDefinitionBytes.
+func ReadToolDefinition(file string) (map[string]interface{}, error) {
+	// #nosec G304 -- the operator's own definition_file.
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(f, MaxToolDefinitionBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", file, err)
+	}
+	if len(raw) > MaxToolDefinitionBytes {
+		return nil, fmt.Errorf("%s is larger than %d bytes", file, MaxToolDefinitionBytes)
+	}
+	def, err := ParseToolDefinition(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not a JSON object with a tool definition: %w", file, err)
+	}
+	return def, nil
+}
 
 // Grantable reports whether an operator may issue a standing grant for the
 // tool: the rule allows grants and the tool is not high risk.

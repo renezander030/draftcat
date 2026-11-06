@@ -26,7 +26,9 @@ import (
 // approval policy, skills) and keeps the sections that built long-lived
 // resources at start (channels, provider, state, listeners, tool gate,
 // observability, voice, the receipt anchor schedule) as they are, naming any that changed so the operator
-// knows a restart is needed for them.
+// knows a restart is needed for them. The one exception is the content of a
+// tool rule's definition_file: a reload re-reads it, so approving a tool's new
+// definition does not take a restart.
 
 var (
 	liveConfig atomic.Pointer[config.Config]
@@ -72,6 +74,9 @@ type reloadResult struct {
 	Skills        int
 	RestartNeeded []string
 	Warnings      int
+	// definitions holds every definition_file as re-read, by rule index, for
+	// the running rules once the reload is applied.
+	definitions map[int]*config.PinnedDefinition
 }
 
 // buildReload reads configPath and skillsDir and returns the next snapshot.
@@ -110,6 +115,16 @@ func buildReload(configPath, skillsDir string, running, boot *config.Config) (*c
 		return nil, nil, res, fmt.Errorf("load skills from %s: %w", skillsDir, err)
 	}
 
+	// The running rules name the files; a rule changed in the config file is
+	// a tool_gate change and waits for a restart like the rest of the section.
+	if next.ToolGate.Enabled {
+		defs, err := readToolDefinitions(next.ToolGate.Tools)
+		if err != nil {
+			return nil, nil, res, err
+		}
+		res.definitions = defs
+	}
+
 	if boot != nil {
 		was, now := restartOnlySections(boot), restartOnlySections(&raw)
 		for name := range now {
@@ -133,6 +148,7 @@ func reloadEngine(configPath, skillsDir string, boot, fallbackCfg *config.Config
 		log.Printf("[config] reload refused: %v", err)
 		return "[config] Reload refused, the running config is unchanged: " + err.Error()
 	}
+	changedDefs := applyToolDefinitions(next.ToolGate.Tools, res.definitions)
 	liveConfig.Store(next)
 	liveSkills.Store(skills)
 	sched.Sync(next.Pipelines)
@@ -144,6 +160,9 @@ func reloadEngine(configPath, skillsDir string, boot, fallbackCfg *config.Config
 		msg += fmt.Sprintf(", %d warning(s)", res.Warnings)
 	}
 	msg += ". Runs in progress keep the config they started with."
+	if len(changedDefs) > 0 {
+		msg += "\nTool definitions re-read and changed: " + strings.Join(changedDefs, ", ")
+	}
 	if len(res.RestartNeeded) > 0 {
 		msg += "\nChanged but applied only at restart: " + strings.Join(res.RestartNeeded, ", ")
 	}

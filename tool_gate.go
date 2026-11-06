@@ -66,8 +66,8 @@ type ToolCallRequest struct {
 	Args map[string]interface{} `json:"args"`
 	// Definition optionally carries the tool's definition as the harness
 	// exposes it to the model (name, description, input schema, annotations).
-	// A rule with definition_sha256 compares its canonical hash; any other
-	// rule ignores it.
+	// A rule with definition_sha256 or definition_file compares its canonical
+	// hash; any other rule ignores it.
 	Definition map[string]interface{} `json:"definition,omitempty"`
 	// RunID optionally ties the call to a pipeline run for the audit trail.
 	RunID string `json:"run_id"`
@@ -890,6 +890,15 @@ func (g *toolGate) policyHash(tool string, rule config.ToolRule, listed bool) st
 }
 
 func hashToolPolicy(tool string, rule config.ToolRule, listed bool) string {
+	// A definition_file hashes as the definition_sha256 it stands for, so a
+	// pin moved into a file keeps the policy hash. A file not yet read still
+	// hashes apart from no pin at all.
+	if rule.DefinitionFile != "" && rule.DefinitionSHA256 == "" {
+		rule.DefinitionSHA256 = "unread " + rule.DefinitionFile
+		if p := rule.Pinned(); p != nil {
+			rule.DefinitionSHA256 = p.SHA256
+		}
+	}
 	return hashCanonical(struct {
 		Tool   string          `json:"tool"`
 		Listed bool            `json:"listed"`

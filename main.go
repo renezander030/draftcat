@@ -2487,6 +2487,7 @@ func main() {
 			fmt.Println("  draftcat hitl verify <relay-url>      run the hitl/v0 conformance suite against a relay")
 			fmt.Println("  draftcat gate <check|test>             decide tool calls against tool_gate without the engine")
 			fmt.Println("  draftcat gate verify-grant <grant>     check an execution grant before running the tool")
+			fmt.Println("  draftcat gate diff-definition <a> <b>  name what changed between two tool definitions")
 			fmt.Println("  draftcat gate <freeze|unfreeze|status> stop every gated tool call, lift the stop, show it")
 			fmt.Println("  draftcat gate hook --format <harness>  pre-tool hook for Claude Code, Codex, Copilot CLI, Gemini CLI")
 			fmt.Println("  draftcat gate install <harness>        write that hook into the harness's settings file")
@@ -2584,6 +2585,14 @@ func main() {
 		}
 	} else {
 		log.Printf("[config] WARNING: startup validation skipped (DRAFTCAT_SKIP_VALIDATE set)")
+	}
+	// A served gate reads each rule's definition_file now and on every reload.
+	// Reading is not validation, so it is never skipped: a pin the gate does
+	// not have cannot be decided on.
+	if cfg.ToolGate.Enabled {
+		if err := loadToolDefinitions(&cfg.ToolGate); err != nil {
+			log.Fatalf("[config] %v — refusing to start", err)
+		}
 	}
 
 	// The relay channel is built here, before the state store and voice bridge

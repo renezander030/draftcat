@@ -155,7 +155,9 @@ configuration stays in place, and the operator is told why. Sections that built
 long-lived resources at start (`telegram`, `relay`, `provider`, `state`,
 `webhook`, `tool_gate`, `observability`, `gmail`, `gohighlevel`, `voice`) keep
 their running values; the reload message names any of them that changed in the
-file, so you know a restart is needed for those.
+file, so you know a restart is needed for those. The one exception is the
+content of a tool rule's `definition_file`, which a reload re-reads (see
+[the tool gate](tool-gate.md#pinning-the-definition-itself)).
 
 ## Spend warnings
 
