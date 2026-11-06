@@ -3186,6 +3186,7 @@ func newWebhookHandler(cfg *config.Config, sched *Scheduler, budget *BudgetTrack
 		gateAuth := newGateAuthenticator(secret, cfg.ToolGate).middleware(maxBody, maxSkew, cfg.Webhook.RequireSignature)
 		mux.Handle(toolGatePath, gateAuth(http.HandlerFunc(gate.HandleCall)))
 		mux.Handle(toolGatePath+"/", gateAuth(http.HandlerFunc(gate.HandleStatus)))
+		mux.Handle(toolGateBudgetPath, gateAuth(http.HandlerFunc(gate.HandleBudget)))
 		log.Printf("[tool-gate] enabled — %d tool(s) allowlisted, everything else denied", len(cfg.ToolGate.Tools))
 	}
 

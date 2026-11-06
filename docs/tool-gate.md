@@ -548,6 +548,62 @@ webhook token keeps working on the gate for every listed tool unless
 every other credential. `draftcat validate` refuses duplicate names and shared
 variables, and `draftcat doctor` warns about a caller whose variable is empty.
 
+## Reading the budget
+
+A harness can ask how much of today's budget is left before it starts work
+that would run into a cap halfway:
+
+```
+GET /gate/budget
+Authorization: Bearer <webhook token or caller token>
+```
+
+```json
+{
+  "day": "2026-11-06",
+  "tokens": 48210,
+  "per_day_tokens": 100000,
+  "cost": 0.412,
+  "per_day_cost": 20,
+  "reserved_cost": 0.05,
+  "pipeline_caps": [{"name": "replies", "calls": 18, "tokens": 39020, "per_day_tokens": 50000,
+                     "cost": 0.355, "per_day_cost": 5, "reached": false}],
+  "frozen": false,
+  "tools": [
+    {"tool": "create_invoice", "calls": 2, "max_calls_per_day": 5,
+     "args": [{"arg": "amount", "total": 200, "max_per_day": 2000}]}
+  ]
+}
+```
+
+- `day`, `tokens`, `cost`: today's settled model usage (UTC day), the same
+  numbers under the same names as `draftcat budget status --json`.
+  `per_day_tokens` and `per_day_cost` are the caps in `budgets` as the engine
+  runs them, a reload included; `0` means no cap.
+- `reserved_cost`: only with `budgets.reserve_max_cost`, the worst-case cost
+  pending model calls hold against `per_day_cost`.
+- `pipeline_caps`: each pipeline with a daily budget of its own, as in
+  `budget status`.
+- `frozen`: whether the [freeze](#freeze) is on. Who set it and why are left
+  out.
+- `tools`: each tool with `max_calls_per_day` or an argument with
+  `max_per_day` that the token may call: all of them for the webhook token,
+  the caller's own `tools` for a caller token. `calls` and `total` are what the
+  caps count: the calls the gate allowed today (UTC), consumed or not, over
+  every caller of that tool, without saying who made them. `total` is the exact
+  decimal sum. Tools without a daily cap are not listed.
+
+The route is served only with `tool_gate.enabled` and takes the same tokens as
+the rest of the gate, `require_caller` included. A `GET` has no body to sign,
+so `webhook.require_signature` does not apply to it, as for polling. The answer
+carries `Cache-Control: no-store`. It reads the engine's store and writes
+nothing; when the store cannot be read it answers `503` rather than numbers
+that may be wrong. It never carries argument values, action IDs, approvers or
+other callers' names.
+
+The numbers are a snapshot. The caps are enforced on each call, so a call made
+right after reading may still be refused.
+
 ## Audit
 
 Every decision writes a v2 `action_approvals` receipt with `pipeline = tool-gate`,

@@ -1132,11 +1132,11 @@ func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg stri
 			return DailyCapReading{}, err
 		}
 		limit := *t.Args[arg].MaxPerDay
-		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, decimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
+		r.Totals = append(r.Totals, fmt.Sprintf("%s: %s allowed today, max_per_day %s", arg, DecimalString(total), strconv.FormatFloat(limit, 'f', -1, 64)))
 		after := new(big.Rat).Add(total, amount)
 		if r.OverArg == "" && after.Cmp(exactBound(limit)) > 0 {
 			r.OverArg, r.Rule = arg, "max_per_day."+arg
-			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, decimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
+			r.Why = fmt.Sprintf("%s: today's total would be %s, over max_per_day %s", arg, DecimalString(after), strconv.FormatFloat(limit, 'f', -1, 64))
 			if t.DeniesOnMismatch() {
 				return r, nil
 			}
@@ -1148,16 +1148,17 @@ func (t ToolRule) ReadDailyCaps(args map[string]interface{}, spent func(arg stri
 			return DailyCapReading{}, err
 		}
 		limit := *t.MaxCallsPerDay
-		r.Totals = append(r.Totals, fmt.Sprintf("calls: %s allowed today, max_calls_per_day %d", decimalString(calls), limit))
+		r.Totals = append(r.Totals, fmt.Sprintf("calls: %s allowed today, max_calls_per_day %d", DecimalString(calls), limit))
 		if r.OverArg == "" && new(big.Rat).Add(calls, big.NewRat(1, 1)).Cmp(big.NewRat(int64(limit), 1)) > 0 {
 			r.OverArg, r.Rule = CallCountKey, "max_calls_per_day"
-			r.Why = fmt.Sprintf("calls: %s already allowed today, max_calls_per_day %d", decimalString(calls), limit)
+			r.Why = fmt.Sprintf("calls: %s already allowed today, max_calls_per_day %d", DecimalString(calls), limit)
 		}
 	}
 	return r, nil
 }
 
-func decimalString(r *big.Rat) string {
+// DecimalString renders a running total exactly, without trailing zeros.
+func DecimalString(r *big.Rat) string {
 	if r.IsInt() {
 		return r.Num().String()
 	}
