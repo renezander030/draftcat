@@ -26,6 +26,7 @@ const gateUsage = `Usage:
   draftcat gate status [--json] [--config path]
   draftcat gate hook --format claude|codex|copilot|gemini [--url URL] [--token-env VAR] [--agent NAME] [--wait 5m]
   draftcat gate install claude-code|codex|copilot-cli|gemini-cli [--matcher REGEX] [--dir DIR | --user] [--dry-run] [--remove]
+  draftcat gate shadow [--since 7d|YYYY-MM-DD] [--json] [--config path]
 
 check         decide one call against tool_gate without running the engine
 test          decide every case in a file and fail when one differs from its expect;
@@ -57,7 +58,10 @@ hook          an agent harness's pre-tool hook: ask the gate about the call on
               stdin, consume an allowed permit, answer allow or deny in the
               harness's format; anything else blocks the call
 install       write that hook into the harness's settings file (project, or
-              --user); see 'draftcat gate install --help'`
+              --user); see 'draftcat gate install --help'
+shadow        list the live calls the tool_gate.shadow candidate decided
+              differently, grouped by tool and decision pair, with the latest
+              rows (default --since 7d); reads the state store of --config`
 
 // gateCase is one entry of a `draftcat gate test` file.
 type gateCase struct {
@@ -111,7 +115,7 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	definitionPath, comparePath := "", ""
 	spent := map[string]string{}
 	calls := 0
-	tool, maxAge, reason, agent := "", time.Duration(0), "", ""
+	tool, maxAge, reason, agent, since := "", time.Duration(0), "", "", ""
 	var positional []string
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
@@ -193,6 +197,12 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			reason = strings.TrimSpace(v)
+		case "--since":
+			v, ok := needValue()
+			if !ok {
+				return 2
+			}
+			since = strings.TrimSpace(v)
 		case "--agent":
 			v, ok := needValue()
 			if !ok {
@@ -211,6 +221,18 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			}
 			positional = append(positional, a)
 		}
+	}
+	if sub == "shadow" {
+		if len(positional) != 0 || argsJSON != "" || definitionPath != "" || comparePath != "" || len(spent) > 0 ||
+			calls > 0 || tool != "" || maxAge != 0 || reason != "" || agent != "" {
+			_, _ = fmt.Fprintln(stderr, "gate: shadow takes only --since, --json and --config")
+			return 2
+		}
+		return gateShadowCmd(configPath, since, asJSON, time.Now(), stdout, stderr)
+	}
+	if since != "" {
+		_, _ = fmt.Fprintln(stderr, "gate: --since belongs to shadow")
+		return 2
 	}
 	if sub == "freeze" || sub == "unfreeze" || sub == "status" {
 		if len(positional) != 0 || argsJSON != "" || len(spent) > 0 || calls > 0 || tool != "" || maxAge != 0 {

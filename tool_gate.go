@@ -213,6 +213,12 @@ type toolGate struct {
 	tripMu    sync.Mutex // guards the tool_gate.trip counts
 	trips     map[string][]tripEvent
 	tripSwept time.Time
+
+	// shadow is the tool_gate.shadow candidate in force (nil = off), and
+	// shadowEval decides a call under it.
+	shadow     func() *shadowCandidate
+	shadowEval func(config.ToolGateConfig, string, map[string]interface{}, map[string]interface{}, toolDailyTotal) (toolPolicyVerdict, error)
+	shadowWG   sync.WaitGroup
 }
 
 func newToolGate(cfg *config.Config, ch OperatorChannel) *toolGate {
@@ -224,6 +230,9 @@ func newToolGate(cfg *config.Config, ch OperatorChannel) *toolGate {
 		recent:   map[string]*repeatEntry{},
 		notified: map[string]time.Time{},
 		trips:    map[string][]tripEvent{},
+
+		shadow:     liveShadow.Load,
+		shadowEval: evaluateToolPolicy,
 	}
 	if state != nil {
 		if err := state.ExpireToolActions(time.Now()); err != nil {
@@ -351,6 +360,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	}
 	var verdict toolPolicyVerdict
 	var err error
+	shadow := func() {}
 	if frozen, why := g.frozen(); frozen {
 		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
 		verdict = freezeVerdict(why)
@@ -361,7 +371,13 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		verdict = callerDenial(caller, req.Tool)
 	} else {
 		verdict, err = g.decidePolicy(req, rule, listed)
+		if err == nil {
+			// The candidate is compared on the rules' own verdict, before a
+			// grant answers it, and only after the live answer is out.
+			shadow = g.shadowAfter(req, verdict)
+		}
 	}
+	defer shadow()
 	if err != nil {
 		log.Printf("[tool-gate] DENY %s (%v) agent=%q", req.Tool, err, req.Agent)
 		verdict = toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: "max_per_day",
@@ -419,6 +435,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	unlockCaps()
+	// The live decision is to ask a human: compare now, not after the hold.
+	shadow()
 
 	// Needs a human.
 	if g.ch == nil {

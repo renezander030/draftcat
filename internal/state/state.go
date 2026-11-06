@@ -234,6 +234,21 @@ CREATE TABLE IF NOT EXISTS gate_agent_freeze (
     by           TEXT NOT NULL DEFAULT '',   -- who set the current state: trip, cli, telegram:<id>
     at           INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS gate_shadow_diffs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    at              INTEGER NOT NULL,
+    agent           TEXT NOT NULL DEFAULT '',
+    tool            TEXT NOT NULL,
+    args_hash       TEXT NOT NULL,             -- the arguments themselves are never stored
+    live_decision   TEXT NOT NULL,
+    live_rule       TEXT NOT NULL DEFAULT '',
+    live_reason     TEXT NOT NULL DEFAULT '',
+    shadow_decision TEXT NOT NULL,
+    shadow_rule     TEXT NOT NULL DEFAULT '',
+    shadow_reason   TEXT NOT NULL DEFAULT '',
+    candidate_hash  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gate_shadow_at ON gate_shadow_diffs(at);
 CREATE TABLE IF NOT EXISTS operator_digest (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     last_day     TEXT NOT NULL DEFAULT ''     -- local date the digest was last evaluated for
@@ -286,6 +301,7 @@ CREATE TABLE IF NOT EXISTS receipt_anchor_state (
  CREATE INDEX IF NOT EXISTS idx_approvals_runid ON action_approvals(run_id);
  CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_idempotency ON webhook_admissions(pipeline, idempotency_key) WHERE idempotency_key <> '';
  CREATE INDEX IF NOT EXISTS idx_budget_calls_day_pipeline ON budget_calls(day, pipeline);
+ CREATE INDEX IF NOT EXISTS idx_tool_actions_tool_created ON tool_actions(tool, created_at);
  `); err != nil {
 		return err
 	}

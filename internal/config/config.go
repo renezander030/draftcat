@@ -761,6 +761,37 @@ type ToolGateConfig struct {
 	// Trip freezes an agent, or the whole gate, once the gate has refused
 	// that agent's calls Denials times within Within. Omitted = never.
 	Trip *GateTrip `yaml:"trip"`
+	// Shadow decides every live call a second time under a candidate config's
+	// tool_gate and records the calls the two decide differently. It never
+	// changes a live decision. Omitted = off.
+	Shadow *GateShadow `yaml:"shadow"`
+}
+
+// GateShadow is tool_gate.shadow.
+type GateShadow struct {
+	// Config is the candidate config file; its tool_gate section is the
+	// policy under test. It is re-read on reload.
+	Config string `yaml:"config"`
+}
+
+// LoadToolGateFile reads the tool_gate section of a config file, the way
+// tool_gate.shadow names one. A file without the section is an error.
+func LoadToolGateFile(path string) (ToolGateConfig, error) {
+	// #nosec G304 -- the operator's own candidate config.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ToolGateConfig{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	var file struct {
+		ToolGate *ToolGateConfig `yaml:"tool_gate"`
+	}
+	if err := yaml.Unmarshal(raw, &file); err != nil {
+		return ToolGateConfig{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if file.ToolGate == nil {
+		return ToolGateConfig{}, fmt.Errorf("%s has no tool_gate section", path)
+	}
+	return *file.ToolGate, nil
 }
 
 // GateTrip is tool_gate.trip: the freeze an agent earns by being refused

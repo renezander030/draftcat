@@ -242,6 +242,75 @@ checked in compare mode. `--json` prints an array of `{name, tool, old, new}`
 objects (each verdict has `decision`, `rule`, `reason`), `[]` when nothing
 differs. Without `--compare`, `gate test` runs as described above.
 
+### Shadow policy
+
+`--compare` shows how a policy change moves hand-written cases.
+`tool_gate.shadow` shows how it moves the calls agents actually make:
+
+```yaml
+tool_gate:
+  shadow:
+    config: candidate.yaml    # its tool_gate section is the policy under test
+```
+
+For every live call that reaches the rules, once the live decision is made,
+the gate decides the same call again under the candidate's `tool_gate`, the
+way `draftcat gate check` does: the same evaluation, with today's totals and
+call counts read from the live store as they stood before this call, and
+nothing else. There is no prompt, no permit, no consume, no grant use and no
+state written for the candidate. The candidate never changes, delays or fails
+the live decision: it runs in the background after the answer is written, and
+a failure or a panic is logged and counted while the live answer stands.
+
+When the candidate decides differently (a different decision, deciding rule or
+reason class, as `--compare` counts them) the gate stores one row: the time,
+agent, tool, argument hash, both verdicts and the candidate's hash (`sha256:`
+over its tool rules). Arguments are never stored. Rules and reasons are kept
+in their value-free form (`args.amount`, `arguments outside the rule`), so two
+verdicts that differ only in a value are not a difference. Rows older than 30
+days are dropped as new ones are written; the table (`gate_shadow_diffs`,
+created at first start) holds one row per differing call in that window.
+
+What is compared is the verdict of the rules, before a standing grant answers
+an ask; the repeat guard and the operator's answer would apply to either
+policy alike. Calls refused before the rules are read (a frozen gate or agent,
+a tool outside the caller's `tools`) are not compared, and the candidate's own
+callers, trip and shadow settings play no part. A candidate
+`max_calls_per_day` counts the tool's allowed calls from the actions
+themselves. A candidate `max_per_day` on an argument the live rules do not cap
+reads a total of 0, because only capped values are kept.
+
+```bash
+draftcat gate shadow --config config.yaml              # the last 7 days
+draftcat gate shadow --since 30d --json --config config.yaml
+```
+
+```
+14 call(s) decided differently under the shadow policy since 2026-10-30T09:12:00Z
+     12  send_email: allow -> deny  (latest 2026-11-06T08:41:13Z)
+      2  create_invoice: ask -> allow  (latest 2026-11-05T17:02:40Z)
+latest:
+  2026-11-06T08:41:13Z  harness-1  send_email: allow (listed) -> deny (max_calls_per_day)  args sha256:9f2b...  candidate sha256:41a0...
+```
+
+Groups count the differences by tool and decision pair, the largest first,
+and `latest` lists the ten newest rows. `--since` takes a day count (`7d`, the
+default) or a UTC date. The command opens the store read-only and never
+creates one; `--json` prints `{since, total, groups, latest}`.
+
+The candidate file is re-read on `SIGHUP` and `/reload` with the rest of the
+config. `tool_gate.shadow` is the one part of `tool_gate` a reload applies, so
+a reload can point it at another file, or drop it to switch the shadow off,
+without a restart. A candidate that fails validation is refused like an
+invalid config: the live gate keeps running, the shadow is off until a valid
+candidate is loaded, and the reload's reply says why. `draftcat validate`
+refuses a candidate file that is missing, does not parse, has no `tool_gate`
+section or has rule errors (reported as `tool_gate.shadow: tool_gate.tools[...]`),
+and warns when its tool rules are identical to the live ones. With Prometheus
+on, `/metrics` counts the differences in
+`draftcat_gate_shadow_differences_total{tool,live,shadow}` and failed
+evaluations in `draftcat_gate_shadow_errors_total`.
+
 ## Definition pin
 
 A rule can pin what the tool declares about itself, so a tool whose
@@ -768,6 +837,8 @@ tool_gate:
     denials: 5               # counted denials of one agent's calls (2 or more)
     within: 10m              # inside this sliding window
     scope: agent             # agent (default) | gate: freeze the whole gate
+  shadow:
+    config: <file>           # candidate config whose tool_gate decides beside the live one; re-read on reload
   callers:
     - name: <agent>          # the agent name the token is recorded under
       token_env: <VARIABLE>  # env var holding the caller's bearer token

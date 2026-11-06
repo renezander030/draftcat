@@ -26,9 +26,10 @@ import (
 // approval policy, skills) and keeps the sections that built long-lived
 // resources at start (channels, provider, state, listeners, tool gate,
 // observability, voice, the receipt anchor schedule) as they are, naming any that changed so the operator
-// knows a restart is needed for them. The one exception is the content of a
-// tool rule's definition_file: a reload re-reads it, so approving a tool's new
-// definition does not take a restart.
+// knows a restart is needed for them. Two parts of tool_gate are the exception:
+// a reload re-reads the content of each rule's definition_file, so approving a
+// tool's new definition does not take a restart, and tool_gate.shadow's
+// candidate file.
 
 var (
 	liveConfig atomic.Pointer[config.Config]
@@ -62,11 +63,17 @@ func restartOnlySections(c *config.Config) map[string]interface{} {
 		"state":         c.State,
 		"provider":      c.Provider,
 		"webhook":       c.Webhook,
-		"tool_gate":     c.ToolGate,
+		"tool_gate":     withoutShadow(c.ToolGate),
 		"observability": c.Observ,
 		"voice":         c.Voice,
 		"receipts":      c.Receipts,
 	}
+}
+
+// withoutShadow is tool_gate less tool_gate.shadow, which a reload applies.
+func withoutShadow(g config.ToolGateConfig) config.ToolGateConfig {
+	g.Shadow = nil
+	return g
 }
 
 type reloadResult struct {
@@ -77,6 +84,10 @@ type reloadResult struct {
 	// definitions holds every definition_file as re-read, by rule index, for
 	// the running rules once the reload is applied.
 	definitions map[int]*config.PinnedDefinition
+	// Shadow is the re-read tool_gate.shadow candidate (nil = off), or
+	// ShadowErr why it was refused.
+	Shadow    *shadowCandidate
+	ShadowErr error
 }
 
 // buildReload reads configPath and skillsDir and returns the next snapshot.
@@ -104,11 +115,20 @@ func buildReload(configPath, skillsDir string, running, boot *config.Config) (*c
 	next.ModelPolicy = raw.ModelPolicy
 	next.Pipelines = raw.Pipelines
 
-	verdict := validate.Summarize(validate.CheckAtStartup(&next, skillsDir))
+	// The shadow candidate is judged on its own below: a broken candidate
+	// switches the shadow off but does not hold up the reload.
+	check := next
+	check.ToolGate.Shadow = nil
+	verdict := validate.Summarize(validate.CheckAtStartup(&check, skillsDir))
 	res.Warnings = verdict.Warnings
 	if verdict.Errors > 0 {
 		return nil, nil, res, fmt.Errorf("%d error(s); first: %s", verdict.Errors, verdict.FirstError)
 	}
+	// A reload applies tool_gate.shadow (with the rule definition files below):
+	// the candidate is re-read from the path the file names now.
+	probe := next
+	probe.ToolGate.Shadow = raw.ToolGate.Shadow
+	res.Shadow, res.ShadowErr = loadShadowCandidate(&probe)
 
 	skills, err := skillsapi.LoadSkills(skillsDir)
 	if err != nil {
@@ -151,6 +171,7 @@ func reloadEngine(configPath, skillsDir string, boot, fallbackCfg *config.Config
 	changedDefs := applyToolDefinitions(next.ToolGate.Tools, res.definitions)
 	liveConfig.Store(next)
 	liveSkills.Store(skills)
+	wasShadow := liveShadow.Swap(res.Shadow)
 	sched.Sync(next.Pipelines)
 	if budget != nil {
 		budget.configureAlerts(next, notify)
@@ -166,6 +187,7 @@ func reloadEngine(configPath, skillsDir string, boot, fallbackCfg *config.Config
 	if len(res.RestartNeeded) > 0 {
 		msg += "\nChanged but applied only at restart: " + strings.Join(res.RestartNeeded, ", ")
 	}
+	msg += shadowReloadLine(wasShadow, res.Shadow, res.ShadowErr)
 	log.Printf("%s", msg)
 	return msg
 }

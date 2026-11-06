@@ -2542,6 +2542,7 @@ func main() {
 			fmt.Println("  draftcat gate hook --format <harness>  pre-tool hook for Claude Code, Codex, Copilot CLI, Gemini CLI")
 			fmt.Println("  draftcat gate install <harness>        write that hook into the harness's settings file")
 			fmt.Println("  draftcat gate unfreeze --agent <name>  lift one agent's freeze (tool_gate.trip)")
+			fmt.Println("  draftcat gate shadow [--since 7d]      live calls the tool_gate.shadow candidate decided differently")
 			return
 		}
 	}
@@ -2783,6 +2784,9 @@ func main() {
 			log.Printf("[obs] OTLP exporter pushing to %s", cfg.Observ.OTLP.Endpoint)
 		}
 	}
+
+	// Shadow policy: a candidate tool_gate decides beside the live one.
+	startShadow(&cfg, func(m string) { _ = opChan.Send(m) })
 
 	// Webhook trigger server — opt-in; opens no port unless enabled.
 	var webhookSrv *http.Server

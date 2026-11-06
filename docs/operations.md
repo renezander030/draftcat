@@ -155,9 +155,12 @@ configuration stays in place, and the operator is told why. Sections that built
 long-lived resources at start (`telegram`, `relay`, `provider`, `state`,
 `webhook`, `tool_gate`, `observability`, `gmail`, `gohighlevel`, `voice`) keep
 their running values; the reload message names any of them that changed in the
-file, so you know a restart is needed for those. The one exception is the
-content of a tool rule's `definition_file`, which a reload re-reads (see
-[the tool gate](tool-gate.md#pinning-the-definition-itself)).
+file, so you know a restart is needed for those. Two parts of `tool_gate` are
+the exception: a reload re-reads the content of each tool rule's
+`definition_file` (see [the tool gate](tool-gate.md#pinning-the-definition-itself)),
+and `tool_gate.shadow`'s [candidate file](tool-gate.md#shadow-policy), where a
+candidate with errors switches the shadow off without holding up the rest of
+the reload.
 
 ## Spend warnings
 
@@ -251,6 +254,8 @@ next to the existing counters and histograms:
 | `draftcat_budget_unsettled_calls` | provider calls awaiting reconciliation |
 
 `draftcat_otlp_exports_dropped_total` counts OTLP span exports that failed and were dropped; it appears after the first drop, next to the `[obs] OTLP export dropped` log line.
+
+With a [shadow policy](tool-gate.md#shadow-policy), `draftcat_gate_shadow_differences_total{tool,live,shadow}` counts the live tool calls the candidate decided differently, and `draftcat_gate_shadow_errors_total` the candidate evaluations that failed; both appear after the first event.
 
 ## Oversight report
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -782,6 +783,9 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if cfg.ToolGate.Trip != nil {
 			rep.warnf("tool_gate.trip", "set but the tool gate is disabled — nothing is counted")
 		}
+		if cfg.ToolGate.Shadow != nil {
+			rep.warnf("tool_gate.shadow", "set but the tool gate is disabled — there are no calls to compare")
+		}
 		return
 	}
 	if !cfg.Webhook.Enabled {
@@ -811,6 +815,7 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		rep.errf("tool_gate.max_repeats", "must be 0 (no cap) or a positive count (got %d)", cfg.ToolGate.MaxRepeats)
 	}
 	checkGateTrip(cfg.ToolGate.Trip, rep)
+	checkGateShadow(cfg, rep)
 	seen := map[string]bool{}
 	for i, t := range cfg.ToolGate.Tools {
 		p := fmt.Sprintf("tool_gate.tools[%d]", i)
@@ -895,6 +900,51 @@ func checkGateTrip(t *config.GateTrip, rep *validateReport) {
 	case "", "agent", "gate":
 	default:
 		rep.errf("tool_gate.trip.scope", "must be agent or gate (got %q)", t.Scope)
+	}
+}
+
+// CheckToolGateShadow runs the tool_gate.shadow checks alone. The engine
+// uses it on reload: a candidate with errors is refused and the shadow is
+// switched off, while the live gate keeps running.
+func CheckToolGateShadow(cfg *config.Config) []Finding {
+	rep := &validateReport{}
+	checkGateShadow(cfg, rep)
+	out := make([]Finding, 0, len(rep.Findings))
+	for _, f := range rep.Findings {
+		out = append(out, Finding(f))
+	}
+	return out
+}
+
+// checkGateShadow validates tool_gate.shadow: the candidate file exists,
+// parses and has a tool_gate section whose rules pass the same checks as the
+// live ones. A candidate identical to the live rules can never differ.
+func checkGateShadow(cfg *config.Config, rep *validateReport) {
+	s := cfg.ToolGate.Shadow
+	if s == nil {
+		return
+	}
+	path := strings.TrimSpace(s.Config)
+	if path == "" {
+		rep.errf("tool_gate.shadow.config", "names the candidate config file; it is required")
+		return
+	}
+	cand, err := config.LoadToolGateFile(path)
+	if err != nil {
+		rep.errf("tool_gate.shadow.config", "%v", err)
+		return
+	}
+	// The candidate's rules, checked as a gate of their own; its callers,
+	// trip and shadow play no part in the comparison.
+	sub := &validateReport{}
+	checkToolGate(&config.Config{Webhook: config.WebhookConfig{Enabled: true},
+		ToolGate: config.ToolGateConfig{Enabled: true, Tools: cand.Tools}}, sub)
+	for _, f := range sub.Findings {
+		f.Path = "tool_gate.shadow: " + f.Path
+		rep.Findings = append(rep.Findings, f)
+	}
+	if reflect.DeepEqual(cand.Tools, cfg.ToolGate.Tools) {
+		rep.warnf("tool_gate.shadow.config", "%s has the same tool rules as the live gate — the shadow never records a difference", path)
 	}
 }
 
