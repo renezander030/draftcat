@@ -38,6 +38,13 @@ func secretEnvNames(cfg *config.Config) []string {
 			names = append(names, c.TokenEnv)
 		}
 	}
+	for _, p := range cfg.Pipelines {
+		for _, st := range p.Steps {
+			if n := strings.TrimSpace(st.Vars["auth_env"]); isHTTPRequest(st) && n != "" {
+				names = append(names, n)
+			}
+		}
+	}
 	return names
 }
 

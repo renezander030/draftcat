@@ -1065,6 +1065,10 @@ func runPipeline(cfg *config.Config, pipeline config.PipelineConfig, budget *Bud
 
 	// Pipeline data flows through this map
 	data := map[string]interface{}{}
+	// approvedRequests holds, per http_request step, the digest of the request
+	// an approval step showed and the operator released. It lives outside
+	// data so no run input can forge it.
+	approvedRequests := map[string]string{}
 
 	// Mock test data
 	data["input"] = `Title: Senior AI/LLM Engineer - Build RAG Pipeline for Legal Documents
@@ -1256,6 +1260,12 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				data["pdf_page_count"] = fmt.Sprintf("%d", len(doc.Pages))
 				log.Printf("[pipeline:%s][step:%s] parsed %s: %d pages", pipeline.Name, step.Name, doc.Filename, len(doc.Pages))
 
+			case httpRequestAction:
+				if err := runHTTPRequest(ctx, runID, pipeline.Name, step, data, approvedRequests[step.Name]); err != nil {
+					return fmt.Errorf("[step:%s] %w", step.Name, err)
+				}
+				stepFields["http_status"] = data["http_status"]
+
 			case "pdf_verify_cite":
 				doc, ok := data["pdf_doc"].(*pdf.PDFDoc)
 				if !ok {
@@ -1397,6 +1407,19 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				draftMsg = fmt.Sprintf("[draftcat] Draft for review:\n\n%v", v)
 			}
 
+			// An approval step that releases an http_request shows the request
+			// itself, so the operator approves the bytes that will be sent.
+			outbound := releasedHTTPRequest(pipeline.Steps, stepIndex)
+			var outboundDigest string
+			if outbound != nil {
+				desc, digest, oerr := outboundDraft(*outbound, runID, data)
+				if oerr != nil {
+					return fmt.Errorf("[step:%s] %w", step.Name, oerr)
+				}
+				draftMsg = "[draftcat] Outbound request for review:\n\n" + desc
+				outboundDigest = digest
+			}
+
 			// Send for approval via operator channel (TG buttons, Slack reactions, etc.)
 			// Unlike OperatorApprovalWindow, a negative value (reachable only
 			// with DRAFTCAT_SKIP_VALIDATE=1) is kept as is.
@@ -1514,6 +1537,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 					}
 				}
 				data["approved"] = true
+				if outbound != nil {
+					approvedRequests[outbound.Name] = outboundDigest
+				}
 				break
 			}
 
@@ -1558,6 +1584,9 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 						return fmt.Errorf("[step:%s] approval receipt unavailable: %w", step.Name, auditErr)
 					}
 					data["approved"] = true
+					if outbound != nil {
+						approvedRequests[outbound.Name] = outboundDigest
+					}
 					break
 				}
 				if action == "skip" {
@@ -1608,6 +1637,18 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 
 				// Revised draft re-enters the gate (at 0/N for quorum steps).
 				currentDraft = fmt.Sprintf("[draftcat] Revised:\n\n%s", resp.Text)
+				if outbound != nil {
+					// The rewrite becomes the output the request is built from,
+					// and the operator reviews the request it now makes.
+					data["ai_output"] = revisedOutput(data["ai_output"], resp.Text)
+					data["ai_raw"] = resp.Text
+					desc, digest, oerr := outboundDraft(*outbound, runID, data)
+					if oerr != nil {
+						return fmt.Errorf("[step:%s] %w", step.Name, oerr)
+					}
+					currentDraft = "[draftcat] Revised outbound request for review:\n\n" + desc
+					outboundDigest = digest
+				}
 			}
 		}
 

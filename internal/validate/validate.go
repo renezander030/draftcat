@@ -35,6 +35,7 @@ var validKnownActions = map[string]string{
 	"ghl_unread_conversations": "fetch unread GHL conversations",
 	"pdf_extract":              "parse a PDF into text + per-fragment bounding boxes (requires vars.path or data.pdf_path)",
 	"pdf_verify_cite":          "resolve <cite> tags in ai_raw against the parsed PDF (optional vars.fail_on_unresolved)",
+	"http_request":             "send one approved HTTP request with a credential from auth_env (requires vars.url and an approval step before it)",
 }
 
 var validStepTypes = map[string]bool{
@@ -537,6 +538,9 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 				if _, ok := validKnownActions[st.Action]; !ok {
 					rep.errf(spath+".action", "unknown action %q%s (known: %s)",
 						st.Action, didYouMean(st.Action, knownActionNames()), strings.Join(knownActionNames(), ", "))
+				}
+				if st.Action == "http_request" {
+					checkHTTPRequestStep(p.Steps, si, spath, rep)
 				}
 				if st.Action == "ghl_stale_opportunities" && st.Vars["pipeline_id"] == "" {
 					rep.errf(spath+".vars.pipeline_id", "ghl_stale_opportunities requires vars.pipeline_id")
@@ -1080,6 +1084,7 @@ func isCommonDataKey(k string) bool {
 		"voice_learnings", "voice_learning_count",
 		"voice_admin_commit_sha", "voice_admin_smoke_run_id", "voice_admin_publish_status",
 		"workflow_id", "workflow_uuid",
+		"http_response", "http_status", "http_response_body",
 		"ai_output", "ai_raw", "approved":
 		return true
 	}
