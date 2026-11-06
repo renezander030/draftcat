@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1
+
+- Native installation reports interrupted or incomplete downloads as failures and bounds each download to two minutes across redirects, retaining the 30-second inactivity limit.
+- Prepare and verify replacement executables before switching the installed file; failed preparation preserves the existing executable and removes temporary files.
+
 ## 0.14.0
 
 - Freeze the tool gate: `/freeze [reason]` and `/unfreeze` in Telegram, or `draftcat gate freeze|unfreeze|status`, stop every gated tool call at once. While frozen the gate denies each call with "tool gate frozen by operator", refuses to consume issued permits and leaves standing grants unused. The freeze is stored, holds across a restart and reaches a running engine on its next call.

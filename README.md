@@ -140,7 +140,7 @@ npm install -g draftcat
 draftcat --help
 ```
 
-The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required.
+The installer downloads the matching Linux, macOS, or Windows binary and verifies it against the checksums attached to the GitHub release. No Go toolchain is required. Each download has a two-minute elapsed limit across redirects and a 30-second inactivity limit. Interrupted downloads fail installation; the existing executable stays in place until its verified replacement is ready.
 
 With a Go toolchain, install the CLI from the module:
 
