@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.1
+
+- Telegram approvals retain button responses that arrive before the prompt request finishes, including quorum votes. Concurrent prompts keep their own decisions, while command buttons continue to work.
+- A malformed relay URL produces a failed verification check instead of a panic.
+- Tidy-up: share freeze formatting, relay dispatch, webhook signatures, gate flag parsing, HTTP request values and Gmail message decoding; remove four redundant helpers.
+
 ## 0.15.0
 
 - Put an agent harness's tool calls through the tool gate: `draftcat gate hook --format claude|codex|copilot|gemini` runs as the pre-tool hook of Claude Code, Codex, GitHub Copilot CLI or Gemini CLI. It asks the gate about each call, waits for the decision, consumes the permit and answers allow or deny in the harness's own format. A gate that is down, refuses the token, does not decide in time, denies or refuses the consume blocks the call. `draftcat gate install claude-code|codex|copilot-cli|gemini-cli` writes the hook into the harness's settings file (project, or `--user`), keeps every other key and hook, re-runs without changes, and `--remove` takes out only draftcat's entry.

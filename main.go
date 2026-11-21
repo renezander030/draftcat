@@ -692,13 +692,12 @@ func (t *TGBot) Name() string { return channels.Telegram }
 func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
 	buttons := approvalButtons()
 
-	msgID, err := t.sendWithButtons(draft, buttons)
+	w, err := t.sendApprovalPrompt(draft, buttons)
 	if err != nil {
 		return OperatorDecision{}, fmt.Errorf("failed to send draft: %w", err)
 	}
+	msgID := w.msgID
 	log.Printf("[telegram] draft posted (msg_id=%d), waiting for operator action...", msgID)
-
-	w := t.pump().register(msgID)
 	defer t.pump().release(msgID)
 
 	// textFor is what a text reply means once a button asked for one:
@@ -708,6 +707,10 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 	var reasonDeadline <-chan time.Time
 
 	for {
+		updates := w.ch
+		if ctx.Err() != nil {
+			updates = nil // an expired prompt cannot consume a buffered decision
+		}
 		select {
 		case <-reasonDeadline:
 			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
@@ -719,7 +722,7 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 			}
 			t.editButtons(msgID, draft+"\n\n[Timed out]", nil)
 			return OperatorDecision{}, fmt.Errorf("approval timeout")
-		case u := <-w.ch:
+		case u := <-updates:
 			// Button click on our message
 			if u.CallbackQuery != nil {
 				cb := u.CallbackQuery
@@ -818,13 +821,12 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 		return fmt.Sprintf("%s\n\nApprovals: %d/%d", draft, got, need)
 	}
 
-	msgID, err := t.sendWithButtons(tally(0), buttons)
+	w, err := t.sendApprovalPrompt(tally(0), buttons)
 	if err != nil {
 		return QuorumDecision{Action: "timeout"}, fmt.Errorf("failed to send draft: %w", err)
 	}
+	msgID := w.msgID
 	log.Printf("[telegram] quorum draft posted (msg_id=%d), need=%d distinct approvers...", msgID, need)
-
-	w := t.pump().register(msgID)
 	defer t.pump().release(msgID)
 
 	approved := map[int64]bool{}
@@ -834,6 +836,10 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 	var reasonDeadline <-chan time.Time
 
 	for {
+		updates := w.ch
+		if ctx.Err() != nil {
+			updates = nil // an expired prompt cannot consume a buffered decision
+		}
 		select {
 		case <-reasonDeadline:
 			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
@@ -845,7 +851,7 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 			}
 			t.editButtons(msgID, fmt.Sprintf("%s\n\n[Timed out — %d/%d approvals not reached]", draft, len(approved), need), nil)
 			return QuorumDecision{Action: "timeout"}, fmt.Errorf("approval timeout")
-		case u := <-w.ch:
+		case u := <-updates:
 			if vetoBy != 0 {
 				if m := u.Message; m != nil && m.Text != "" && m.Chat.ID == t.chatID && m.From.ID == vetoBy && t.rateLimiter.allow(m.From.ID) {
 					if result := validateOperatorInput(m.Text, t.security); result.Clean {

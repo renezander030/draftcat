@@ -68,6 +68,9 @@ type tgPump struct {
 	commands chan TGUpdate
 	stop     chan struct{}
 	running  bool
+
+	promptSends int
+	early       []TGUpdate
 }
 
 // pump returns the bot's update pump, creating it on first use so a bot built
@@ -144,6 +147,48 @@ func (t *TGBot) drainUpdates() []TGUpdate {
 	}
 }
 
+// sendApprovalPrompt retains early callbacks until Telegram returns the prompt's
+// message ID. Network I/O never holds the pump mutex or stalls existing waiters.
+func (t *TGBot) sendApprovalPrompt(text string, buttons [][]map[string]string) (*tgWaiter, error) {
+	p := t.pump()
+	p.mu.Lock()
+	p.promptSends++
+	p.mu.Unlock()
+
+	msgID, err := t.sendWithButtons(text, buttons)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.promptSends--
+	var w *tgWaiter
+	if err == nil {
+		w = &tgWaiter{msgID: msgID, ch: make(chan TGUpdate, tgWaiterBuffer)}
+		p.waiters[msgID] = w
+	}
+	// Replay under the routing lock so a newer callback cannot overtake an
+	// earlier veto. Other in-flight sends may still claim unmatched callbacks.
+	var remaining []TGUpdate
+	for _, u := range p.early {
+		if target := p.waiters[u.CallbackQuery.Message.MessageID]; target != nil {
+			deliver(target, u)
+		} else if p.promptSends == 0 {
+			p.toCommands(u)
+		} else {
+			remaining = append(remaining, u)
+		}
+	}
+	p.early = remaining
+	return w, err
+}
+
+func approvalCallback(data string) bool {
+	switch data {
+	case "approve", "skip", "adjust", "skip_reason":
+		return true
+	default:
+		return false
+	}
+}
+
 // register claims the callbacks for one message id until release.
 func (p *tgPump) register(msgID int) *tgWaiter {
 	w := &tgWaiter{msgID: msgID, ch: make(chan TGUpdate, tgWaiterBuffer)}
@@ -171,10 +216,17 @@ func (p *tgPump) waiterCount() int {
 func (p *tgPump) route(u TGUpdate) {
 	if u.CallbackQuery != nil {
 		p.mu.Lock()
-		w := p.waiters[u.CallbackQuery.Message.MessageID]
-		p.mu.Unlock()
-		if w != nil {
+		defer p.mu.Unlock()
+		if w := p.waiters[u.CallbackQuery.Message.MessageID]; w != nil {
 			deliver(w, u)
+			return
+		}
+		if p.promptSends > 0 && approvalCallback(u.CallbackQuery.Data) {
+			if len(p.early) < tgCommandBuffer {
+				p.early = append(p.early, u)
+			} else {
+				log.Printf("[telegram] early callback queue full — dropping update %d", u.UpdateID)
+			}
 			return
 		}
 		p.toCommands(u)
