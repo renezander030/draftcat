@@ -361,12 +361,12 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	var verdict toolPolicyVerdict
 	var err error
 	shadow := func() {}
-	if frozen, why := g.frozen(); frozen {
-		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
-		verdict = freezeVerdict(why)
-	} else if frozen, why := g.agentFrozen(req.Agent); frozen {
-		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, why, req.Agent)
-		verdict = agentFreezeVerdict(why)
+	if deny, frozen := g.frozen(); frozen {
+		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, deny.Reason, req.Agent)
+		verdict = deny
+	} else if deny, frozen := g.agentFrozen(req.Agent); frozen {
+		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, deny.Reason, req.Agent)
+		verdict = deny
 	} else if caller != nil && !caller.Allows(req.Tool) {
 		verdict = callerDenial(caller, req.Tool)
 	} else {
@@ -606,9 +606,9 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	}
 	// A frozen gate refuses the permit like a denied one. The permit itself is
 	// untouched, so it can be consumed again once the freeze is lifted.
-	if frozen, why := g.frozen(); frozen {
+	if deny, frozen := g.frozen(); frozen {
 		resp.Permit, resp.Consume = "", ""
-		resp.Decision, resp.Rule, resp.Reason = "deny", freezeRule, why
+		resp.Decision, resp.Rule, resp.Reason = deny.Decision, deny.Rule, deny.Reason
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
@@ -618,9 +618,9 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	// So does a frozen agent's, for the permits it holds.
-	if frozen, why := g.agentFrozen(a.Agent); frozen {
+	if deny, frozen := g.agentFrozen(a.Agent); frozen {
 		resp.Permit, resp.Consume = "", ""
-		resp.Decision, resp.Rule, resp.Reason = "deny", agentFreezeRule, why
+		resp.Decision, resp.Rule, resp.Reason = deny.Decision, deny.Rule, deny.Reason
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}

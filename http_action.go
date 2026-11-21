@@ -43,26 +43,26 @@ func releasedHTTPRequest(steps []config.StepConfig, i int) *config.StepConfig {
 }
 
 // renderHTTPRequest builds the request an http_request step would send now.
-func renderHTTPRequest(step config.StepConfig, runID string, data map[string]interface{}) (httpaction.Spec, []byte, string, error) {
+func renderHTTPRequest(step config.StepConfig, runID string, data map[string]interface{}) (httpaction.Request, error) {
 	spec, ferrs := httpaction.Parse(step.Vars)
 	if len(ferrs) > 0 {
-		return spec, nil, "", fmt.Errorf("%s %q: %w", httpRequestAction, step.Name, ferrs[0])
+		return httpaction.Request{}, fmt.Errorf("%s %q: %w", httpRequestAction, step.Name, ferrs[0])
 	}
-	body, err := httpaction.Body(spec, data)
+	req, err := httpaction.Render(spec, runID, step.Name, data)
 	if err != nil {
-		return spec, nil, "", fmt.Errorf("%s %q: %w", httpRequestAction, step.Name, err)
+		return httpaction.Request{}, fmt.Errorf("%s %q: %w", httpRequestAction, step.Name, err)
 	}
-	return spec, body, httpaction.IdempotencyKey(runID, step.Name), nil
+	return req, nil
 }
 
 // outboundDraft is what the operator reviews for a request, and the digest
 // its approval binds to.
 func outboundDraft(step config.StepConfig, runID string, data map[string]interface{}) (string, string, error) {
-	spec, body, key, err := renderHTTPRequest(step, runID, data)
+	req, err := renderHTTPRequest(step, runID, data)
 	if err != nil {
 		return "", "", err
 	}
-	return httpaction.Describe(spec, body, key), httpaction.Digest(spec, body, key), nil
+	return req.Describe(), req.Digest(), nil
 }
 
 // revisedOutput is a rewrite approved in place of the model's first output:
@@ -81,14 +81,15 @@ func revisedOutput(previous interface{}, text string) interface{} {
 // run's data. approved is the digest the releasing approval step bound; a
 // request that does not match it is not sent.
 func runHTTPRequest(ctx context.Context, runID, pipeline string, step config.StepConfig, data map[string]interface{}, approved string) error {
-	spec, body, key, err := renderHTTPRequest(step, runID, data)
+	req, err := renderHTTPRequest(step, runID, data)
 	if err != nil {
 		return err
 	}
+	spec, key := req.Spec, req.Key
 	if approved == "" {
 		return errors.New("http_request is sent only after an approval step showed it to the operator, and none did in this run; nothing was sent")
 	}
-	if httpaction.Digest(spec, body, key) != approved {
+	if req.Digest() != approved {
 		return errors.New("http_request changed after it was approved; nothing was sent")
 	}
 	credential := ""
@@ -101,7 +102,7 @@ func runHTTPRequest(ctx context.Context, runID, pipeline string, step config.Ste
 		// reload has its credential redacted too.
 		redact.Register(spec.AuthEnv, credential)
 	}
-	resp, err := httpaction.Do(ctx, spec, body, key, credential)
+	resp, err := req.Do(ctx, credential)
 	if err != nil {
 		return fmt.Errorf("http_request: %w", err)
 	}

@@ -17,7 +17,6 @@ package main
 // transport with a thirty-second timeout.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -263,28 +262,7 @@ func (r *RelayChannel) SendForQuorumApproval(ctx context.Context, draft string, 
 // dispatch signs and POSTs one envelope. It deliberately does not wait for the
 // human: a relay must ack promptly and carry the wait on its own side.
 func (r *RelayChannel) dispatch(ctx context.Context, req relay.Request) (int, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return 0, fmt.Errorf("marshal dispatch: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.cfg.URL, bytes.NewReader(body))
-	if err != nil {
-		return 0, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set(relay.ProtocolHeader, relay.Version)
-	httpReq.Header.Set(relay.SigHeader, relay.Sign(r.secret, body, time.Now()))
-
-	resp, err := r.client.Do(httpReq)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return resp.StatusCode, fmt.Errorf("relay returned %s", resp.Status)
-	}
-	return resp.StatusCode, nil
+	return relay.Dispatch(ctx, r.client, r.cfg.URL, r.secret, req)
 }
 
 // handleDecision receives one decision envelope from the relay.

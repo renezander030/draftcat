@@ -47,55 +47,28 @@ type tripEvent struct {
 // that names no agent counts as "-", the name the operator notices show.
 func freezeAgentName(agent string) string { return orDash(agent) }
 
-// agentFreezeReason is the reason a frozen agent's refused call carries.
-func agentFreezeReason(f statestore.AgentFreeze) string {
-	r := "agent " + f.Agent + " frozen"
-	if f.By != "" {
-		r += " by " + f.By
-	}
-	if f.Reason != "" {
-		r += ": " + f.Reason
-	}
-	return r
-}
-
-// agentFreezeVerdict is the policy deny a frozen agent's calls get. Like the
-// gate freeze it has no Class: no notice per call, and it does not count
-// toward the trip.
-func agentFreezeVerdict(reason string) toolPolicyVerdict {
-	return toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: agentFreezeRule, Reason: reason}
-}
-
-// agentFrozen reports whether the agent is frozen and the reason a refused
-// call carries. The store is read on every decision; a store that cannot be
-// read freezes.
-func (g *toolGate) agentFrozen(agent string) (bool, string) {
+// agentFrozen reports whether the agent is frozen and, if so, the deny its
+// refused call gets (rule freeze.agent). The store is read on every
+// decision; a store that cannot be read freezes.
+func (g *toolGate) agentFrozen(agent string) (toolPolicyVerdict, bool) {
 	if state == nil {
-		return false, ""
+		return toolPolicyVerdict{}, false
 	}
 	name := freezeAgentName(agent)
 	f, ok, err := state.AgentFreeze(name)
 	if err != nil {
 		log.Printf("[tool-gate] agent freeze state unreadable, denying: %v", err)
-		return true, "agent " + name + " frozen (freeze state could not be read)"
+		return freezeDeny(agentFreezeRule, "agent "+name+" frozen (freeze state could not be read)"), true
 	}
 	if !ok {
-		return false, ""
+		return toolPolicyVerdict{}, false
 	}
-	return true, agentFreezeReason(f)
+	return freezeDeny(agentFreezeRule, freezeReasonText("agent "+f.Agent+" frozen", " by ", f.By, f.Reason)), true
 }
 
 // describeAgentFreeze is one agent's status line.
 func describeAgentFreeze(f statestore.AgentFreeze) string {
-	line := "Agent " + f.Agent + ": FROZEN"
-	if f.By != "" {
-		line += " by " + f.By
-	}
-	line += " since " + f.At.UTC().Format(time.RFC3339)
-	if f.Reason != "" {
-		line += " (" + f.Reason + ")"
-	}
-	return line
+	return freezeStatusText("Agent "+f.Agent+": FROZEN", f.By, f.At, f.Reason)
 }
 
 // stillFrozenAgents is the note an unfreeze of the whole gate adds when

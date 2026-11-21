@@ -13,7 +13,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 )
@@ -200,7 +199,7 @@ func parseHookPayload(format string, raw []byte) (hookCall, error) {
 		c.Event = payloadString(p, "hook_event_name")
 		input = p["tool_input"]
 	}
-	if c.Event != "" && !containsString(f.events, c.Event) {
+	if c.Event != "" && !slices.Contains(f.events, c.Event) {
 		return hookCall{}, fmt.Errorf("the hook fired for %s, not %s", c.Event, strings.Join(f.events, " or "))
 	}
 	if strings.TrimSpace(c.Tool) == "" {
@@ -234,15 +233,6 @@ func payloadString(p map[string]interface{}, key string) string {
 		return v.String()
 	}
 	return ""
-}
-
-func containsString(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 // hookActionID is the stable action_id of one harness call, so a retried hook
@@ -310,7 +300,7 @@ func runGateHook(ctx context.Context, o hookOptions, format string, call hookCal
 	deadline := time.Now().Add(o.wait)
 	id := hookActionID(format, call)
 
-	hold := minDuration(time.Until(deadline), hookHoldCap)
+	hold := min(time.Until(deadline), hookHoldCap)
 	ask, err := json.Marshal(struct {
 		ActionID string                 `json:"action_id"`
 		Tool     string                 `json:"tool"`
@@ -338,7 +328,7 @@ func runGateHook(ctx context.Context, o hookOptions, format string, call hookCal
 			_, _ = gc.call(ctx, http.MethodPost, toolGatePath+"/"+id+"/revoke", body, hookShortTimeout)
 			return hookVerdict{Reason: fmt.Sprintf("no decision within %s; the ask was withdrawn (action %s)", o.wait, id)}
 		}
-		hold = minDuration(left, hookHoldCap)
+		hold = min(left, hookHoldCap)
 		started := time.Now()
 		resp, refusal = gc.call(ctx, http.MethodGet, toolGatePath+"/"+id+"?wait="+url.QueryEscape(hold.String()), nil, hold+hookRequestGrace)
 		if refusal != "" {
@@ -347,7 +337,7 @@ func runGateHook(ctx context.Context, o hookOptions, format string, call hookCal
 		// A gate (or a proxy) that answers a long-poll at once is not polled
 		// in a tight loop.
 		if hookPending(resp) && time.Since(started) < hookPollPause {
-			time.Sleep(minDuration(hookPollPause, time.Until(deadline)))
+			time.Sleep(min(hookPollPause, time.Until(deadline)))
 		}
 	}
 	if resp.Decision != "allow" || resp.State != "allowed" {
@@ -389,13 +379,6 @@ func hookDenialReason(r ToolCallResponse) string {
 }
 
 func hookPending(r ToolCallResponse) bool { return r.Decision == "pending" || r.State == "pending" }
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // hookGateClient makes the hook's requests: the bearer token on every one, and
 // every POST body signed with the same key the gate verifies it with.
@@ -474,17 +457,6 @@ func (c *hookGateClient) once(ctx context.Context, method, path string, body []b
 	default:
 		return resp, res.StatusCode, fmt.Sprintf("the gate answered %d: %s", res.StatusCode, text)
 	}
-}
-
-// signHookBody is the X-Draftcat-Signature value the gate verifies:
-// t=<unix>,v1=<hex hmac-sha256(t + "." + body)>, keyed with the bearer token.
-func signHookBody(key []byte, ts int64, body []byte) string {
-	t := strconv.FormatInt(ts, 10)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(t))
-	_, _ = mac.Write([]byte("."))
-	_, _ = mac.Write(body)
-	return "t=" + t + ",v1=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 // writeHookAnswer answers in the harness's hook format. A deny always carries

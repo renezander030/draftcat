@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/renezander030/draftcat/internal/config"
+	"github.com/renezander030/draftcat/internal/schedule"
 	statestore "github.com/renezander030/draftcat/internal/state"
 )
 
@@ -50,7 +51,7 @@ func TestWebhookPipelineNotAutoScheduled(t *testing.T) {
 	if due := sched.GetDue(); len(due) != 0 {
 		t.Errorf("expected no auto-due pipelines, got %v", due)
 	}
-	if isAutoSchedule("webhook") {
+	if schedule.IsTimer("webhook") {
 		t.Error("'webhook' must not be an auto schedule")
 	}
 }

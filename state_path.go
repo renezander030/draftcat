@@ -12,11 +12,8 @@ import (
 
 const defaultStatePath = config.DefaultStatePath
 
-// resolveStatePath is where the engine and every subcommand find the state
-// store; see config.Config.StatePath.
-func resolveStatePath(cfg *config.Config) string { return cfg.StatePath() }
-
-// statePathFromConfigFile applies resolveStatePath for a subcommand that only has a
+// statePathFromConfigFile applies config.Config.StatePath (where the engine
+// and every subcommand find the state store) for a subcommand that only has a
 // --config argument. The config is read only when the env override is unset;
 // an unreadable or unparsable file falls through to the default.
 func statePathFromConfigFile(configPath string) string {
@@ -24,7 +21,7 @@ func statePathFromConfigFile(configPath string) string {
 		return v
 	}
 	cfg, _ := loadConfigFile(configPath)
-	return resolveStatePath(cfg)
+	return cfg.StatePath()
 }
 
 // loadConfigFile reads and parses a config file for a subcommand that reports

@@ -117,46 +117,46 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 	calls := 0
 	tool, maxAge, reason, agent, since := "", time.Duration(0), "", "", ""
 	var positional []string
+	// gateValueFlags are the options that take the next argument as a value.
+	gateValueFlags := map[string]bool{"--config": true, "-config": true, "--args": true, "--definition": true,
+		"--compare": true, "--spent": true, "--calls": true, "--tool": true, "--max-age": true,
+		"--reason": true, "--since": true, "--agent": true}
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
-		needValue := func() (string, bool) {
-			if i+1 >= len(rest) {
-				_, _ = fmt.Fprintf(stderr, "gate: %s requires a value\n", a)
-				return "", false
-			}
-			i++
-			return rest[i], true
+		if a == "--json" {
+			asJSON = true
+			continue
 		}
+		if !gateValueFlags[a] {
+			if strings.HasPrefix(a, "-") {
+				_, _ = fmt.Fprintf(stderr, "gate: unknown option %q\n", a)
+				return 2
+			}
+			positional = append(positional, a)
+			continue
+		}
+		if i+1 >= len(rest) {
+			_, _ = fmt.Fprintf(stderr, "gate: %s requires a value\n", a)
+			return 2
+		}
+		i++
+		v := rest[i]
 		switch a {
 		case "--config", "-config":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			configPath = v
 		case "--args":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			argsJSON = v
 		case "--definition":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			definitionPath = v
 		case "--compare":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			comparePath = v
+		case "--tool":
+			tool = v
+		case "--reason":
+			reason = strings.TrimSpace(v)
+		case "--since":
+			since = strings.TrimSpace(v)
 		case "--spent":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			name, amount, found := strings.Cut(v, "=")
 			if !found || strings.TrimSpace(name) == "" {
 				_, _ = fmt.Fprintf(stderr, "gate: --spent wants arg=N (got %q)\n", v)
@@ -164,62 +164,24 @@ func gateCmd(args []string, stdout, stderr io.Writer) int {
 			}
 			spent[strings.TrimSpace(name)] = strings.TrimSpace(amount)
 		case "--calls":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			n, err := strconv.Atoi(strings.TrimSpace(v))
 			if err != nil || n < 0 {
 				_, _ = fmt.Fprintf(stderr, "gate: --calls wants a count of 0 or more (got %q)\n", v)
 				return 2
 			}
 			calls = n
-		case "--tool":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
-			tool = v
 		case "--max-age":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			d, err := time.ParseDuration(v)
 			if err != nil || d < 0 {
 				_, _ = fmt.Fprintf(stderr, "gate: --max-age wants a duration like 5m (got %q)\n", v)
 				return 2
 			}
 			maxAge = d
-		case "--reason":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
-			reason = strings.TrimSpace(v)
-		case "--since":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
-			since = strings.TrimSpace(v)
 		case "--agent":
-			v, ok := needValue()
-			if !ok {
-				return 2
-			}
 			if agent = strings.TrimSpace(v); agent == "" {
 				_, _ = fmt.Fprintln(stderr, "gate: --agent wants an agent name")
 				return 2
 			}
-		case "--json":
-			asJSON = true
-		default:
-			if strings.HasPrefix(a, "-") {
-				_, _ = fmt.Fprintf(stderr, "gate: unknown option %q\n", a)
-				return 2
-			}
-			positional = append(positional, a)
 		}
 	}
 	if sub == "shadow" {

@@ -178,3 +178,17 @@ func TestBearerMatches(t *testing.T) {
 		}
 	}
 }
+
+// The hook's signer and the gate's verifier are the two sides of one format:
+// what the hook sends, the gate accepts, and the signer agrees with the
+// independent construction above.
+func TestSignHookBodyRoundTrips(t *testing.T) {
+	key, body, now := []byte("tok"), []byte(`{"tool":"x"}`), time.Unix(1_800_000_000, 0)
+	h := signHookBody(key, now.Unix(), body)
+	if h != signBody(key, now.Unix(), body) {
+		t.Fatalf("signer drifted from the documented construction: %s", h)
+	}
+	if _, err := authenticateWebhookSignature(h, body, key, 300, now); err != nil {
+		t.Fatalf("verifier rejects the hook's signature: %v", err)
+	}
+}

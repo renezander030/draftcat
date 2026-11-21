@@ -27,40 +27,54 @@ const (
 
 const freezeUsage = "Usage: /freeze [reason] stops every gated tool call, /unfreeze lifts it, /unfreeze <agent> lifts one agent's freeze."
 
-// freezeReason is the reason a refused call carries.
-func freezeReason(f statestore.GateFreeze) string {
-	r := freezePrefix
-	if f.By != "" {
-		r += " " + f.By
-	}
-	if f.Reason != "" {
-		r += ": " + f.Reason
-	}
-	return r
+// freezeDeny is the policy deny a frozen gate or agent answers with, under
+// rule. It has no Class, so no operator notice is sent per denied call and it
+// does not count toward the trip.
+func freezeDeny(rule, reason string) toolPolicyVerdict {
+	return toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: rule, Reason: reason}
 }
 
-// freezeVerdict is the policy deny a frozen gate answers with. It has no
-// Class, so no operator notice is sent per denied call.
-func freezeVerdict(reason string) toolPolicyVerdict {
-	return toolPolicyVerdict{Decision: "deny", DecidedBy: "policy", Rule: freezeRule, Reason: reason}
+// freezeReasonText is the reason a refused call carries: head, then sep and
+// who froze it, then the operator's reason.
+func freezeReasonText(head, sep, by, reason string) string {
+	if by != "" {
+		head += sep + by
+	}
+	if reason != "" {
+		head += ": " + reason
+	}
+	return head
 }
 
-// frozen reports whether the gate is frozen and the reason a refused call
-// carries. The store is read on every decision. A store that cannot be read
+// freezeStatusText is one status line: head, then who froze it, since when
+// and why.
+func freezeStatusText(head, by string, at time.Time, reason string) string {
+	if by != "" {
+		head += " by " + by
+	}
+	head += " since " + at.UTC().Format(time.RFC3339)
+	if reason != "" {
+		head += " (" + reason + ")"
+	}
+	return head
+}
+
+// frozen reports whether the gate is frozen and, if so, the deny a refused
+// call gets. The store is read on every decision. A store that cannot be read
 // freezes: the gate denies rather than guesses.
-func (g *toolGate) frozen() (bool, string) {
+func (g *toolGate) frozen() (toolPolicyVerdict, bool) {
 	if state == nil {
-		return false, ""
+		return toolPolicyVerdict{}, false
 	}
 	f, err := state.GateFreeze()
 	if err != nil {
 		log.Printf("[tool-gate] freeze state unreadable, denying: %v", err)
-		return true, freezePrefix + " (freeze state could not be read)"
+		return freezeDeny(freezeRule, freezePrefix+" (freeze state could not be read)"), true
 	}
 	if !f.Frozen {
-		return false, ""
+		return toolPolicyVerdict{}, false
 	}
-	return true, freezeReason(f)
+	return freezeDeny(freezeRule, freezeReasonText(freezePrefix, " ", f.By, f.Reason)), true
 }
 
 // describeFreeze is the status line for /status and `draftcat gate status`.
@@ -68,15 +82,7 @@ func describeFreeze(f statestore.GateFreeze) string {
 	if !f.Frozen {
 		return "Tool gate: not frozen"
 	}
-	line := "Tool gate: FROZEN"
-	if f.By != "" {
-		line += " by " + f.By
-	}
-	line += " since " + f.At.UTC().Format(time.RFC3339)
-	if f.Reason != "" {
-		line += " (" + f.Reason + ")"
-	}
-	return line
+	return freezeStatusText("Tool gate: FROZEN", f.By, f.At, f.Reason)
 }
 
 // freezeStatusLine is the extra /status text, only while the gate or an

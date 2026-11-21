@@ -16,7 +16,6 @@ package main
 // re-implementation of it.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -159,27 +158,19 @@ func runHitlCmd(args []string) int {
 		},
 		Callback: relay.Callback{URL: strings.TrimRight(base, "/") + relay.CallbackPath, Nonce: nonce},
 	}
-	body, _ := json.Marshal(req)
-
 	// Check 1: the relay acks promptly and does NOT hold the connection for the
 	// human. A relay that blocks here cannot serve a four-hour approval window.
 	dispatchStart := time.Now()
 	dispatchCtx, dispatchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dispatchCancel()
-	httpReq, _ := http.NewRequestWithContext(dispatchCtx, http.MethodPost, relayURL, bytes.NewReader(body))
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set(relay.ProtocolHeader, relay.Version)
-	httpReq.Header.Set(relay.SigHeader, relay.Sign([]byte(secret), body, time.Now()))
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(httpReq)
+	status, err := relay.Dispatch(dispatchCtx, &http.Client{Timeout: 30 * time.Second}, relayURL, []byte(secret), req)
 	ackDur := time.Since(dispatchStart)
-	if err != nil {
+	if status == 0 {
 		add("dispatch accepted", false, err.Error())
 		return reportHitl(checks, *jsonOut)
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	_ = resp.Body.Close()
-	add("dispatch accepted", resp.StatusCode >= 200 && resp.StatusCode <= 299,
-		fmt.Sprintf("HTTP %d in %s", resp.StatusCode, ackDur.Round(time.Millisecond)))
+	add("dispatch accepted", err == nil,
+		fmt.Sprintf("HTTP %d in %s", status, ackDur.Round(time.Millisecond)))
 	add("ack does not block on the human", ackDur < 25*time.Second,
 		fmt.Sprintf("acked in %s", ackDur.Round(time.Millisecond)))
 

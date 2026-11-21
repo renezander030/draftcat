@@ -22,6 +22,8 @@
 package relay
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -29,6 +31,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -288,4 +292,33 @@ func DecodeDecision(body []byte) (*Decision, error) {
 		return nil, fmt.Errorf("decode decision: %w", err)
 	}
 	return &d, nil
+}
+
+// Dispatch signs req and POSTs it to url: the one way a draftcat engine (or
+// its conformance check) hands a relay an approval request. It does not wait
+// for the human: a relay must ack promptly. status is 0 when no HTTP answer
+// arrived; a non-2xx answer returns its status together with an error.
+func Dispatch(ctx context.Context, client *http.Client, url string, secret []byte, req Request) (status int, err error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return 0, fmt.Errorf("marshal dispatch: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set(ProtocolHeader, Version)
+	httpReq.Header.Set(SigHeader, Sign(secret, body, time.Now()))
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return resp.StatusCode, fmt.Errorf("relay returned %s", resp.Status)
+	}
+	return resp.StatusCode, nil
 }

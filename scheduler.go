@@ -47,11 +47,6 @@ type Scheduler struct {
 	now       func() time.Time
 }
 
-// isAutoSchedule reports whether a schedule string drives automatic timer runs.
-// "manual" (operator /run only), "webhook" (HTTP trigger only), and "" are not
-// timer-driven.
-func isAutoSchedule(spec string) bool { return schedule.IsTimer(spec) }
-
 func newScheduler(pipelines []config.PipelineConfig) *Scheduler {
 	s := &Scheduler{pipelines: make(map[string]*PipelineState), now: time.Now}
 	now := s.now()
