@@ -355,9 +355,28 @@ func marshal(v interface{}, indent bool) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
+// Request is one rendered request: its spec, body and idempotency key travel
+// together, so the request the operator reviewed is the one that is sent.
+type Request struct {
+	Spec Spec
+	Body []byte // nil = no body
+	Key  string // the Idempotency-Key
+}
+
+// Render builds the request a step sends now: its body from the run's data
+// and its idempotency key from the run and step.
+func Render(s Spec, runID, step string, data map[string]interface{}) (Request, error) {
+	body, err := Body(s, data)
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{Spec: s, Body: body, Key: IdempotencyKey(runID, step)}, nil
+}
+
 // Describe is the request as the operator reviews it: method, URL, every
 // header draftcat sends (the credential named, never shown) and the body.
-func Describe(s Spec, body []byte, idempotencyKey string) string {
+func (r Request) Describe() string {
+	s, body, idempotencyKey := r.Spec, r.Body, r.Key
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s\n", s.Method, s.URL.String())
 	if body != nil {
@@ -386,8 +405,8 @@ func Describe(s Spec, body []byte, idempotencyKey string) string {
 
 // Digest binds an approval to one request: the same spec, body and key give
 // the same digest, and any change to them gives another.
-func Digest(s Spec, body []byte, idempotencyKey string) string {
-	sum := sha256.Sum256([]byte(Describe(s, body, idempotencyKey)))
+func (r Request) Digest() string {
+	sum := sha256.Sum256([]byte(r.Describe()))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -423,8 +442,9 @@ var client = &http.Client{
 
 // Do sends the request once. It never retries: a resend could repeat the
 // side effect the operator approved once. credential is the value of
-// s.AuthEnv; it is never part of a returned error.
-func Do(ctx context.Context, s Spec, body []byte, idempotencyKey, credential string) (Response, error) {
+// Spec.AuthEnv; it is never part of a returned error.
+func (r Request) Do(ctx context.Context, credential string) (Response, error) {
+	s, body, idempotencyKey := r.Spec, r.Body, r.Key
 	scrub := func(text string) string {
 		if credential == "" {
 			return text

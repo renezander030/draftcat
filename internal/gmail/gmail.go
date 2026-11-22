@@ -197,71 +197,11 @@ func (g *GmailConnector) GetMessage(id string) (*Email, error) {
 		return nil, err
 	}
 
-	var msg struct {
-		ID           string `json:"id"`
-		InternalDate string `json:"internalDate"`
-		Snippet      string `json:"snippet"`
-		Payload      struct {
-			Headers []struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"headers"`
-			Parts []struct {
-				MimeType string `json:"mimeType"`
-				Body     struct {
-					Data string `json:"data"`
-				} `json:"body"`
-			} `json:"parts"`
-			Body struct {
-				Data string `json:"data"`
-			} `json:"body"`
-		} `json:"payload"`
-		LabelIds []string `json:"labelIds"`
-	}
+	var msg message
 	json.Unmarshal(raw, &msg)
-
-	email := Email{
-		ID:      msg.ID,
-		Snippet: msg.Snippet,
-		Labels:  msg.LabelIds,
-	}
-
-	// Extract headers
-	for _, h := range msg.Payload.Headers {
-		switch h.Name {
-		case "From":
-			email.From = h.Value
-		case "To":
-			email.To = h.Value
-		case "Subject":
-			email.Subject = h.Value
-		}
-	}
-
+	email := msg.summary()
 	// Use internalDate for accurate relative time
-	var epoch int64
-	fmt.Sscanf(msg.InternalDate, "%d", &epoch)
-	email.Date = timeAgo(time.Unix(epoch/1000, 0))
-
-	// Extract body
-	if len(msg.Payload.Parts) > 0 {
-		for _, part := range msg.Payload.Parts {
-			if part.MimeType == "text/plain" && part.Body.Data != "" {
-				decoded, _ := base64.URLEncoding.DecodeString(part.Body.Data)
-				email.Body = string(decoded)
-				break
-			}
-		}
-	} else if msg.Payload.Body.Data != "" {
-		decoded, _ := base64.URLEncoding.DecodeString(msg.Payload.Body.Data)
-		email.Body = string(decoded)
-	}
-
-	// Truncate body for token efficiency
-	if len(email.Body) > 500 {
-		email.Body = email.Body[:500] + "..."
-	}
-
+	email.Date = timeAgo(time.Unix(msg.epochMillis()/1000, 0))
 	return &email, nil
 }
 
@@ -278,28 +218,8 @@ func (g *GmailConnector) FetchThread(threadID string) ([]Email, error) {
 	}
 
 	var thread struct {
-		ID       string `json:"id"`
-		Messages []struct {
-			ID           string `json:"id"`
-			InternalDate string `json:"internalDate"`
-			Snippet      string `json:"snippet"`
-			Payload      struct {
-				Headers []struct {
-					Name  string `json:"name"`
-					Value string `json:"value"`
-				} `json:"headers"`
-				Parts []struct {
-					MimeType string `json:"mimeType"`
-					Body     struct {
-						Data string `json:"data"`
-					} `json:"body"`
-				} `json:"parts"`
-				Body struct {
-					Data string `json:"data"`
-				} `json:"body"`
-			} `json:"payload"`
-			LabelIds []string `json:"labelIds"`
-		} `json:"messages"`
+		ID       string    `json:"id"`
+		Messages []message `json:"messages"`
 	}
 	json.Unmarshal(raw, &thread)
 
@@ -309,37 +229,10 @@ func (g *GmailConnector) FetchThread(threadID string) ([]Email, error) {
 	}
 	var msgsWithTime []msgWithTime
 	for _, msg := range thread.Messages {
-		email := Email{ID: msg.ID, Snippet: msg.Snippet, Labels: msg.LabelIds}
-		for _, h := range msg.Payload.Headers {
-			switch h.Name {
-			case "From":
-				email.From = h.Value
-			case "To":
-				email.To = h.Value
-			case "Subject":
-				email.Subject = h.Value
-			}
-		}
+		email := msg.summary()
 		// Use internalDate (epoch ms) for accurate chronological ordering
-		var epoch int64
-		fmt.Sscanf(msg.InternalDate, "%d", &epoch)
+		epoch := msg.epochMillis()
 		email.Date = time.Unix(epoch/1000, 0).Format("2006-01-02 15:04")
-		// Extract body
-		if len(msg.Payload.Parts) > 0 {
-			for _, part := range msg.Payload.Parts {
-				if part.MimeType == "text/plain" && part.Body.Data != "" {
-					decoded, _ := base64.URLEncoding.DecodeString(part.Body.Data)
-					email.Body = string(decoded)
-					break
-				}
-			}
-		} else if msg.Payload.Body.Data != "" {
-			decoded, _ := base64.URLEncoding.DecodeString(msg.Payload.Body.Data)
-			email.Body = string(decoded)
-		}
-		if len(email.Body) > 500 {
-			email.Body = email.Body[:500] + "..."
-		}
 		msgsWithTime = append(msgsWithTime, msgWithTime{email: email, epoch: epoch})
 	}
 
@@ -499,60 +392,14 @@ func (g *GmailConnector) GetFullMessage(id string) (*Email, string, string, stri
 		return nil, "", "", "", err
 	}
 
-	var msg struct {
-		ID       string `json:"id"`
-		ThreadId string `json:"threadId"`
-		Snippet  string `json:"snippet"`
-		Payload  struct {
-			Headers []struct {
-				Name  string `json:"name"`
-				Value string `json:"value"`
-			} `json:"headers"`
-			Parts []struct {
-				MimeType string `json:"mimeType"`
-				Body     struct {
-					Data string `json:"data"`
-				} `json:"body"`
-			} `json:"parts"`
-			Body struct {
-				Data string `json:"data"`
-			} `json:"body"`
-		} `json:"payload"`
-	}
+	var msg message
 	json.Unmarshal(raw, &msg)
 
-	email := Email{ID: msg.ID, Snippet: msg.Snippet}
-	var messageID, references string
-	for _, h := range msg.Payload.Headers {
-		switch h.Name {
-		case "From":
-			email.From = h.Value
-		case "To":
-			email.To = h.Value
-		case "Subject":
-			email.Subject = h.Value
-		case "Date":
-			email.Date = h.Value
-		case "Message-ID", "Message-Id":
-			messageID = h.Value
-		case "References":
-			references = h.Value
-		}
-	}
-
-	// Extract body
-	if len(msg.Payload.Parts) > 0 {
-		for _, part := range msg.Payload.Parts {
-			if part.MimeType == "text/plain" && part.Body.Data != "" {
-				decoded, _ := base64.URLEncoding.DecodeString(part.Body.Data)
-				email.Body = string(decoded)
-				break
-			}
-		}
-	} else if msg.Payload.Body.Data != "" {
-		decoded, _ := base64.URLEncoding.DecodeString(msg.Payload.Body.Data)
-		email.Body = string(decoded)
-	}
+	// The reply needs the whole body and the threading headers; it carries no labels.
+	email := Email{ID: msg.ID, Snippet: msg.Snippet, Body: msg.plainBody()}
+	email.From, email.To, email.Subject = msg.header("From"), msg.header("To"), msg.header("Subject")
+	email.Date = msg.header("Date")
+	messageID, references := msg.header("Message-ID", "Message-Id"), msg.header("References")
 
 	return &email, msg.ThreadId, messageID, references, nil
 }
@@ -648,3 +495,78 @@ func StartAuthCallback(port int) chan string {
 }
 
 func (g *GmailConnector) ClientID() string { return g.token.ClientID }
+
+// message is a Gmail API message as the format=full reads decode it.
+type message struct {
+	ID           string `json:"id"`
+	ThreadId     string `json:"threadId"`
+	InternalDate string `json:"internalDate"`
+	Snippet      string `json:"snippet"`
+	Payload      struct {
+		Headers []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"headers"`
+		Parts []struct {
+			MimeType string `json:"mimeType"`
+			Body     struct {
+				Data string `json:"data"`
+			} `json:"body"`
+		} `json:"parts"`
+		Body struct {
+			Data string `json:"data"`
+		} `json:"body"`
+	} `json:"payload"`
+	LabelIds []string `json:"labelIds"`
+}
+
+// summary is the message as a prompt reads it: sender, recipient, subject,
+// labels and a body cut at 500 bytes for token efficiency. Date is the
+// caller's.
+func (m message) summary() Email {
+	e := Email{ID: m.ID, Snippet: m.Snippet, Labels: m.LabelIds, Body: m.plainBody()}
+	e.From, e.To, e.Subject = m.header("From"), m.header("To"), m.header("Subject")
+	if len(e.Body) > 500 {
+		e.Body = e.Body[:500] + "..."
+	}
+	return e
+}
+
+// header is the value of the last header with one of names, or "".
+func (m message) header(names ...string) string {
+	v := ""
+	for _, h := range m.Payload.Headers {
+		for _, n := range names {
+			if h.Name == n {
+				v = h.Value
+			}
+		}
+	}
+	return v
+}
+
+// plainBody is the first non-empty text/plain part, or the payload body of a
+// message without parts, decoded.
+func (m message) plainBody() string {
+	if len(m.Payload.Parts) > 0 {
+		for _, part := range m.Payload.Parts {
+			if part.MimeType == "text/plain" && part.Body.Data != "" {
+				decoded, _ := base64.URLEncoding.DecodeString(part.Body.Data)
+				return string(decoded)
+			}
+		}
+		return ""
+	}
+	if m.Payload.Body.Data != "" {
+		decoded, _ := base64.URLEncoding.DecodeString(m.Payload.Body.Data)
+		return string(decoded)
+	}
+	return ""
+}
+
+// epochMillis is internalDate as a number; 0 when it does not parse.
+func (m message) epochMillis() int64 {
+	var epoch int64
+	_, _ = fmt.Sscanf(m.InternalDate, "%d", &epoch)
+	return epoch
+}

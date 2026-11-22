@@ -220,7 +220,7 @@ func doctorSecretsFile(rep *doctorReport) {
 
 // doctorState inspects the state store without creating or migrating it.
 func doctorState(rep *doctorReport, cfg *config.Config, now time.Time) {
-	path := resolveStatePath(cfg)
+	path := cfg.StatePath()
 	if _, err := os.Stat(path); err != nil {
 		dir := filepath.Dir(path)
 		if fi, derr := os.Stat(dir); derr != nil || !fi.IsDir() {

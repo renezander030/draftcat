@@ -133,13 +133,13 @@ func TestBodyRendering(t *testing.T) {
 
 func TestDescribeNamesCredentialWithoutValue(t *testing.T) {
 	s := mustParse(t, map[string]string{"url": "https://example.com/x", "auth_env": "ORDERS_TOKEN", "headers": "X-Source: agent-1"})
-	d := Describe(s, []byte(`{"a":1}`), "k1")
+	d := (Request{Spec: s, Body: []byte(`{"a":1}`), Key: "k1"}).Describe()
 	for _, want := range []string{"POST https://example.com/x", "Authorization: Bearer <credential from ORDERS_TOKEN>", "X-Source: agent-1", "Idempotency-Key: k1", `{"a":1}`} {
 		if !strings.Contains(d, want) {
 			t.Errorf("description lacks %q:\n%s", want, d)
 		}
 	}
-	if Digest(s, []byte(`{"a":1}`), "k1") == Digest(s, []byte(`{"a":2}`), "k1") {
+	if (Request{Spec: s, Body: []byte(`{"a":1}`), Key: "k1"}).Digest() == (Request{Spec: s, Body: []byte(`{"a":2}`), Key: "k1"}).Digest() {
 		t.Fatal("digest must change with the body")
 	}
 }
@@ -159,7 +159,7 @@ func TestDoSuccessJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := mustParse(t, map[string]string{"url": srv.URL + "/orders", "auth_env": "ORDERS_TOKEN"})
-	resp, err := Do(context.Background(), s, []byte(`{"a":1}`), "key-1", token)
+	resp, err := (Request{Spec: s, Body: []byte(`{"a":1}`), Key: "key-1"}).Do(context.Background(), token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestDoCustomAuthHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := mustParse(t, map[string]string{"url": srv.URL, "auth_env": "K", "auth_header": "X-Api-Key"})
-	if _, err := Do(context.Background(), s, nil, "k", "secret-value-123"); err != nil {
+	if _, err := (Request{Spec: s, Body: nil, Key: "k"}).Do(context.Background(), "secret-value-123"); err != nil {
 		t.Fatal(err)
 	}
 	if got != "secret-value-123|" {
@@ -202,7 +202,7 @@ func TestDoNon2xxFailsWithRedactedExcerpt(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := mustParse(t, map[string]string{"url": srv.URL, "auth_env": "ORDERS_TOKEN"})
-	_, err := Do(context.Background(), s, []byte(`{}`), "k", token)
+	_, err := (Request{Spec: s, Body: []byte(`{}`), Key: "k"}).Do(context.Background(), token)
 	if err == nil {
 		t.Fatal("401 must fail the step")
 	}
@@ -220,10 +220,10 @@ func TestDoExpectStatus(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
-	if _, err := Do(context.Background(), mustParse(t, map[string]string{"url": srv.URL, "expect_status": "200,201"}), nil, "k", ""); err == nil {
+	if _, err := (Request{Spec: mustParse(t, map[string]string{"url": srv.URL, "expect_status": "200,201"}), Body: nil, Key: "k"}).Do(context.Background(), ""); err == nil {
 		t.Fatal("202 is not in 200,201")
 	}
-	if _, err := Do(context.Background(), mustParse(t, map[string]string{"url": srv.URL, "expect_status": "202"}), nil, "k", ""); err != nil {
+	if _, err := (Request{Spec: mustParse(t, map[string]string{"url": srv.URL, "expect_status": "202"}), Body: nil, Key: "k"}).Do(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -237,7 +237,7 @@ func TestDoDoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := mustParse(t, map[string]string{"url": srv.URL, "auth_env": "K", "auth_header": "X-Api-Key"})
-	if _, err := Do(context.Background(), s, []byte(`{}`), "k", "secret-value-123"); err == nil || hit {
+	if _, err := (Request{Spec: s, Body: []byte(`{}`), Key: "k"}).Do(context.Background(), "secret-value-123"); err == nil || hit {
 		t.Fatalf("a redirect must fail the step and never reach the other host: err=%v hit=%v", err, hit)
 	}
 }
@@ -254,7 +254,7 @@ func TestDoTimeout(t *testing.T) {
 	defer close(release)
 	s := mustParse(t, map[string]string{"url": srv.URL, "timeout": "50ms"})
 	start := time.Now()
-	_, err := Do(context.Background(), s, []byte(`{}`), "k", "")
+	_, err := (Request{Spec: s, Body: []byte(`{}`), Key: "k"}).Do(context.Background(), "")
 	if err == nil || !strings.Contains(err.Error(), "deadline") {
 		t.Fatalf("expected a deadline error, got %v", err)
 	}
@@ -270,7 +270,7 @@ func TestDoResponseBound(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := mustParse(t, map[string]string{"url": srv.URL, "max_response_bytes": "100"})
-	resp, err := Do(context.Background(), s, []byte(`{}`), "k", "")
+	resp, err := (Request{Spec: s, Body: []byte(`{}`), Key: "k"}).Do(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

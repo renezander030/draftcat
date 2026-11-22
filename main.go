@@ -3,17 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/renezander030/draftcat/internal/config"
-	skillsapi "github.com/renezander030/draftcat/internal/skills"
-	"github.com/renezander030/draftcat/internal/validate"
 	"io"
 	"log"
 	"math/rand"
@@ -27,6 +22,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/renezander030/draftcat/internal/config"
+	skillsapi "github.com/renezander030/draftcat/internal/skills"
+	"github.com/renezander030/draftcat/internal/validate"
 
 	"gopkg.in/yaml.v3"
 
@@ -693,13 +692,12 @@ func (t *TGBot) Name() string { return channels.Telegram }
 func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []int64) (OperatorDecision, error) {
 	buttons := approvalButtons()
 
-	msgID, err := t.sendWithButtons(draft, buttons)
+	w, err := t.sendApprovalPrompt(draft, buttons)
 	if err != nil {
 		return OperatorDecision{}, fmt.Errorf("failed to send draft: %w", err)
 	}
+	msgID := w.msgID
 	log.Printf("[telegram] draft posted (msg_id=%d), waiting for operator action...", msgID)
-
-	w := t.pump().register(msgID)
 	defer t.pump().release(msgID)
 
 	// textFor is what a text reply means once a button asked for one:
@@ -709,6 +707,10 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 	var reasonDeadline <-chan time.Time
 
 	for {
+		updates := w.ch
+		if ctx.Err() != nil {
+			updates = nil // an expired prompt cannot consume a buffered decision
+		}
 		select {
 		case <-reasonDeadline:
 			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
@@ -720,7 +722,7 @@ func (t *TGBot) SendForApproval(ctx context.Context, draft string, approvers []i
 			}
 			t.editButtons(msgID, draft+"\n\n[Timed out]", nil)
 			return OperatorDecision{}, fmt.Errorf("approval timeout")
-		case u := <-w.ch:
+		case u := <-updates:
 			// Button click on our message
 			if u.CallbackQuery != nil {
 				cb := u.CallbackQuery
@@ -819,13 +821,12 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 		return fmt.Sprintf("%s\n\nApprovals: %d/%d", draft, got, need)
 	}
 
-	msgID, err := t.sendWithButtons(tally(0), buttons)
+	w, err := t.sendApprovalPrompt(tally(0), buttons)
 	if err != nil {
 		return QuorumDecision{Action: "timeout"}, fmt.Errorf("failed to send draft: %w", err)
 	}
+	msgID := w.msgID
 	log.Printf("[telegram] quorum draft posted (msg_id=%d), need=%d distinct approvers...", msgID, need)
-
-	w := t.pump().register(msgID)
 	defer t.pump().release(msgID)
 
 	approved := map[int64]bool{}
@@ -835,6 +836,10 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 	var reasonDeadline <-chan time.Time
 
 	for {
+		updates := w.ch
+		if ctx.Err() != nil {
+			updates = nil // an expired prompt cannot consume a buffered decision
+		}
 		select {
 		case <-reasonDeadline:
 			t.editButtons(msgID, draft+"\n\n[Skipped]", nil)
@@ -846,7 +851,7 @@ func (t *TGBot) SendForQuorumApproval(ctx context.Context, draft string, need in
 			}
 			t.editButtons(msgID, fmt.Sprintf("%s\n\n[Timed out — %d/%d approvals not reached]", draft, len(approved), need), nil)
 			return QuorumDecision{Action: "timeout"}, fmt.Errorf("approval timeout")
-		case u := <-w.ch:
+		case u := <-updates:
 			if vetoBy != 0 {
 				if m := u.Message; m != nil && m.Text != "" && m.Chat.ID == t.chatID && m.From.ID == vetoBy && t.rateLimiter.allow(m.From.ID) {
 					if result := validateOperatorInput(m.Text, t.security); result.Clean {
@@ -2684,7 +2689,7 @@ func main() {
 	pdfParser = pdf.NewPDFParser()
 
 	// State store — SQLite-backed dedup + run history
-	statePath := resolveStatePath(&cfg)
+	statePath := cfg.StatePath()
 	{
 		var err error
 		state, err = statestore.OpenStateStore(statePath)
@@ -3109,96 +3114,6 @@ func startWebhookServer(cfg *config.Config, sched *Scheduler, budget *BudgetTrac
 	}()
 	return srv
 }
-
-// webhookSigHeader carries the body-bound HMAC receipt on inbound triggers.
-const webhookSigHeader = "X-Draftcat-Signature"
-
-// verifyWebhookSignature checks the Stripe/GitHub-style receipt
-//
-//	X-Draftcat-Signature: t=<unix>,v1=<hex hmac-sha256(t + "." + body)>
-//
-// A bearer token proves only that the caller once saw the token: it does not
-// bind the request body, and a captured header replays forever. Since a webhook
-// here STARTS a pipeline, that is the one thing an inbound request must not be
-// able to do on its own. Signing t+body and bounding the clock skew closes both
-// holes; the nonce store below closes replay inside the skew window.
-//
-// Errors are deliberately specific for the log and generic for the caller — the
-// handler returns a bare 401 so a prober learns nothing about which check failed.
-// bearerMatches reports whether an Authorization header carries exactly the
-// webhook token, compared in constant time.
-func bearerMatches(header string, secret []byte) bool {
-	const prefix = "Bearer "
-	return strings.HasPrefix(header, prefix) &&
-		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(header, prefix)), secret) == 1
-}
-
-func verifyWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) error {
-	sig, err := authenticateWebhookSignature(header, body, secret, maxSkewSeconds, now)
-	if err != nil {
-		return err
-	}
-	return claimWebhookSignature(sig, now)
-}
-
-func claimWebhookSignature(sig string, now time.Time) error {
-	if state != nil {
-		won, err := state.TryMarkSeen(webhookReplayScope, "sig", sig, now)
-		if err != nil {
-			return fmt.Errorf("replay record failed: %w", err)
-		}
-		if !won {
-			return fmt.Errorf("signature already used (replay)")
-		}
-	}
-	return nil
-}
-
-func authenticateWebhookSignature(header string, body, secret []byte, maxSkewSeconds int64, now time.Time) (string, error) {
-	if header == "" {
-		return "", fmt.Errorf("missing %s header", webhookSigHeader)
-	}
-	var tsPart, sigPart string
-	for _, field := range strings.Split(header, ",") {
-		field = strings.TrimSpace(field)
-		switch {
-		case strings.HasPrefix(field, "t="):
-			if tsPart != "" {
-				return "", fmt.Errorf("duplicate timestamp")
-			}
-			tsPart = strings.TrimPrefix(field, "t=")
-		case strings.HasPrefix(field, "v1="):
-			if sigPart != "" {
-				return "", fmt.Errorf("duplicate signature")
-			}
-			sigPart = strings.TrimPrefix(field, "v1=")
-		}
-	}
-	if tsPart == "" || sigPart == "" {
-		return "", fmt.Errorf("malformed signature header")
-	}
-	ts, err := strconv.ParseInt(tsPart, 10, 64)
-	if err != nil {
-		return "", fmt.Errorf("unparseable timestamp")
-	}
-	// Compare bounds instead of subtracting an attacker-controlled timestamp.
-	if ts < now.Unix()-maxSkewSeconds || ts > now.Unix()+maxSkewSeconds {
-		return "", fmt.Errorf("timestamp outside %ds window", maxSkewSeconds)
-	}
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(tsPart))
-	mac.Write([]byte("."))
-	mac.Write(body)
-	want := hex.EncodeToString(mac.Sum(nil))
-	if subtle.ConstantTimeCompare([]byte(want), []byte(sigPart)) != 1 {
-		return "", fmt.Errorf("signature mismatch")
-	}
-	return sigPart, nil
-}
-
-// webhookReplayScope namespaces spent webhook signatures in seen_items. The
-// leading underscores keep it from colliding with a real pipeline name.
-const webhookReplayScope = "__webhook"
 
 // webhookPipelines indexes the pipelines that opted into HTTP triggering.
 func webhookPipelines(cfg *config.Config) map[string]config.PipelineConfig {
