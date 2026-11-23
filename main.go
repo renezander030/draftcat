@@ -564,7 +564,8 @@ func sortedIDs(m map[int64]bool) []int64 {
 // operator chose "Skip with reason". The skip stands either way.
 var skipReasonWait = 10 * time.Minute
 
-// approvalButtons is the keyboard on every approval message.
+// approvalButtons is the keyboard on every approval message. The update pump
+// reads its callback data to tell an approval tap from a command tap.
 func approvalButtons() [][]map[string]string {
 	return [][]map[string]string{
 		{

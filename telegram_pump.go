@@ -180,13 +180,21 @@ func (t *TGBot) sendApprovalPrompt(text string, buttons [][]map[string]string) (
 	return w, err
 }
 
+// approvalCallback reports whether data is what a button of the approval
+// keyboard carries. It reads approvalButtons, so a tap on any button that
+// keyboard gains is held for its prompt like the others.
 func approvalCallback(data string) bool {
-	switch data {
-	case "approve", "skip", "adjust", "skip_reason":
-		return true
-	default:
+	if data == "" {
 		return false
 	}
+	for _, row := range approvalButtons() {
+		for _, b := range row {
+			if b["callback_data"] == data {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // register claims the callbacks for one message id until release.

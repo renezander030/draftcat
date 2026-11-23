@@ -394,8 +394,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	} else if deny, frozen := g.agentFrozen(req.Agent); frozen {
 		log.Printf("[tool-gate] DENY %s (%s) agent=%q", req.Tool, deny.Reason, req.Agent)
 		verdict = deny
-	} else if caller != nil && !caller.Allows(req.Tool) {
-		verdict = callerDenial(caller, req.Tool)
+	} else if deny, refused := callerDenial(caller, req.Tool); refused {
+		verdict = deny
 	} else {
 		verdict, err = g.decidePolicy(req, rule, listed)
 		if err == nil {
@@ -667,8 +667,7 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	// A caller spends a permit only while it may still call the tool: a
 	// restart that took the tool off its list ends what it was approved for
 	// before. The permit is left unspent, and the operator is told.
-	if c := gateCallerFrom(r.Context()); c != nil && !c.Allows(a.Tool) {
-		deny := callerDenial(c, a.Tool)
+	if deny, refused := callerDenial(gateCallerFrom(r.Context()), a.Tool); refused {
 		g.refuseConsume(id, deny.Reason) // a receipt, as for every other refused consume
 		log.Printf("[tool-gate] DENY consume %s (not in the caller's tools) agent=%q", a.Tool, a.Agent)
 		g.notifyDenial(ToolCallRequest{Agent: a.Agent, Tool: a.Tool, argsHash: a.ArgsHash}, deny.Class, deny.Reason)

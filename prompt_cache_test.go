@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/renezander030/draftcat/internal/config"
+	"github.com/renezander030/draftcat/internal/outputschema"
 )
 
 // cacheServer records each request's user message content and answers with
@@ -106,6 +107,48 @@ func TestPromptCacheMarksStepInstructionsForAnthropic(t *testing.T) {
 			parts[1].Type != "text" || parts[1].Text != want || parts[1].CacheControl != nil {
 			t.Fatalf("call %d: content %s, want the instructions marked ephemeral then %q unmarked", i, s.contents[i], want)
 		}
+	}
+}
+
+// A reply that fails output_schema is asked for again with the same marked
+// instructions first: the validation error goes into the unmarked part, so the
+// retry reads the instructions the first call wrote to the cache.
+func TestPromptCacheOutputRetryKeepsTheMarkedInstructions(t *testing.T) {
+	s := &llmServer{steps: []func(http.ResponseWriter){
+		completionWith(`{"label": 7}`),
+		completionWith(`{"label": "billing"}`),
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(s.handler))
+	defer srv.Close()
+	cfg, p := cacheConfig(t, srv.URL, "openrouter", "anthropic/claude-haiku-5.5")
+	p.Steps[0].OutputSchema = outputschema.Schema{"label": map[string]interface{}{"type": "string"}}
+	runCacheStep(t, cfg, p, "My invoice is wrong")
+
+	const stable = "Classify messages for a plumbing company. Long rules follow.\nMessage: "
+	if s.hitCount() != 2 {
+		t.Fatalf("provider saw %d calls, want 2 (first call plus one output retry)", s.hitCount())
+	}
+	var rest [2]string
+	for i, body := range s.bodies {
+		var req struct {
+			Messages []struct {
+				Content []contentPart `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &req); err != nil || len(req.Messages) != 1 {
+			t.Fatalf("call %d: content is not a list of parts: %s", i, body)
+		}
+		parts := req.Messages[0].Content
+		if len(parts) != 2 || parts[0].Text != stable || parts[0].CacheControl["type"] != "ephemeral" || parts[1].CacheControl != nil {
+			t.Fatalf("call %d: content %s, want the instructions marked ephemeral then one unmarked part", i, body)
+		}
+		rest[i] = parts[1].Text
+	}
+	if rest[0] != "My invoice is wrong" {
+		t.Fatalf("first call's unmarked part = %q, want the message only", rest[0])
+	}
+	if !strings.HasPrefix(rest[1], "My invoice is wrong\n\n") || !strings.Contains(rest[1], "field label: expected string") {
+		t.Fatalf("retry's unmarked part = %q, want the message then the validation error", rest[1])
 	}
 }
 

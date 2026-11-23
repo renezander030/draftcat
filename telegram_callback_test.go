@@ -106,3 +106,52 @@ func TestCallbackDataIsParsedStrictly(t *testing.T) {
 		})
 	}
 }
+
+// A tap on any button of the approval keyboard that arrives while its prompt
+// is still being sent reaches that prompt, in order, and never the command
+// loop; a /cron tap arriving at the same moment goes to the command loop.
+func TestApprovalKeyboardTapsDuringSendReachTheirPrompt(t *testing.T) {
+	var words []string
+	for _, row := range approvalButtons() {
+		for _, b := range row {
+			words = append(words, b["callback_data"])
+		}
+	}
+	if got, want := strings.Join(words, " "), "approve skip adjust skip_reason"; got != want {
+		t.Fatalf("approval keyboard carries %q, want %q", got, want)
+	}
+
+	bot, s := newScriptedBot()
+	bot.api = func(method string, payload map[string]interface{}) (json.RawMessage, error) {
+		raw, err := s.api(method, payload)
+		if method == "sendMessage" {
+			for i, w := range words {
+				bot.pump().route(cbUpdate(i+1, 1, 7, w))
+			}
+			bot.pump().route(cbUpdate(100, 99, 7, "cron:pause:invoices"))
+			if cmds := bot.drainUpdates(); len(cmds) != 1 || cmds[0].UpdateID != 100 {
+				t.Errorf("command loop got %+v during the send, want only the /cron tap", cmds)
+			}
+		}
+		return raw, err
+	}
+
+	w, err := bot.sendApprovalPrompt("draft", approvalButtons())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bot.pump().release(w.msgID)
+	for i, want := range words {
+		select {
+		case u := <-w.ch:
+			if u.UpdateID != i+1 || u.CallbackQuery.Data != want {
+				t.Errorf("prompt got update %d %q, want %d %q", u.UpdateID, u.CallbackQuery.Data, i+1, want)
+			}
+		default:
+			t.Fatalf("tap %q made while the prompt was sent never reached it", want)
+		}
+	}
+	if cmds := bot.drainUpdates(); len(cmds) != 0 {
+		t.Errorf("approval taps reached the command loop: %+v", cmds)
+	}
+}

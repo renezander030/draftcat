@@ -225,36 +225,32 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	decisions := slices.Sorted(maps.Keys(r.Decisions))
 	_, _ = fmt.Fprintln(w, "## Decisions")
 	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "| Decision | Count |")
-	_, _ = fmt.Fprintln(w, "|---|---|")
+	var counts [][]string
 	for _, d := range decisions {
-		_, _ = fmt.Fprintf(w, "| %s | %d |\n", mdCell(d), r.Decisions[d])
+		counts = append(counts, []string{d, strconv.Itoa(r.Decisions[d])})
 	}
+	writeTable(w, []string{"Decision", "Count"}, counts)
 
 	_, _ = fmt.Fprintln(w, "\n## By pipeline and step")
 	_, _ = fmt.Fprintln(w)
-	headers := make([]string, len(decisions))
-	for i, d := range decisions {
-		headers[i] = mdCell(d)
-	}
-	_, _ = fmt.Fprintf(w, "| Pipeline | Step | %s |\n", strings.Join(headers, " | "))
-	_, _ = fmt.Fprintf(w, "|---|---|%s\n", strings.Repeat("---|", len(decisions)))
+	var steps [][]string
 	for _, row := range r.Steps {
-		cells := make([]string, len(decisions))
-		for i, d := range decisions {
-			cells[i] = strconv.Itoa(row.Decisions[d])
+		cells := []string{row.Pipeline, row.Step}
+		for _, d := range decisions {
+			cells = append(cells, strconv.Itoa(row.Decisions[d]))
 		}
-		_, _ = fmt.Fprintf(w, "| %s | %s | %s |\n", mdCell(row.Pipeline), mdCell(row.Step), strings.Join(cells, " | "))
+		steps = append(steps, cells)
 	}
+	writeTable(w, append([]string{"Pipeline", "Step"}, decisions...), steps)
 
 	if len(r.Operators) > 0 {
 		_, _ = fmt.Fprintln(w, "\n## By operator")
 		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "| Operator | Decisions |")
-		_, _ = fmt.Fprintln(w, "|---|---|")
+		var ops [][]string
 		for _, op := range slices.Sorted(maps.Keys(r.Operators)) {
-			_, _ = fmt.Fprintf(w, "| %s | %d |\n", mdCell(op), r.Operators[op])
+			ops = append(ops, []string{op, strconv.Itoa(r.Operators[op])})
 		}
+		writeTable(w, []string{"Operator", "Decisions"}, ops)
 	}
 	if r.Skips > 0 {
 		_, _ = fmt.Fprintf(w, "\n%d of %d skip(s) carry a recorded reason.\n", r.Reasons, r.Skips)
@@ -262,11 +258,11 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	if len(r.Outcomes) > 0 {
 		_, _ = fmt.Fprintln(w, "\n## Reported tool executions")
 		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintln(w, "| Tool | Succeeded | Failed |")
-		_, _ = fmt.Fprintln(w, "|---|---|---|")
+		var tools [][]string
 		for _, tool := range slices.Sorted(maps.Keys(r.Outcomes)) {
-			_, _ = fmt.Fprintf(w, "| %s | %d | %d |\n", mdCell(tool), r.Outcomes[tool]["succeeded"], r.Outcomes[tool]["failed"])
+			tools = append(tools, []string{tool, strconv.Itoa(r.Outcomes[tool]["succeeded"]), strconv.Itoa(r.Outcomes[tool]["failed"])})
 		}
+		writeTable(w, []string{"Tool", "Succeeded", "Failed"}, tools)
 	}
 	_, _ = fmt.Fprintln(w, "\n## Receipts")
 	_, _ = fmt.Fprintln(w)
@@ -278,11 +274,25 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	_, _ = fmt.Fprintf(w, "First %s, last %s; receipt ids sha256 %s.\n", r.First, r.Last, r.Digest)
 }
 
-// mdCell makes s safe as one Markdown table cell. Pipeline, step and tool
-// names come from config, an agent harness or a model, so a "|" in one would
-// open an extra column and a line break would split the row; the pipe is
-// escaped and line breaks become spaces.
-func mdCell(s string) string { return strings.ReplaceAll(oneLine(s), "|", `\|`) }
+// writeTable writes one Markdown table: the header row, a delimiter row with
+// one column per header cell, then the rows. Pipeline, step and tool names come
+// from config, an agent harness or a model, so a "|" in one would open an extra
+// column and a line break would split the row: every cell, header cells
+// included, has its pipes escaped and its line breaks turned into spaces.
+func writeTable(w io.Writer, header []string, rows [][]string) {
+	writeRow := func(cells []string) {
+		escaped := make([]string, len(cells))
+		for i, c := range cells {
+			escaped[i] = strings.ReplaceAll(oneLine(c), "|", `\|`)
+		}
+		_, _ = fmt.Fprintf(w, "| %s |\n", strings.Join(escaped, " | "))
+	}
+	writeRow(header)
+	_, _ = fmt.Fprintln(w, "|"+strings.Repeat("---|", len(header)))
+	for _, row := range rows {
+		writeRow(row)
+	}
+}
 
 var lineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
 

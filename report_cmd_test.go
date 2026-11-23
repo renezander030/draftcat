@@ -187,3 +187,70 @@ func TestReportKeepsOddNamesInsideTheirCells(t *testing.T) {
 		t.Fatalf("--json must keep the names as recorded: %+v", rep)
 	}
 }
+
+// The Markdown report word for word, with a pipe or a line break in a cell of
+// every table: a decision (in its own table and as a column header), a
+// pipeline, a step and a tool name.
+func TestPrintOversightReportWordForWord(t *testing.T) {
+	r := oversightReport{
+		From: "2026-10-01T00:00:00Z", To: "2026-10-15T12:00:00Z", Receipts: 6, ByPerson: 4,
+		Decisions: map[string]int{"approve": 3, "odd|\nchoice": 1, "skip": 1, "timeout": 1},
+		Steps: []reportRow{
+			{Pipeline: "replies", Step: "draft|send", Decisions: map[string]int{"approve": 2, "skip": 1}},
+			{Pipeline: "re\r\nplies", Step: "check\nforged | row", Decisions: map[string]int{"approve": 1, "odd|\nchoice": 1, "timeout": 1}},
+		},
+		Operators: map[string]int{"7": 3, "8": 1},
+		Skips:     1, Reasons: 1,
+		Outcomes:  map[string]map[string]int{"fs|write": {"succeeded": 1}, "mail\rsend": {"succeeded": 2, "failed": 1}},
+		Integrity: map[string]int{"ok": 5, "unsigned": 1},
+		First:     "rcpt_a", Last: "rcpt_f", Digest: "sha256:0f",
+	}
+	want := `# Oversight report
+
+2026-10-01T00:00:00Z to 2026-10-15T12:00:00Z (UTC), all pipelines
+
+6 decision(s); 4 made by a person, the rest by configured policy or the clock.
+
+## Decisions
+
+| Decision | Count |
+|---|---|
+| approve | 3 |
+| odd\| choice | 1 |
+| skip | 1 |
+| timeout | 1 |
+
+## By pipeline and step
+
+| Pipeline | Step | approve | odd\| choice | skip | timeout |
+|---|---|---|---|---|---|
+| replies | draft\|send | 2 | 0 | 1 | 0 |
+| re plies | check forged \| row | 1 | 1 | 0 | 1 |
+
+## By operator
+
+| Operator | Decisions |
+|---|---|
+| 7 | 3 |
+| 8 | 1 |
+
+1 of 1 skip(s) carry a recorded reason.
+
+## Reported tool executions
+
+| Tool | Succeeded | Failed |
+|---|---|---|
+| fs\|write | 1 | 0 |
+| mail send | 2 | 1 |
+
+## Receipts
+
+Signatures: ok 5, unsigned 1.
+First rcpt_a, last rcpt_f; receipt ids sha256 sha256:0f.
+`
+	var out bytes.Buffer
+	printOversightReport(&out, r)
+	if out.String() != want {
+		t.Fatalf("markdown report:\n%s\nwant:\n%s", out.String(), want)
+	}
+}

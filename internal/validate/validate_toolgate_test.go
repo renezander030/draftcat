@@ -76,6 +76,29 @@ func TestToolGate_DoubleStarGlobs(t *testing.T) {
 	}
 }
 
+// The glob findings, word for word: a malformed pattern with or without a **
+// segment, and a ** pattern with a .. segment of its own. A .. segment in a
+// pattern without ** is matched by path.Match as written, so it is no finding.
+func TestToolGate_GlobFindingLines(t *testing.T) {
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "t", Args: map[string]config.ArgConstraint{
+			"a_bad":         {Glob: "[unclosed"},
+			"b_bad_tree":    {Glob: "/work/repo/[src/**"},
+			"c_parent_tree": {Glob: "/work/repo/../shared/**"},
+			"d_parent_star": {Glob: "/work/repo/../shared/*"},
+			"e_tree":        {Glob: "**/*.md"},
+		},
+	}}})
+	want := []string{
+		`tool_gate.tools[0].args.a_bad.glob: bad pattern "[unclosed"`,
+		`tool_gate.tools[0].args.b_bad_tree.glob: bad pattern "/work/repo/[src/**"`,
+		`tool_gate.tools[0].args.c_parent_tree.glob: pattern "/work/repo/../shared/**" has a .. segment, and a ** glob never matches a path with one`,
+	}
+	if strings.Join(errs, "\n") != strings.Join(want, "\n") || len(warns) != 0 {
+		t.Fatalf("glob findings:\n got errors %q warnings %q\nwant errors %q", errs, warns, want)
+	}
+}
+
 func TestToolGate_EmptyConstraintIsAnError(t *testing.T) {
 	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
 		Name: "t", Args: map[string]config.ArgConstraint{"to": {}},

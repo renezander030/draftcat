@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"path"
 	"slices"
 	"strings"
@@ -19,7 +20,7 @@ import (
 // with src/../secrets. The value is not cleaned: . and empty segments are
 // matched as written. A malformed pattern returns path.ErrBadPattern.
 func MatchGlob(pattern, value string) (bool, error) {
-	if !HasDoubleStar(pattern) {
+	if !hasDoubleStar(pattern) {
 		return path.Match(pattern, value)
 	}
 	segs := strings.Split(pattern, "/")
@@ -28,7 +29,7 @@ func MatchGlob(pattern, value string) (bool, error) {
 			return false, err
 		}
 	}
-	if HasParentSegment(value) {
+	if hasParentSegment(value) {
 		return false, nil
 	}
 	vals := strings.Split(value, "/")
@@ -56,13 +57,27 @@ func MatchGlob(pattern, value string) (bool, error) {
 	return at[len(vals)], nil
 }
 
-// HasDoubleStar reports whether a glob has a ** segment, the only kind that
+// CheckGlob reports what draftcat validate refuses in a tool-gate glob: a
+// pattern MatchGlob cannot read, or a ** pattern with a .. segment of its own,
+// which could never match. nil means every value is matched against it as
+// MatchGlob describes.
+func CheckGlob(pattern string) error {
+	if _, err := MatchGlob(pattern, ""); err != nil {
+		return fmt.Errorf("bad pattern %q", pattern)
+	}
+	if hasDoubleStar(pattern) && hasParentSegment(pattern) {
+		return fmt.Errorf("pattern %q has a .. segment, and a ** glob never matches a path with one", pattern)
+	}
+	return nil
+}
+
+// hasDoubleStar reports whether a glob has a ** segment, the only kind that
 // matches across a /.
-func HasDoubleStar(pattern string) bool {
+func hasDoubleStar(pattern string) bool {
 	return slices.Contains(strings.Split(pattern, "/"), "**")
 }
 
-// HasParentSegment reports whether a path has a .. segment, split on / or \.
-func HasParentSegment(p string) bool {
+// hasParentSegment reports whether a path has a .. segment, split on / or \.
+func hasParentSegment(p string) bool {
 	return slices.Contains(strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }), "..")
 }

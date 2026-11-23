@@ -1157,7 +1157,7 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 	}
 	if c.Glob != "" {
 		ok, err := MatchGlob(c.Glob, s)
-		if err == nil && !ok && HasDoubleStar(c.Glob) && HasParentSegment(s) {
+		if err == nil && !ok && hasDoubleStar(c.Glob) && hasParentSegment(s) {
 			return false, fmt.Sprintf("%q has a .. segment, which a ** glob never matches", clip(s))
 		}
 		if err != nil || !ok {

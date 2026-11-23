@@ -195,3 +195,24 @@ func TestGateCallers_ConsumeNeedsTheToolStillListed(t *testing.T) {
 		t.Fatalf("a listed tool is still allowed: %+v", r)
 	}
 }
+
+// A permit is spent by whoever may still call its tool: a caller that lists
+// the tool, a caller that lists no tools, and the shared token.
+func TestGateCallers_ConsumeWhileTheToolIsAllowed(t *testing.T) {
+	useReliabilityStore(t)
+	h := callersFixture(t, false)
+	for _, c := range []struct{ token, id, tool string }{
+		{"billing-token", "inv-3", "create_invoice"},
+		{"mail-token", "mail-3", "send_email"},
+		{"shared-token", "any-3", "create_invoice"},
+	} {
+		_, r := gateRequest(t, h, http.MethodPost, toolGatePath, c.token, `{"action_id":"`+c.id+`","tool":"`+c.tool+`","args":{}}`)
+		if r.State != "allowed" {
+			t.Fatalf("setup %s: %+v", c.id, r)
+		}
+		code, got := gateRequest(t, h, http.MethodPost, toolGatePath+"/"+c.id+"/consume", c.token, `{"binding_hash":"`+r.BindingHash+`"}`)
+		if code != http.StatusOK || got.Permit != "execute" || got.Rule == "caller.tools" {
+			t.Fatalf("%s consumes its permit for %s = %d %+v", c.token, c.tool, code, got)
+		}
+	}
+}

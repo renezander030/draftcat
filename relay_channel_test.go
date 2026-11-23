@@ -396,6 +396,81 @@ func TestRelayChannel_UnknownFrameKeepsGateOpen(t *testing.T) {
 	}
 }
 
+// Every accepted decision answers 200 with what it did to the gate: the quorum
+// still open (with the count so far), a repeat by the same approver (counted
+// once), or the gate closed. Approvers come back in the order they approved.
+func TestRelayChannel_AcceptedDecisionsReportQuorumProgress(t *testing.T) {
+	f := newFakeRelay(t)
+	rc, callback := newTestRelayChannel(t, f, twoOps)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out := make(chan QuorumDecision, 1)
+	go func() {
+		d, _ := rc.SendForQuorumApproval(ctx, "draft", 2, nil)
+		out <- d
+	}()
+	req := f.dispatch(t)
+	post := func(d relay.Decision) string {
+		t.Helper()
+		d.Protocol, d.ApprovalID, d.Nonce, d.PayloadHash = relay.Version, req.ApprovalID, req.Callback.Nonce, req.PayloadHash
+		resp := postDecision(t, callback, d, testRelaySecret, time.Now())
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d (%s), want 200", resp.StatusCode, body)
+		}
+		return strings.TrimSpace(string(body))
+	}
+	approve := func(id string) relay.Decision {
+		return relay.Decision{Decision: relay.ActionApprove, Approver: relay.Approver{ID: id}}
+	}
+
+	steps := []struct {
+		name string
+		d    relay.Decision
+		want string
+	}{
+		{"first approval", approve("bob@example.com"), `{"collected":1,"required":2,"resolved":false,"status":"recorded"}`},
+		{"same approver again", approve("bob@example.com"), `{"note":"duplicate approver","resolved":false,"status":"recorded"}`},
+		{"second approver", approve("alice@example.com"), `{"resolved":true,"status":"recorded"}`},
+	}
+	for _, s := range steps {
+		if got := post(s.d); got != s.want {
+			t.Fatalf("%s: body %s, want %s", s.name, got, s.want)
+		}
+	}
+	select {
+	case d := <-out:
+		if d.Action != "approve" || len(d.Approvers) != 2 || d.Approvers[0] != 222 || d.Approvers[1] != 111 {
+			t.Fatalf("got %+v, want approve by [222 111] in approval order", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate never resolved after two distinct approvals")
+	}
+
+	// An adjust closes the gate at once and names who asked for it.
+	f.mu.Lock()
+	f.got = false
+	f.mu.Unlock()
+	go func() {
+		d, _ := rc.SendForQuorumApproval(ctx, "second draft", 2, nil)
+		out <- d
+	}()
+	req = f.dispatch(t)
+	if got := post(relay.Decision{Decision: relay.ActionAdjust, Approver: relay.Approver{ID: "bob@example.com"}, AdjustText: "shorter"}); got != `{"resolved":true,"status":"recorded"}` {
+		t.Fatalf("adjust: body %s", got)
+	}
+	select {
+	case d := <-out:
+		if d.Action != "adjust" || d.Text != "shorter" || d.DeciderID != 222 {
+			t.Fatalf("got %+v, want adjust by 222 with its text", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("adjust never resolved the gate")
+	}
+}
+
 // A decision for a gate that already closed is a 409, so a relay retry is safe.
 func TestRelayChannel_ResolvedGateIsIdempotent(t *testing.T) {
 	f := newFakeRelay(t)
