@@ -856,6 +856,11 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.AllowGrants && !t.RequireApproval {
 			rep.warnf(p+".allow_grants", "tool %q never asks a human, so a grant never applies", t.Name)
 		}
+		if v := t.ApprovalWindow; v != "" {
+			if d, err := time.ParseDuration(v); err != nil || d <= 0 {
+				rep.errf(p+".approval_window", "must be a positive duration like 2m or 8h (got %q) — leave it out to use timeouts.operator_approval", v)
+			}
+		}
 		if t.MaxCallsPerDay != nil && *t.MaxCallsPerDay < 1 {
 			rep.errf(p+".max_calls_per_day", "must be 1 or more (got %d) — leave a tool out of tool_gate.tools to refuse it", *t.MaxCallsPerDay)
 		}

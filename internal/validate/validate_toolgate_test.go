@@ -152,6 +152,21 @@ func TestToolGate_NotifyOutcomesValues(t *testing.T) {
 	}
 }
 
+func TestToolGate_ApprovalWindow(t *testing.T) {
+	for _, ok := range []string{"", "90s", "2m", "8h"} {
+		errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "deploy", RequireApproval: true, ApprovalWindow: ok}}})
+		if len(errs) != 0 || len(warns) != 0 {
+			t.Fatalf("approval_window %q produced findings: errors=%v warnings=%v", ok, errs, warns)
+		}
+	}
+	for _, bad := range []string{"0", "0s", "-5m", "soon", "10"} {
+		errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "deploy", RequireApproval: true, ApprovalWindow: bad}}})
+		if !anyHas(errs, "tools[0].approval_window") {
+			t.Fatalf("approval_window %q accepted: %v", bad, errs)
+		}
+	}
+}
+
 func TestToolGate_CallCountCap(t *testing.T) {
 	n := func(i int) *int { return &i }
 	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "send_email", MaxCallsPerDay: n(50)}}})

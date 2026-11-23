@@ -86,7 +86,8 @@ type ToolCallRequest struct {
 	// the approval keeps running server-side. Ignored in async mode.
 	Wait string `json:"wait"`
 	// ExpiresAt optionally narrows the permit validity window. The gate never
-	// extends it beyond operator_approval.
+	// extends it beyond the approval window (the rule's approval_window, else
+	// operator_approval).
 	ExpiresAt string `json:"expires_at"`
 	// Precondition optionally names the state of the target the call acts on
 	// (a version, an ETag, a content digest). It is shown to the human and
@@ -257,8 +258,10 @@ func handleToolCall(cfg *config.Config, ch OperatorChannel) http.HandlerFunc {
 	return newToolGate(cfg, ch).HandleCall
 }
 
-func (g *toolGate) approvalWindow() time.Duration {
-	return g.cfg.Timeouts.OperatorApprovalWindow()
+// approvalWindow is how long a call under rule waits for a human and its
+// permit stays valid: the rule's approval_window, else operator_approval.
+func (g *toolGate) approvalWindow(rule config.ToolRule) time.Duration {
+	return rule.ApprovalWindowOr(g.cfg.Timeouts.OperatorApprovalWindow())
 }
 
 // HandleCall is POST /gate/tool-call.
@@ -334,7 +337,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 
 	rule, listed := g.cfg.ToolGate.Lookup(req.Tool)
 	policyHash := g.policyHash(req.Tool, rule, listed)
-	expires := g.now().Add(g.approvalWindow())
+	expires := g.now().Add(g.approvalWindow(rule))
 	if state != nil {
 		expires = expires.Truncate(time.Second)
 	}
@@ -512,7 +515,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		writeToolDecision(w, http.StatusAccepted, tk.pendingResponse())
 		return
 	}
-	hold := g.approvalWindow()
+	hold := g.approvalWindow(rule)
 	if wait > 0 && wait < hold {
 		hold = wait
 	}
@@ -984,7 +987,7 @@ func (g *toolGate) policyHash(tool string, rule config.ToolRule, listed bool) st
 		ApprovalWindow int64
 		Telegram       config.TelegramConfig
 		Relay          config.RelayConfig
-	}{hashToolPolicy(tool, rule, listed), g.cfg.ToolGate.Enabled, int64(g.approvalWindow()), g.cfg.Telegram, g.cfg.Relay})
+	}{hashToolPolicy(tool, rule, listed), g.cfg.ToolGate.Enabled, int64(g.approvalWindow(rule)), g.cfg.Telegram, g.cfg.Relay})
 }
 
 func hashToolPolicy(tool string, rule config.ToolRule, listed bool) string {

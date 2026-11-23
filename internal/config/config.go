@@ -929,6 +929,12 @@ type ToolRule struct {
 	// asking again. Off by default: approving one send does not approve the
 	// next, because the next one has the same side effect.
 	RememberApproval bool `yaml:"remember_approval"`
+	// ApprovalWindow is how long a call of this tool waits for a human, and
+	// how long its permit stays valid, in place of timeouts.operator_approval:
+	// short for a low-risk tool, longer for a deploy ("2m", "8h"). Omitted =
+	// operator_approval. Not part of the policy hash itself: the window it
+	// yields is, like operator_approval.
+	ApprovalWindow string `yaml:"approval_window" json:"-"`
 	// MaxCallsPerDay caps how many calls of this tool the gate allows in one
 	// UTC day. A call counts from the moment it is allowed, consumed or not,
 	// like a max_per_day total; a call past the cap is handled like a mismatch
@@ -1331,6 +1337,16 @@ func (t ToolRule) DailyCaps() []string {
 
 func (t ToolRule) argKeys() []string {
 	return slices.Sorted(maps.Keys(t.Args))
+}
+
+// ApprovalWindowOr parses approval_window; empty, unparsable, zero or
+// negative = fallback, the operator_approval window.
+func (t ToolRule) ApprovalWindowOr(fallback time.Duration) time.Duration {
+	d, _ := time.ParseDuration(t.ApprovalWindow)
+	if d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // DeniesOnMismatch reports whether an argument mismatch is refused outright

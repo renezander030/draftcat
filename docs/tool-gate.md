@@ -430,8 +430,10 @@ definition changed: inputSchema.properties.cc added; inputSchema.required +cc
 ## Collecting a decision
 
 A decision the rule settles comes back at once. A decision that needs a human
-takes as long as the human takes — up to `timeouts.operator_approval`, 4h by
-default — and an HTTP client that gives up after 30 seconds used to lose it.
+takes as long as the human takes — up to the tool's approval window
+(`timeouts.operator_approval`, 4h by default, or the rule's own
+`approval_window`, below) — and an HTTP client that gives up after 30 seconds
+used to lose it.
 Three ways to hold on:
 
 **Sync (default).** The request is held until the operator decides or the
@@ -456,6 +458,36 @@ GET /gate/tool-call/<approval_id>?wait=30s   # long-poll, capped at 100s
 An unknown id answers `404` with `decision: deny`. Durable action state remains
 queryable after restart. Work that was still pending when the process stopped
 becomes `expired`; it is never resumed from an unprovable in-memory point.
+
+### Approval window per tool
+
+A rule's `approval_window` sets that tool's window in place of
+`timeouts.operator_approval`: short for a call nobody should approve an hour
+later, long for one that waits on a person who is not always at hand.
+
+```yaml
+timeouts:
+  operator_approval: 30m
+tool_gate:
+  tools:
+    - name: restart_worker
+      risk: low
+      require_approval: true
+      approval_window: 2m      # unanswered after 2 minutes: denied
+    - name: deploy
+      risk: high
+      require_approval: true
+      approval_window: 8h      # waits a working day for a human
+    - name: send_email
+      require_approval: true   # no approval_window: operator_approval, 30m
+```
+
+The window bounds the whole call as `operator_approval` does: how long the
+human has to decide, how long a sync request is held, the `expires_at` a
+response and a relay dispatch carry, and how long an allowed permit stays
+consumable. A caller's `expires_at` can narrow it, never extend it. The window
+a call was decided under is part of its `policy_hash`. `draftcat validate`
+refuses a value that is not a positive duration (`2m`, `8h`).
 
 ## Consuming an allowed decision
 
@@ -876,6 +908,7 @@ tool_gate:
       definition_sha256: sha256:<64 hex>  # pin the tool's definition (draftcat gate hash-definition)
       definition_file: <path>.json        # or pin it to the approved definition itself; a change is named field by field
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
+      approval_window: <duration>    # this tool's approval window; default timeouts.operator_approval
       args:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,
                      review_above: …, max_per_day: …, optional: true}
