@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -306,7 +307,7 @@ func (r *RelayChannel) handleDecision(w http.ResponseWriter, req *http.Request) 
 	// 3+4+5. Nonce, payload-hash echo, approver membership, expiry, verb.
 	if err := relay.VerifyDecision(d, &gate.pending, time.Now()); err != nil {
 		log.Printf("[relay] decision rejected for %s: %v", d.ApprovalID, err)
-		if strings.Contains(err.Error(), "expired") {
+		if errors.Is(err, relay.ErrExpired) {
 			writeRelayJSON(w, http.StatusGone, map[string]any{"status": "expired"})
 			return
 		}

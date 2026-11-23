@@ -30,6 +30,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -219,6 +220,12 @@ func VerifySignature(header string, body, secret []byte, maxSkewSeconds int64, n
 	return nil
 }
 
+// ErrExpired is the one VerifyDecision refusal that means the gate's own clock
+// ran out. The callback answers it with 410, which tells a relay to close the
+// approval for good, so it is matched by identity: every other refusal (an
+// unknown verb, an unknown approver) leaves the gate open, whatever its text.
+var ErrExpired = errors.New("gate expired")
+
 // Pending is what the gate remembers about a dispatched approval so it can
 // judge the decision that comes back.
 type Pending struct {
@@ -256,7 +263,7 @@ func VerifyDecision(d *Decision, p *Pending, now time.Time) error {
 		return fmt.Errorf("payload_hash mismatch (relay showed a different draft than the gate staged)")
 	}
 	if now.After(p.ExpiresAt) {
-		return fmt.Errorf("gate expired at %s", p.ExpiresAt.UTC().Format(time.RFC3339))
+		return fmt.Errorf("%w at %s", ErrExpired, p.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	switch d.Decision {
 	case ActionApprove, ActionSkip, ActionAdjust:
