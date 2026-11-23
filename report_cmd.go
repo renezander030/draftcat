@@ -228,19 +228,23 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	_, _ = fmt.Fprintln(w, "| Decision | Count |")
 	_, _ = fmt.Fprintln(w, "|---|---|")
 	for _, d := range decisions {
-		_, _ = fmt.Fprintf(w, "| %s | %d |\n", d, r.Decisions[d])
+		_, _ = fmt.Fprintf(w, "| %s | %d |\n", mdCell(d), r.Decisions[d])
 	}
 
 	_, _ = fmt.Fprintln(w, "\n## By pipeline and step")
 	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintf(w, "| Pipeline | Step | %s |\n", strings.Join(decisions, " | "))
+	headers := make([]string, len(decisions))
+	for i, d := range decisions {
+		headers[i] = mdCell(d)
+	}
+	_, _ = fmt.Fprintf(w, "| Pipeline | Step | %s |\n", strings.Join(headers, " | "))
 	_, _ = fmt.Fprintf(w, "|---|---|%s\n", strings.Repeat("---|", len(decisions)))
 	for _, row := range r.Steps {
 		cells := make([]string, len(decisions))
 		for i, d := range decisions {
 			cells[i] = strconv.Itoa(row.Decisions[d])
 		}
-		_, _ = fmt.Fprintf(w, "| %s | %s | %s |\n", row.Pipeline, row.Step, strings.Join(cells, " | "))
+		_, _ = fmt.Fprintf(w, "| %s | %s | %s |\n", mdCell(row.Pipeline), mdCell(row.Step), strings.Join(cells, " | "))
 	}
 
 	if len(r.Operators) > 0 {
@@ -249,7 +253,7 @@ func printOversightReport(w io.Writer, r oversightReport) {
 		_, _ = fmt.Fprintln(w, "| Operator | Decisions |")
 		_, _ = fmt.Fprintln(w, "|---|---|")
 		for _, op := range slices.Sorted(maps.Keys(r.Operators)) {
-			_, _ = fmt.Fprintf(w, "| %s | %d |\n", op, r.Operators[op])
+			_, _ = fmt.Fprintf(w, "| %s | %d |\n", mdCell(op), r.Operators[op])
 		}
 	}
 	if r.Skips > 0 {
@@ -261,7 +265,7 @@ func printOversightReport(w io.Writer, r oversightReport) {
 		_, _ = fmt.Fprintln(w, "| Tool | Succeeded | Failed |")
 		_, _ = fmt.Fprintln(w, "|---|---|---|")
 		for _, tool := range slices.Sorted(maps.Keys(r.Outcomes)) {
-			_, _ = fmt.Fprintf(w, "| %s | %d | %d |\n", tool, r.Outcomes[tool]["succeeded"], r.Outcomes[tool]["failed"])
+			_, _ = fmt.Fprintf(w, "| %s | %d | %d |\n", mdCell(tool), r.Outcomes[tool]["succeeded"], r.Outcomes[tool]["failed"])
 		}
 	}
 	_, _ = fmt.Fprintln(w, "\n## Receipts")
@@ -273,3 +277,14 @@ func printOversightReport(w io.Writer, r oversightReport) {
 	_, _ = fmt.Fprintf(w, "Signatures: %s.\n", strings.Join(integrity, ", "))
 	_, _ = fmt.Fprintf(w, "First %s, last %s; receipt ids sha256 %s.\n", r.First, r.Last, r.Digest)
 }
+
+// mdCell makes s safe as one Markdown table cell. Pipeline, step and tool
+// names come from config, an agent harness or a model, so a "|" in one would
+// open an extra column and a line break would split the row; the pipe is
+// escaped and line breaks become spaces.
+func mdCell(s string) string { return strings.ReplaceAll(oneLine(s), "|", `\|`) }
+
+var lineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
+// oneLine turns line breaks into spaces, so recorded text prints on one line.
+func oneLine(s string) string { return lineBreaks.Replace(s) }

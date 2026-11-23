@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -104,5 +105,85 @@ func TestReportWindowParsing(t *testing.T) {
 		if _, _, err := reportWindow(bad[0], bad[1], now); err == nil {
 			t.Fatalf("%v should be refused", bad)
 		}
+	}
+}
+
+// A pipe in a step or tool name would open an extra column and a line break
+// would split the row, so the Markdown tables escape both; --json keeps the
+// names as recorded.
+func TestReportKeepsOddNamesInsideTheirCells(t *testing.T) {
+	secret := []byte("report-secret")
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	path, st := seedReportStore(t, secret, now)
+	at := now.Add(-2 * time.Hour)
+	for i, step := range []string{"draft|send", "check\r\nforged | row"} {
+		e := statestore.ApprovalEnvelope{ReceiptID: "rcpt_odd" + strconv.Itoa(i), Pipeline: "replies", Step: step, DecidedAt: at,
+			Decision: "approve", OperatorID: 7, PayloadHash: "sha256:" + strings.Repeat("a", 64),
+			QuorumN: 1, QuorumGot: 1, ExpiresAt: at.Add(time.Hour), Lifecycle: "decided"}
+		signApprovalEnvelope(secret, &e)
+		if err := st.RecordApprovalV2(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := statestore.ToolAction{ActionID: "act_odd", Tool: "fs|write", ArgsHash: "args", PolicyHash: "policy", BindingHash: "binding",
+		CreatedAt: at, UpdatedAt: at, ExpiresAt: at.Add(time.Hour)}
+	if _, _, err := st.ReserveToolAction(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DecideToolAction(a.ActionID, "allowed", "allow", "approved", "operator", at); err != nil {
+		t.Fatal(err)
+	}
+	consume := statestore.ApprovalEnvelope{ReceiptID: "rcpt_odd_consume", ActionID: a.ActionID, Pipeline: "tool-gate", Step: a.Tool,
+		PayloadHash: a.ArgsHash, PolicyHash: a.PolicyHash, BindingHash: a.BindingHash, ExpiresAt: a.ExpiresAt, DecidedAt: at,
+		Decision: "consume", Lifecycle: "consume"}
+	signApprovalEnvelope(secret, &consume)
+	if _, ok, err := st.ConsumeToolActionWithReceipt(a.ActionID, a.BindingHash, at, consume); err != nil || !ok {
+		t.Fatalf("consume=%v %v", ok, err)
+	}
+	if _, ok, err := st.CompleteToolAction(statestore.ToolOutcome{ActionID: a.ActionID, BindingHash: a.BindingHash, Status: "succeeded", ResultHash: "sha256:r", CompletedAt: at}); err != nil || !ok {
+		t.Fatalf("complete=%v %v", ok, err)
+	}
+	t.Setenv("DRAFTCAT_STATE_PATH", path)
+	t.Setenv("DRAFTCAT_APPROVAL_SECRET", string(secret))
+
+	var out, errOut bytes.Buffer
+	if code := reportCmd(nil, &out, &errOut, now); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	text := out.String()
+	// Every row of a table has its header's cells; a pipe after a backslash
+	// is part of a cell, as in GitHub Markdown.
+	cells := func(row string) int { return strings.Count(row, "|") - strings.Count(row, `\|`) }
+	header := -1
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case line == "":
+			header = -1
+		case header < 0 && strings.HasPrefix(line, "| "):
+			header = cells(line)
+		case header >= 0 && (!strings.HasPrefix(line, "|") || cells(line) != header):
+			t.Fatalf("table row %q does not match its header's %d delimiters:\n%s", line, header, text)
+		}
+	}
+	for _, want := range []string{`| replies | draft\|send | 1 | 0 | 0 | 0 | 0 |`, `| replies | check forged \| row | 1 | 0 | 0 | 0 | 0 |`, `| fs\|write | 1 | 0 |`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("markdown report lacks %q:\n%s", want, text)
+		}
+	}
+
+	out.Reset()
+	if code := reportCmd([]string{"--json"}, &out, &errOut, now); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	var rep oversightReport
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	steps := map[string]bool{}
+	for _, s := range rep.Steps {
+		steps[s.Step] = true
+	}
+	if !steps["draft|send"] || !steps["check\r\nforged | row"] || rep.Outcomes["fs|write"]["succeeded"] != 1 {
+		t.Fatalf("--json must keep the names as recorded: %+v", rep)
 	}
 }

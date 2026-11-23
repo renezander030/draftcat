@@ -348,7 +348,7 @@ func runTestPipeline(cfg *config.Config, p config.PipelineConfig, skills *skills
 }
 
 func truncateOneLine(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
+	s = oneLine(s)
 	if len(s) <= n {
 		return s
 	}
