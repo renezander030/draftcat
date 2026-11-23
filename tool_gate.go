@@ -661,6 +661,18 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
+	// A caller spends a permit only while it may still call the tool: a
+	// restart that took the tool off its list ends what it was approved for
+	// before. The permit is left unspent, and the operator is told.
+	if c := gateCallerFrom(r.Context()); c != nil && !c.Allows(a.Tool) {
+		deny := callerDenial(c, a.Tool)
+		log.Printf("[tool-gate] DENY consume %s (not in the caller's tools) agent=%q", a.Tool, a.Agent)
+		g.notifyDenial(ToolCallRequest{Agent: a.Agent, Tool: a.Tool, argsHash: a.ArgsHash}, deny.Class, deny.Reason)
+		resp.Permit, resp.Consume = "", ""
+		resp.Decision, resp.Rule, resp.Reason = deny.Decision, deny.Rule, deny.Reason
+		writeToolDecision(w, http.StatusConflict, resp)
+		return
+	}
 	if ok, why := preconditionHolds(a, body.Precondition); !ok {
 		g.refuseConsume(id, why)
 		resp.Permit, resp.Rule, resp.Reason = "", "precondition_failed", why

@@ -142,3 +142,44 @@ func TestGateCallers_SignatureUsesTheCallerKey(t *testing.T) {
 		t.Fatalf("a body signed with the caller's token is accepted, got %d", code)
 	}
 }
+
+// A caller's permit is spent only while the caller may still call the tool: a
+// restart that takes a tool off its list ends what it was approved for before,
+// and the operator hears of the refusal.
+func TestGateCallers_ConsumeNeedsTheToolStillListed(t *testing.T) {
+	useReliabilityStore(t)
+	t.Setenv("GATE_TOKEN_BILLING", "billing-token")
+	serve := func(tools ...string) (http.Handler, *countingChannel) {
+		cfg := gateCfg(config.ToolRule{Name: "create_invoice", RequireApproval: true}, config.ToolRule{Name: "send_email"})
+		cfg.ToolGate.Callers = []config.GateCaller{{Name: "billing-agent", TokenEnv: "GATE_TOKEN_BILLING", Tools: tools}}
+		ch := &countingChannel{stubApprovalChannel: stubApprovalChannel{action: "approve"}}
+		gate := newToolGate(cfg, ch)
+		auth := newGateAuthenticator([]byte("shared-token"), cfg.ToolGate).middleware(1<<20, 300, false)
+		mux := http.NewServeMux()
+		mux.Handle(toolGatePath, auth(http.HandlerFunc(gate.HandleCall)))
+		mux.Handle(toolGatePath+"/", auth(http.HandlerFunc(gate.HandleStatus)))
+		return mux, ch
+	}
+	before, _ := serve("create_invoice", "send_email")
+	_, r := gateRequest(t, before, http.MethodPost, toolGatePath, "billing-token", `{"action_id":"inv-9","tool":"create_invoice","args":{"amount":900}}`)
+	if r.State != "allowed" {
+		t.Fatalf("setup: the operator approves: %+v", r)
+	}
+
+	after, ch := serve("send_email")
+	consume := `{"binding_hash":"` + r.BindingHash + `"}`
+	code, c := gateRequest(t, after, http.MethodPost, toolGatePath+"/inv-9/consume", "billing-token", consume)
+	if code != http.StatusConflict || c.Permit != "" || c.Consume != "" || c.Decision != "deny" || c.Rule != "caller.tools" {
+		t.Fatalf("consume once the tool left the caller's list = %d %+v", code, c)
+	}
+	if ch.noticeCount() != 1 || !strings.Contains(ch.notices[0], "caller billing-agent may not call create_invoice") {
+		t.Fatalf("the operator is told: %q", ch.notices)
+	}
+	if a, err := state.ToolAction("inv-9"); err != nil || a.Status != "allowed" {
+		t.Fatalf("the refused permit is not spent: %+v %v", a, err)
+	}
+	// The caller's other tools are unaffected.
+	if _, r := gateRequest(t, after, http.MethodPost, toolGatePath, "billing-token", `{"action_id":"mail-9","tool":"send_email","args":{}}`); r.Decision != "allow" {
+		t.Fatalf("a listed tool is still allowed: %+v", r)
+	}
+}

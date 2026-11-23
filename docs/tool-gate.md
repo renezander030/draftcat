@@ -612,7 +612,9 @@ A grant does not cover:
   `max_calls_per_day` — those still reach a human (`review_above` never
   applies on a rule with `require_approval`, which already asks every time);
 - a high-risk tool — `draftcat validate` refuses `allow_grants` on one;
-- a rule that no longer has `allow_grants` — its grants stop applying.
+- a rule that no longer has `allow_grants` — its grants stop applying;
+- an operator who is no longer in `telegram.security.allowed_users` — the
+  grants they issued stop applying, and their calls reach a human again.
 
 A grant lasts between 1 minute and 24 hours and covers at most 1000 calls
 (1000 when no count is given). Grants live in the state store and survive a
@@ -745,16 +747,22 @@ A request with a caller's token is made as that caller:
 
 - its `agent` is the caller's name, recorded on the action and bound into the
   permit; a request that names a different agent is refused with `403`;
-- a tool outside its `tools` is denied with `rule: caller.tools`;
+- a tool outside its `tools` is denied with `rule: caller.tools`, and so is
+  the consume of a permit for a tool it no longer lists: a restart that takes
+  a tool off its `tools` ends what the caller was approved for before
+  (`409`, the permit stays unspent, the operator gets the denial notice);
 - `GET`, `consume`, `revoke` and `complete` reach only the actions it asked
   for, and any other id answers `404`;
 - a signed request is signed with the caller's own token.
 
-Removing a caller, or unsetting its variable, withdraws that one token. The
-webhook token keeps working on the gate for every listed tool unless
-`require_caller: true`. Caller tokens are redacted from logs and notices like
-every other credential. `draftcat validate` refuses duplicate names and shared
-variables, and `draftcat doctor` warns about a caller whose variable is empty.
+Removing a caller, or unsetting its variable, withdraws that one token at
+the next restart (a reload names `tool_gate` as changed and keeps the running
+callers): its calls still waiting on a human close as `expired`, and its token
+is refused on every request, consume included. The webhook token keeps
+working on the gate for every listed tool unless `require_caller: true`.
+Caller tokens are redacted from logs and notices like every other credential.
+`draftcat validate` refuses duplicate names and shared variables, and
+`draftcat doctor` warns about a caller whose variable is empty.
 
 ## Reading the budget
 

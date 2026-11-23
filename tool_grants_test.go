@@ -14,10 +14,40 @@ func grantableEmail() config.ToolRule {
 	return config.ToolRule{Name: "send_email", RequireApproval: true, AllowGrants: true}
 }
 
+// grantsBy names the operators a test's grants may come from, as
+// telegram.security.allowed_users does in the engine.
+func grantsBy(cfg *config.Config, operators ...int64) *config.Config {
+	cfg.Telegram.Security.AllowedUsers = operators
+	return cfg
+}
+
+// A grant stands for its operator's word, so it ends with the operator: after a
+// restart without them in allowed_users its calls go to a human again, and no
+// use is taken from it.
+func TestStandingGrantEndsWithItsOperator(t *testing.T) {
+	st := useReliabilityStore(t)
+	ch := &recordingApprovalChannel{action: "skip"}
+	before := grantsBy(gateCfg(grantableEmail()), 9, 222)
+	if msg := grantCommand("/grant", "send_email 2h 10", 222, before.ToolGate, time.Now()); !strings.HasPrefix(msg, "Granted g_") {
+		t.Fatalf("grant: %s", msg)
+	}
+	after := grantsBy(gateCfg(grantableEmail()), 9)
+	if _, r := postGate(t, newToolGate(after, ch), `{"action_id":"r-1","tool":"send_email","args":{}}`); r.DecidedBy != "operator" || len(ch.drafts) != 1 {
+		t.Fatalf("a removed operator's grant must not release the call: %+v", r)
+	}
+	if grants, err := st.ToolGrants(time.Now(), false); err != nil || len(grants) != 1 || grants[0].Uses != 0 {
+		t.Fatalf("no use is taken from it: %+v %v", grants, err)
+	}
+	// While the operator is allowed, the same grant answers.
+	if _, r := postGate(t, newToolGate(before, ch), `{"action_id":"r-2","tool":"send_email","args":{}}`); r.DecidedBy != "grant" {
+		t.Fatalf("the grant applies while its operator is allowed: %+v", r)
+	}
+}
+
 func TestStandingGrantReleasesBoundedCalls(t *testing.T) {
 	st := useReliabilityStore(t)
 	ch := &recordingApprovalChannel{action: "skip"}
-	cfg := gateCfg(grantableEmail())
+	cfg := grantsBy(gateCfg(grantableEmail()), 4242)
 	if msg := grantCommand("/grant", "send_email 1h 2", 4242, cfg.ToolGate, time.Now()); !strings.HasPrefix(msg, "Granted g_") {
 		t.Fatalf("grant: %s", msg)
 	}
@@ -59,7 +89,7 @@ func TestStandingGrantDoesNotCoverEscalations(t *testing.T) {
 	rule := grantableEmail()
 	rule.Args = map[string]config.ArgConstraint{"to": glob("*@example.com")}
 	rule.MaxCallsPerDay = intp(1)
-	cfg := gateCfg(rule)
+	cfg := grantsBy(gateCfg(rule), 1)
 	grantCommand("/grant", "send_email 1h 10", 1, cfg.ToolGate, time.Now())
 	g := newToolGate(cfg, ch)
 	if _, r := postGate(t, g, `{"action_id":"e-1","tool":"send_email","args":{"to":"anna@example.com"}}`); r.DecidedBy != "grant" {
@@ -79,7 +109,7 @@ func TestStandingGrantDoesNotCoverEscalations(t *testing.T) {
 func TestStandingGrantScopeAndRevocation(t *testing.T) {
 	useReliabilityStore(t)
 	ch := &recordingApprovalChannel{action: "skip"}
-	cfg := gateCfg(grantableEmail())
+	cfg := grantsBy(gateCfg(grantableEmail()), 9)
 	msg := grantCommand("/grant", "send_email 30m 5 inbox", 9, cfg.ToolGate, time.Now())
 	id := strings.Fields(strings.TrimPrefix(msg, "Granted "))[0]
 	g := newToolGate(cfg, ch)
@@ -100,7 +130,7 @@ func TestStandingGrantScopeAndRevocation(t *testing.T) {
 	}
 	// The rule losing allow_grants ends what its grants release.
 	grantCommand("/grant", "send_email 30m 5", 9, cfg.ToolGate, time.Now())
-	off := gateCfg(config.ToolRule{Name: "send_email", RequireApproval: true})
+	off := grantsBy(gateCfg(config.ToolRule{Name: "send_email", RequireApproval: true}), 9)
 	if _, r := postGate(t, newToolGate(off, ch), `{"action_id":"s-4","tool":"send_email","args":{}}`); r.DecidedBy != "operator" {
 		t.Fatalf("a rule without allow_grants ignores grants: %+v", r)
 	}
@@ -108,7 +138,7 @@ func TestStandingGrantScopeAndRevocation(t *testing.T) {
 
 func TestStandingGrantLastUseIsTakenOnce(t *testing.T) {
 	useReliabilityStore(t)
-	cfg := gateCfg(grantableEmail())
+	cfg := grantsBy(gateCfg(grantableEmail()), 1)
 	grantCommand("/grant", "send_email 1h 3", 1, cfg.ToolGate, time.Now())
 	g := newToolGate(cfg, &recordingApprovalChannel{action: "skip"})
 	var mu sync.Mutex

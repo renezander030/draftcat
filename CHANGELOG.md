@@ -3,6 +3,7 @@
 ## 0.16.0
 
 - An approval that timed out now writes its deny receipt (reason `approval timed out`), and a request the tool gate refuses without deciding writes a signed v2 receipt too (`decision: deny`, operator 0, `lifecycle: refused`, the reason in `policy`): malformed or unknown-field JSON, an invalid `action_id`, `mode`, `wait`, `precondition` or `expires_at`, no tool named, an `agent` that is not the caller token's name, an `action_id` bound to other data, and a consume refused while frozen, with another binding, a failed precondition or a permit already used. Responses are unchanged; a request without an accepted token writes none.
+- A standing grant releases calls only while the operator who issued it is still in `telegram.security.allowed_users`: removing an operator ends their grants, and their calls reach a human again. A caller's permit is consumed only while the caller still lists the tool: a restart that narrows its `tools` refuses the consume of an earlier permit (`409`, `rule: caller.tools`, permit unspent) and sends the operator the denial notice.
 
 ## 0.15.1
 

@@ -20,7 +20,7 @@ func freezeStore(t *testing.T) (string, *statestore.StateStore) {
 func TestFreezeDeniesDecisionRefusesConsumeAndIgnoresGrants(t *testing.T) {
 	_, st := freezeStore(t)
 	ch := &recordingApprovalChannel{action: "approve"}
-	cfg := gateCfg(config.ToolRule{Name: "read_file"}, grantableEmail())
+	cfg := grantsBy(gateCfg(config.ToolRule{Name: "read_file"}, grantableEmail()), 7)
 	g := newToolGate(cfg, ch)
 
 	// An allowed permit issued before the freeze, and a live grant.

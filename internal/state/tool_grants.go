@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -48,19 +49,29 @@ func (s *StateStore) CreateToolGrant(g ToolGrant) error {
 	return err
 }
 
-// UseToolGrant takes one use of a live grant that covers this tool and agent,
-// the one expiring first, and returns it with the use counted. The use is
-// taken in one conditional update, so two calls cannot share the last use.
-// ok is false when no grant covers the call.
-func (s *StateStore) UseToolGrant(tool, agent string, now time.Time) (ToolGrant, bool, error) {
+// UseToolGrant takes one use of a live grant that covers this tool and agent
+// and was issued by one of operators, the one expiring first, and returns it
+// with the use counted. The use is taken in one conditional update, so two
+// calls cannot share the last use. ok is false when no grant covers the call;
+// with no operators, none does.
+func (s *StateStore) UseToolGrant(tool, agent string, operators []int64, now time.Time) (ToolGrant, bool, error) {
 	if s == nil || s.db == nil {
 		return ToolGrant{}, false, ErrNoStore
 	}
+	if len(operators) == 0 {
+		return ToolGrant{}, false, nil
+	}
+	args := []interface{}{tool, agent, now.Unix()}
+	for _, id := range operators {
+		args = append(args, id)
+	}
+	by := strings.TrimSuffix(strings.Repeat("?,", len(operators)), ",")
 	for attempt := 0; attempt < 3; attempt++ {
 		row := s.db.QueryRowContext(context.Background(),
 			`SELECT `+toolGrantColumns+` FROM tool_grants
 			 WHERE tool = ? AND (agent = '' OR agent = ?) AND revoked_at = 0 AND expires_at > ? AND uses < max_uses
-			 ORDER BY expires_at, grant_id LIMIT 1`, tool, agent, now.Unix())
+			 AND granted_by IN (`+by+`)
+			 ORDER BY expires_at, grant_id LIMIT 1`, args...)
 		g, err := scanToolGrant(row.Scan)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ToolGrant{}, false, nil
