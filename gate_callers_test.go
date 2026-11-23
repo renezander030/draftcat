@@ -175,6 +175,18 @@ func TestGateCallers_ConsumeNeedsTheToolStillListed(t *testing.T) {
 	if ch.noticeCount() != 1 || !strings.Contains(ch.notices[0], "caller billing-agent may not call create_invoice") {
 		t.Fatalf("the operator is told: %q", ch.notices)
 	}
+	// the refused consume leaves its receipt, as every refused consume does
+	refused := false
+	if rows, err := state.ApprovalsForPipeline("tool-gate", 100); err == nil {
+		for _, row := range rows {
+			if row.ActionID == "inv-9" && row.Decision == "deny" && strings.HasPrefix(row.Policy, "permit not consumed") {
+				refused = true
+			}
+		}
+	}
+	if !refused {
+		t.Fatalf("the refused consume left no receipt")
+	}
 	if a, err := state.ToolAction("inv-9"); err != nil || a.Status != "allowed" {
 		t.Fatalf("the refused permit is not spent: %+v %v", a, err)
 	}

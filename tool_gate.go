@@ -669,6 +669,7 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	// before. The permit is left unspent, and the operator is told.
 	if c := gateCallerFrom(r.Context()); c != nil && !c.Allows(a.Tool) {
 		deny := callerDenial(c, a.Tool)
+		g.refuseConsume(id, deny.Reason) // a receipt, as for every other refused consume
 		log.Printf("[tool-gate] DENY consume %s (not in the caller's tools) agent=%q", a.Tool, a.Agent)
 		g.notifyDenial(ToolCallRequest{Agent: a.Agent, Tool: a.Tool, argsHash: a.ArgsHash}, deny.Class, deny.Reason)
 		resp.Permit, resp.Consume = "", ""
