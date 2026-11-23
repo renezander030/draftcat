@@ -149,6 +149,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkTimeouts(cfg, rep)
 	checkBudgetAlerts(cfg, rep)
 	checkReserveMaxCost(cfg, rep)
+	checkPromptCache(cfg, rep)
 	checkReceiptAnchor(cfg, rep)
 	checkVoiceCallCaps(cfg, rep)
 	checkRolesToModels(cfg, rep)
@@ -443,6 +444,22 @@ func checkReserveMaxCost(cfg *config.Config, rep *validateReport) {
 			}
 		}
 		warnRoles(path, roles)
+	}
+}
+
+// checkPromptCache warns where prompt_cache is set but no marker is sent: it
+// applies to anthropic/ models on OpenRouter only.
+func checkPromptCache(cfg *config.Config, rep *validateReport) {
+	names := make([]string, 0, len(cfg.Models))
+	for n := range cfg.Models {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		m := cfg.Models[n]
+		if m.PromptCache && !cfg.Provider.CachesPrompt(m) {
+			rep.warnf("models."+n+".prompt_cache", "has no effect: prompt caching is sent for anthropic/ models on OpenRouter only")
+		}
 	}
 }
 

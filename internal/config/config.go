@@ -301,6 +301,28 @@ type ModelConfig struct {
 	MaxTokens int     `yaml:"max_tokens"`
 	CostIn    float64 `yaml:"cost_per_1k_input"`
 	CostOut   float64 `yaml:"cost_per_1k_output"`
+	// PromptCache marks the part of an AI step's prompt that is the same on
+	// every run (the prompt up to its first {{placeholder}}) for Anthropic
+	// prompt caching. A call that starts with the same instructions within
+	// five minutes reads them at a tenth of the input price; the call that
+	// writes them pays 1.25x. Off by default: a step that runs less often than
+	// that only pays the write. Applies to anthropic/ models on OpenRouter;
+	// any other model or provider is sent the plain prompt as before.
+	PromptCache bool `yaml:"prompt_cache"`
+}
+
+// IsAnthropic reports whether the model id names an Anthropic model on
+// OpenRouter: "anthropic/claude-…", or a "~anthropic/…" latest alias.
+func (m ModelConfig) IsAnthropic() bool {
+	id := strings.ToLower(strings.TrimSpace(m.Model))
+	return strings.HasPrefix(strings.TrimPrefix(id, "~"), "anthropic/")
+}
+
+// CachesPrompt reports whether calls to the model carry a prompt cache
+// marker: prompt_cache is on, the model is Anthropic's and the provider is
+// OpenRouter. Other OpenAI-compatible servers reject unknown request fields.
+func (p ProviderConfig) CachesPrompt(m ModelConfig) bool {
+	return m.PromptCache && m.IsAnthropic() && p.IsOpenRouter()
 }
 
 // Priced reports whether the model carries a per-1k price.

@@ -220,12 +220,14 @@ type CompletionResponse struct {
 	Text         string
 	InputTokens  int
 	OutputTokens int
-	// CachedTokens and ReasoningTokens are the provider's breakdown when it
-	// reports one (OpenRouter usage accounting); zero otherwise.
-	CachedTokens    int
-	ReasoningTokens int
-	LatencyMs       int64
-	CostUSD         float64
+	// CachedTokens, CacheWriteTokens and ReasoningTokens are the provider's
+	// breakdown when it reports one (OpenRouter usage accounting); zero
+	// otherwise. They are part of InputTokens and OutputTokens, not extra.
+	CachedTokens     int
+	CacheWriteTokens int
+	ReasoningTokens  int
+	LatencyMs        int64
+	CostUSD          float64
 	// CostSource says where CostUSD came from: "provider" when the response
 	// carried the real charge, "rates" when it was computed from the
 	// configured per-1k prices.
@@ -308,8 +310,8 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 
 	reqBody := map[string]interface{}{
 		"model": modelCfg.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": promptContent(ctx, cfg, modelCfg, prompt)},
 		},
 		"max_tokens": maxTokens,
 	}
@@ -391,7 +393,8 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 			CompletionTokens    *int     `json:"completion_tokens"`
 			Cost                *float64 `json:"cost"`
 			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
 			} `json:"prompt_tokens_details"`
 			CompletionTokensDetails struct {
 				ReasoningTokens int `json:"reasoning_tokens"`
@@ -407,15 +410,19 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 	}
 	inputTokens, outputTokens := *result.Usage.PromptTokens, *result.Usage.CompletionTokens
 	if inputTokens < 0 || outputTokens < 0 || inputTokens > int(^uint(0)>>1)-outputTokens ||
-		result.Usage.PromptTokensDetails.CachedTokens < 0 || result.Usage.CompletionTokensDetails.ReasoningTokens < 0 ||
+		result.Usage.PromptTokensDetails.CachedTokens < 0 || result.Usage.PromptTokensDetails.CacheWriteTokens < 0 ||
+		result.Usage.CompletionTokensDetails.ReasoningTokens < 0 ||
 		(result.Usage.Cost != nil && !validCost(*result.Usage.Cost)) {
 		return nil, providerError(fmt.Errorf("LLM response contains invalid usage; reconciliation required"), true)
 	}
 
 	// The configured rates are the fallback. When the provider states what it
 	// actually charged, the caps are enforced on that number — rates alone
-	// undercount reasoning tokens and overcount cached ones.
+	// undercount reasoning tokens and overcount cached ones. A cache write is
+	// billed above the input price, so rates add that premium for the tokens
+	// written; cache reads stay at the full input price.
 	cost := float64(inputTokens)/1000*modelCfg.CostIn +
+		float64(result.Usage.PromptTokensDetails.CacheWriteTokens)/1000*modelCfg.CostIn*cacheWritePremium +
 		float64(outputTokens)/1000*modelCfg.CostOut
 	source := "rates"
 	if usageAccounting && result.Usage.Cost != nil {
@@ -427,15 +434,16 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 		return nil, providerError(fmt.Errorf("LLM response cost is invalid; reconciliation required"), true)
 	}
 	completion := &CompletionResponse{
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		CachedTokens:    result.Usage.PromptTokensDetails.CachedTokens,
-		ReasoningTokens: result.Usage.CompletionTokensDetails.ReasoningTokens,
-		LatencyMs:       latency,
-		CostUSD:         cost,
-		CostSource:      source,
-		Model:           result.Model,
-		Attempts:        attempts,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		CachedTokens:     result.Usage.PromptTokensDetails.CachedTokens,
+		CacheWriteTokens: result.Usage.PromptTokensDetails.CacheWriteTokens,
+		ReasoningTokens:  result.Usage.CompletionTokensDetails.ReasoningTokens,
+		LatencyMs:        latency,
+		CostUSD:          cost,
+		CostSource:       source,
+		Model:            result.Model,
+		Attempts:         attempts,
 	}
 	if len(result.Choices) == 0 {
 		return completion, fmt.Errorf("LLM returned no choices")
@@ -1352,6 +1360,14 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				prompt = strings.ReplaceAll(prompt, "{{"+k+"}}", v)
 			}
 
+			// Up to its first remaining placeholder the prompt is the same on
+			// every run of this step; that part is what a prompt cache can
+			// serve again. Pipeline data only ever lands at or after it.
+			stable := prompt
+			if i := strings.Index(prompt, "{{"); i >= 0 {
+				stable = prompt[:i]
+			}
+
 			// Inject pipeline data
 			for k, v := range data {
 				prompt = strings.ReplaceAll(prompt, "{{"+k+"}}", fmt.Sprintf("%v", v))
@@ -1377,7 +1393,8 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			)
 			for attempt := 0; ; attempt++ {
 				aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
-				r, err := callLLM(aiCtx, cfg, role, callPrompt, budget)
+				// a retry keeps the same fixed instructions first, so it reads them from the prompt cache too
+				r, err := callLLM(withStablePrefix(aiCtx, stable), cfg, role, callPrompt, budget)
 				aiCancel()
 				if err != nil {
 					if attempt > 0 {
@@ -1391,6 +1408,10 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
 					pipeline.Name, step.Name, resp.Model,
 					resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
+				if resp.CachedTokens > 0 || resp.CacheWriteTokens > 0 {
+					log.Printf("[pipeline:%s][step:%s] prompt cache: %d input token(s) read, %d written",
+						pipeline.Name, step.Name, resp.CachedTokens, resp.CacheWriteTokens)
+				}
 				tokens += resp.InputTokens + resp.OutputTokens
 				cost += resp.CostUSD
 

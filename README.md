@@ -292,6 +292,15 @@ observability: {spans: false}   # or DRAFTCAT_TRACE=1
 state:         {path: ./state.db}
 ```
 
+A step that sends the same long instructions on every run can have them
+cached by an Anthropic model: `prompt_cache: true` on the model marks the
+step's prompt up to its first `{{placeholder}}` for Anthropic prompt caching.
+Runs that start with the same instructions within five minutes read them at a
+tenth of the input price; the run that writes them pays 1.25x, so it is off by
+default. It applies to `anthropic/` models on OpenRouter; every other model is
+sent the plain prompt. Without a provider-reported charge, the cost caps count
+cache writes at the write price.
+
 An approval step can narrow who may decide it:
 
 ```yaml
