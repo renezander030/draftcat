@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -49,18 +50,55 @@ type RelayChannel struct {
 // met, and any skip or adjust resolves the gate immediately — the same
 // semantics the Telegram quorum gate already uses.
 type relayGate struct {
-	pending   relay.Pending
-	need      int
+	pending relay.Pending
+	need    int
+	done    chan QuorumDecision
+	once    sync.Once
+
+	mu        sync.Mutex // guards approvers and seen
 	approvers []int64
 	seen      map[string]bool
-	done      chan QuorumDecision
-	once      sync.Once
 }
 
 // resolve delivers the final decision exactly once. Later callbacks for the
 // same gate get a 409 from the handler rather than racing on a closed channel.
 func (g *relayGate) resolve(d QuorumDecision) {
 	g.once.Do(func() { g.done <- d })
+}
+
+// record applies one decision that passed relay.VerifyDecision, from operator
+// opID, and returns the body of its 200 answer. A skip or an adjust resolves
+// the gate at once; an approval counts once per approver identity and resolves
+// the gate when the quorum is met.
+func (g *relayGate) record(d *relay.Decision, opID int64) map[string]any {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	switch d.Decision {
+	case relay.ActionSkip:
+		g.resolve(QuorumDecision{Action: "skip", Text: strings.TrimSpace(d.Reason), DeciderID: opID})
+		return map[string]any{"status": "recorded", "resolved": true}
+	case relay.ActionAdjust:
+		g.resolve(QuorumDecision{Action: "adjust", Text: d.AdjustText, DeciderID: opID})
+		return map[string]any{"status": "recorded", "resolved": true}
+	}
+
+	// Approve. Quorum counts DISTINCT approvers: one person tapping twice does
+	// not satisfy a two-of-three gate.
+	if g.seen[d.Approver.ID] {
+		return map[string]any{"status": "recorded", "resolved": false, "note": "duplicate approver"}
+	}
+	g.seen[d.Approver.ID] = true
+	g.approvers = append(g.approvers, opID)
+
+	if len(g.seen) >= g.need {
+		g.resolve(QuorumDecision{Action: "approve", Approvers: append([]int64(nil), g.approvers...)})
+		return map[string]any{"status": "recorded", "resolved": true}
+	}
+	return map[string]any{
+		"status": "recorded", "resolved": false,
+		"collected": len(g.seen), "required": g.need,
+	}
 }
 
 // NewRelayChannel builds the channel and starts its callback server. The server
@@ -306,7 +344,7 @@ func (r *RelayChannel) handleDecision(w http.ResponseWriter, req *http.Request) 
 	// 3+4+5. Nonce, payload-hash echo, approver membership, expiry, verb.
 	if err := relay.VerifyDecision(d, &gate.pending, time.Now()); err != nil {
 		log.Printf("[relay] decision rejected for %s: %v", d.ApprovalID, err)
-		if strings.Contains(err.Error(), "expired") {
+		if errors.Is(err, relay.ErrExpired) {
 			writeRelayJSON(w, http.StatusGone, map[string]any{"status": "expired"})
 			return
 		}
@@ -321,38 +359,7 @@ func (r *RelayChannel) handleDecision(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	switch d.Decision {
-	case relay.ActionSkip:
-		gate.resolve(QuorumDecision{Action: "skip", Text: strings.TrimSpace(d.Reason), DeciderID: opID})
-		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": true})
-		return
-	case relay.ActionAdjust:
-		gate.resolve(QuorumDecision{Action: "adjust", Text: d.AdjustText, DeciderID: opID})
-		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": true})
-		return
-	}
-
-	// Approve. Quorum counts DISTINCT approvers: one person tapping twice does
-	// not satisfy a two-of-three gate.
-	if gate.seen[d.Approver.ID] {
-		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": false, "note": "duplicate approver"})
-		return
-	}
-	gate.seen[d.Approver.ID] = true
-	gate.approvers = append(gate.approvers, opID)
-
-	if len(gate.seen) >= gate.need {
-		gate.resolve(QuorumDecision{Action: "approve", Approvers: append([]int64(nil), gate.approvers...)})
-		writeRelayJSON(w, http.StatusOK, map[string]any{"status": "recorded", "resolved": true})
-		return
-	}
-	writeRelayJSON(w, http.StatusOK, map[string]any{
-		"status": "recorded", "resolved": false,
-		"collected": len(gate.seen), "required": gate.need,
-	})
+	writeRelayJSON(w, http.StatusOK, gate.record(d, opID))
 }
 
 func writeRelayJSON(w http.ResponseWriter, code int, payload map[string]any) {

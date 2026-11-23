@@ -35,6 +35,7 @@ models:
     max_tokens: 4096
     cost_per_1k_input: 0.0001
     cost_per_1k_output: 0.0005
+    # prompt_cache: true          # cache a step's fixed instructions (Anthropic on OpenRouter)
   gpt-4o-mini:
     model: openai/gpt-4o-mini
     max_tokens: 1024

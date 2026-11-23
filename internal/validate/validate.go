@@ -6,7 +6,6 @@ import (
 	"maps"
 	"math"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -150,6 +149,7 @@ func runChecks(cfg *config.Config, skillsDir string, rep *validateReport) {
 	checkTimeouts(cfg, rep)
 	checkBudgetAlerts(cfg, rep)
 	checkReserveMaxCost(cfg, rep)
+	checkPromptCache(cfg, rep)
 	checkReceiptAnchor(cfg, rep)
 	checkVoiceCallCaps(cfg, rep)
 	checkRolesToModels(cfg, rep)
@@ -447,6 +447,22 @@ func checkReserveMaxCost(cfg *config.Config, rep *validateReport) {
 	}
 }
 
+// checkPromptCache warns where prompt_cache is set but no marker is sent: it
+// applies to anthropic/ models on OpenRouter only.
+func checkPromptCache(cfg *config.Config, rep *validateReport) {
+	names := make([]string, 0, len(cfg.Models))
+	for n := range cfg.Models {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		m := cfg.Models[n]
+		if m.PromptCache && !cfg.Provider.CachesPrompt(m) {
+			rep.warnf("models."+n+".prompt_cache", "has no effect: prompt caching is sent for anthropic/ models on OpenRouter only")
+		}
+	}
+}
+
 func checkRolesToModels(cfg *config.Config, rep *validateReport) {
 	for role, model := range cfg.Roles {
 		if _, ok := cfg.Models[model]; !ok {
@@ -556,6 +572,7 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 			case "ai":
 				aiSteps++
 				checkOutputSchema(st.OutputSchema, spath, rep)
+				checkOutputRetries(st, skills, spath, rep)
 				if st.Skill == "" && st.Prompt == "" {
 					rep.errf(spath, "ai step needs either 'skill' or inline 'prompt'")
 				}
@@ -856,6 +873,11 @@ func checkToolGate(cfg *config.Config, rep *validateReport) {
 		if t.AllowGrants && !t.RequireApproval {
 			rep.warnf(p+".allow_grants", "tool %q never asks a human, so a grant never applies", t.Name)
 		}
+		if v := t.ApprovalWindow; v != "" {
+			if d, err := time.ParseDuration(v); err != nil || d <= 0 {
+				rep.errf(p+".approval_window", "must be a positive duration like 2m or 8h (got %q) — leave it out to use timeouts.operator_approval", v)
+			}
+		}
 		if t.MaxCallsPerDay != nil && *t.MaxCallsPerDay < 1 {
 			rep.errf(p+".max_calls_per_day", "must be 1 or more (got %d) — leave a tool out of tool_gate.tools to refuse it", *t.MaxCallsPerDay)
 		}
@@ -1003,8 +1025,8 @@ func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
 			}
 		}
 		if c.Glob != "" {
-			if _, err := path.Match(c.Glob, ""); err != nil {
-				rep.errf(ap+".glob", "bad pattern %q", c.Glob)
+			if err := config.CheckGlob(c.Glob); err != nil {
+				rep.errf(ap+".glob", "%v", err)
 			}
 		}
 		if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
@@ -1277,5 +1299,24 @@ func min3(a, b, c int) int {
 func checkOutputSchema(schema map[string]interface{}, path string, rep *validateReport) {
 	for _, finding := range outputschema.Check(schema) {
 		rep.errf(path+".output_schema."+finding.Field, "%s", finding.Message)
+	}
+}
+
+// checkOutputRetries bounds an ai step's output_retries. Each retry is a paid
+// call, so the count is capped rather than left to the config.
+func checkOutputRetries(st config.StepConfig, skills map[string]*skillsapi.SkillDef, path string, rep *validateReport) {
+	if st.OutputRetries == nil {
+		return
+	}
+	if n := *st.OutputRetries; n < 0 || n > config.MaxOutputRetries {
+		rep.errf(path+".output_retries", "must be 0 to %d (got %d)", config.MaxOutputRetries, n)
+		return
+	}
+	hasSchema := len(st.OutputSchema) > 0
+	if sk, ok := skills[st.Skill]; ok && len(sk.OutputSchema) > 0 {
+		hasSchema = true
+	}
+	if !hasSchema && *st.OutputRetries > 0 {
+		rep.warnf(path+".output_retries", "has no effect: the step has no output_schema to validate against")
 	}
 }

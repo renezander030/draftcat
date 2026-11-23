@@ -288,7 +288,7 @@ func TestAgentFreezeSurvivesRestartAndReachesARunningGate(t *testing.T) {
 
 func TestAgentFreezeRefusesConsumeAndIgnoresGrants(t *testing.T) {
 	_, st := freezeStore(t)
-	cfg := gateCfg(config.ToolRule{Name: "read_file"}, grantableEmail())
+	cfg := grantsBy(gateCfg(config.ToolRule{Name: "read_file"}, grantableEmail()), 7)
 	ch := &recordingApprovalChannel{action: "approve"}
 	g := newToolGate(cfg, ch)
 

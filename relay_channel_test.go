@@ -339,6 +339,138 @@ func TestRelayChannel_ForgedDecisionsAreRefused(t *testing.T) {
 	}
 }
 
+// A frame the gate cannot use (a heartbeat, a verb from a newer relay, an
+// approver it does not know) is refused and changes nothing: the approval stays
+// open for the real decision. Only the gate's own expiry may answer 410, since a
+// relay that follows the protocol closes its card for good on a 410.
+func TestRelayChannel_UnknownFrameKeepsGateOpen(t *testing.T) {
+	f := newFakeRelay(t)
+	rc, callback := newTestRelayChannel(t, f, twoOps)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out := make(chan OperatorDecision, 1)
+	go func() {
+		d, _ := rc.SendForApproval(ctx, "send the quarterly report", nil)
+		out <- d
+	}()
+	req := f.dispatch(t)
+	valid := relay.Decision{
+		Protocol: relay.Version, ApprovalID: req.ApprovalID, Nonce: req.Callback.Nonce,
+		Decision: relay.ActionApprove, PayloadHash: req.PayloadHash,
+		Approver: relay.Approver{ID: "alice@example.com"},
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(d *relay.Decision)
+		want   int
+	}{
+		{"heartbeat naming no approval", func(d *relay.Decision) { *d = relay.Decision{Protocol: relay.Version} }, http.StatusConflict},
+		{"newer verb", func(d *relay.Decision) { d.Decision = "viewed" }, http.StatusForbidden},
+		{"newer verb that mentions expiry", func(d *relay.Decision) { d.Decision = "card_expired" }, http.StatusForbidden},
+		{"unknown approver that mentions expiry", func(d *relay.Decision) { d.Approver.ID = "expired@example.com" }, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		d := valid
+		tc.mutate(&d)
+		resp := postDecision(t, callback, d, testRelaySecret, time.Now())
+		_ = resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s: status %d, want %d", tc.name, resp.StatusCode, tc.want)
+		}
+	}
+
+	resp := postDecision(t, callback, valid, testRelaySecret, time.Now())
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("valid approve after the refused frames: status %d, want 200", resp.StatusCode)
+	}
+	select {
+	case d := <-out:
+		if d.Action != "approve" {
+			t.Fatalf("action = %q, want approve: a refused frame changed the gate", d.Action)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate never resolved after the refused frames")
+	}
+}
+
+// Every accepted decision answers 200 with what it did to the gate: the quorum
+// still open (with the count so far), a repeat by the same approver (counted
+// once), or the gate closed. Approvers come back in the order they approved.
+func TestRelayChannel_AcceptedDecisionsReportQuorumProgress(t *testing.T) {
+	f := newFakeRelay(t)
+	rc, callback := newTestRelayChannel(t, f, twoOps)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out := make(chan QuorumDecision, 1)
+	go func() {
+		d, _ := rc.SendForQuorumApproval(ctx, "draft", 2, nil)
+		out <- d
+	}()
+	req := f.dispatch(t)
+	post := func(d relay.Decision) string {
+		t.Helper()
+		d.Protocol, d.ApprovalID, d.Nonce, d.PayloadHash = relay.Version, req.ApprovalID, req.Callback.Nonce, req.PayloadHash
+		resp := postDecision(t, callback, d, testRelaySecret, time.Now())
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d (%s), want 200", resp.StatusCode, body)
+		}
+		return strings.TrimSpace(string(body))
+	}
+	approve := func(id string) relay.Decision {
+		return relay.Decision{Decision: relay.ActionApprove, Approver: relay.Approver{ID: id}}
+	}
+
+	steps := []struct {
+		name string
+		d    relay.Decision
+		want string
+	}{
+		{"first approval", approve("bob@example.com"), `{"collected":1,"required":2,"resolved":false,"status":"recorded"}`},
+		{"same approver again", approve("bob@example.com"), `{"note":"duplicate approver","resolved":false,"status":"recorded"}`},
+		{"second approver", approve("alice@example.com"), `{"resolved":true,"status":"recorded"}`},
+	}
+	for _, s := range steps {
+		if got := post(s.d); got != s.want {
+			t.Fatalf("%s: body %s, want %s", s.name, got, s.want)
+		}
+	}
+	select {
+	case d := <-out:
+		if d.Action != "approve" || len(d.Approvers) != 2 || d.Approvers[0] != 222 || d.Approvers[1] != 111 {
+			t.Fatalf("got %+v, want approve by [222 111] in approval order", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gate never resolved after two distinct approvals")
+	}
+
+	// An adjust closes the gate at once and names who asked for it.
+	f.mu.Lock()
+	f.got = false
+	f.mu.Unlock()
+	go func() {
+		d, _ := rc.SendForQuorumApproval(ctx, "second draft", 2, nil)
+		out <- d
+	}()
+	req = f.dispatch(t)
+	if got := post(relay.Decision{Decision: relay.ActionAdjust, Approver: relay.Approver{ID: "bob@example.com"}, AdjustText: "shorter"}); got != `{"resolved":true,"status":"recorded"}` {
+		t.Fatalf("adjust: body %s", got)
+	}
+	select {
+	case d := <-out:
+		if d.Action != "adjust" || d.Text != "shorter" || d.DeciderID != 222 {
+			t.Fatalf("got %+v, want adjust by 222 with its text", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("adjust never resolved the gate")
+	}
+}
+
 // A decision for a gate that already closed is a 409, so a relay retry is safe.
 func TestRelayChannel_ResolvedGateIsIdempotent(t *testing.T) {
 	f := newFakeRelay(t)

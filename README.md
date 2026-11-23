@@ -123,7 +123,7 @@ However your agent runs, draftcat sits between it and your customer systems as a
 - **Approver scoping** — `approvers:` on a step narrows who may decide it to a subset of `allowed_users`. Quorum says *how many*; this says *which ones*. It can only narrow, never widen.
 - **Model I/O policy** - ordered `model_policy` regex rules check exact input before it reaches the provider and output before it leaves Draftcat. A match can deny or enter the existing human approval gate, and the decision is written as a versioned receipt.
 - **Input sanitization** — operator input is scrubbed for prompt-injection patterns before the LLM.
-- **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform.
+- **Output validation** — AI output is checked against the skill's `output_schema` (field types, numeric `min`/`max`, `enum` membership) and rejected if it doesn't conform. A rejected reply is asked for once more with the validation error, as its own budgeted, policy-checked call; `output_retries` on the step sets the count (0 to 3, `0` fails on the first invalid reply).
 - **Checked action receipts** - v2 receipts bind immutable action ID, payload hash, policy digest, validity window, run, and decision. List, inspect, or stream JSONL from SQLite with `draftcat receipts`; see [`docs/action-receipts.md`](docs/action-receipts.md).
 - **Durable webhook admission** - Draftcat writes a body-hash-only admission row before returning HTTP 202. The response includes `admission_id` and an authenticated poll URL; unfinished admissions become `interrupted` after restart.
 - **Health contract** - `GET /healthz` reports process liveness and `GET /readyz` succeeds only while the SQLite decision store is available.
@@ -291,6 +291,15 @@ budgets:
 observability: {spans: false}   # or DRAFTCAT_TRACE=1
 state:         {path: ./state.db}
 ```
+
+A step that sends the same long instructions on every run can have them
+cached by an Anthropic model: `prompt_cache: true` on the model marks the
+step's prompt up to its first `{{placeholder}}` for Anthropic prompt caching.
+Runs that start with the same instructions within five minutes read them at a
+tenth of the input price; the run that writes them pays 1.25x, so it is off by
+default. It applies to `anthropic/` models on OpenRouter; every other model is
+sent the plain prompt. Without a provider-reported charge, the cost caps count
+cache writes at the write price.
 
 An approval step can narrow who may decide it:
 

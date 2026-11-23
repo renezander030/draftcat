@@ -193,6 +193,11 @@ gate counts distinct approver identities and resolves when the count is met.
 - `410` `{"status":"expired"}` — the gate timed out before the human answered.
 - `401` / `403` — signature, nonce, approver, or payload-hash check failed.
 
+A frame the gate cannot use (a body that is not JSON, a heartbeat, a `decision`
+verb outside the v0 set) is refused with `400`, `401`, `403` or `409` and changes
+nothing: the approval stays open for the next valid decision. Only the gate's
+own expiry answers `410`, so a relay may close its card for good on a `410`.
+
 ---
 
 ## 5. Security model — why an untrusted relay is safe

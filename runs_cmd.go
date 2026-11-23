@@ -150,7 +150,7 @@ func runRunsCmd(args []string) int {
 		return 0
 	}
 	for _, r := range out {
-		line := fmt.Sprintf("%s  %-22s %-7s %6.1fs", r.StartedAt, r.Pipeline, r.Status, r.Duration)
+		line := fmt.Sprintf("%s  %-22s %-7s %6.1fs", r.StartedAt, oneLine(r.Pipeline), r.Status, r.Duration)
 		if r.Error != "" {
 			line += "  " + truncateOneLine(r.Error, 60)
 		}
@@ -165,7 +165,7 @@ func runRunsCmd(args []string) int {
 				receipt = " [signed]"
 			}
 			fmt.Printf("    %-20s %-11s by %s (%d/%d)%s\n",
-				a.Step, a.Decision, who, a.QuorumGot, a.QuorumN, receipt)
+				oneLine(a.Step), a.Decision, who, a.QuorumGot, a.QuorumN, receipt)
 			if a.Reason != "" {
 				fmt.Printf("    %-20s reason: %s [%s]\n", "", truncateOneLine(a.Reason, 80), a.ReasonOK)
 			}

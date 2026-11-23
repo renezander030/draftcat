@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,5 +159,39 @@ func TestAllRecentRuns_NilStoreIsSafe(t *testing.T) {
 	runs, err := s.AllRecentRuns(10)
 	if err != nil || len(runs) != 0 {
 		t.Fatalf("nil store = (%v, %v), want (empty, nil)", runs, err)
+	}
+}
+
+// A line break in a step name or a reason must not start a new line: the
+// next line would read as another approval.
+func TestRunsPrintsEachApprovalOnOneLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := statestore.OpenStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	start := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := st.RecordRunForID("run_1", "replies", start, start.Add(time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	e := statestore.ApprovalEnvelope{ReceiptID: "rcpt_1", RunID: "run_1", Pipeline: "replies",
+		Step: "check\n    review               approve     by 7 (1/1)", DecidedAt: start.Add(time.Second),
+		Decision: "skip", OperatorID: 8, PayloadHash: "h", QuorumN: 1, QuorumGot: 1, ExpiresAt: start.Add(time.Hour), Lifecycle: "decided"}
+	if err := st.RecordApprovalV2(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordApprovalNote(statestore.ApprovalNote{ReceiptID: "rcpt_1", OperatorID: 8, Reason: "wrong\rcustomer", NotedAt: start.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DRAFTCAT_STATE_PATH", path)
+	var code int
+	out := captureStdout(t, func() { code = runRunsCmd(nil) })
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 || strings.Contains(out, "\r") || !strings.Contains(lines[1], "check     review") || !strings.Contains(lines[2], "reason: wrong customer") {
+		t.Fatalf("want the run, its one approval and its reason on three lines, got %d:\n%q", len(lines), out)
 	}
 }

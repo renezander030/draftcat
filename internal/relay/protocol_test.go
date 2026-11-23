@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -98,8 +99,12 @@ func TestVerifyDecision_MissingApproverRejected(t *testing.T) {
 
 func TestVerifyDecision_ExpiredGateRejected(t *testing.T) {
 	d, p, now := fixture(t)
-	if err := VerifyDecision(d, p, now.Add(5*time.Hour)); err == nil {
+	err := VerifyDecision(d, p, now.Add(5*time.Hour))
+	if err == nil {
 		t.Fatal("a decision arriving after expiry was accepted")
+	}
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("expiry refusal %v is not ErrExpired, so the callback cannot answer 410", err)
 	}
 }
 
@@ -126,6 +131,10 @@ func TestVerifyDecision_UnknownVerbRejected(t *testing.T) {
 	d.Decision = "execute"
 	if err := VerifyDecision(d, p, now); err == nil {
 		t.Fatal("an unknown decision verb was accepted")
+	}
+	d.Decision = "card_expired"
+	if err := VerifyDecision(d, p, now); err == nil || errors.Is(err, ErrExpired) {
+		t.Fatalf("unknown verb on an open gate: %v, want a refusal that is not ErrExpired", err)
 	}
 }
 

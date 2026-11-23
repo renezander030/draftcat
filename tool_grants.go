@@ -9,7 +9,8 @@ package main
 // a receipt that names the grant, the operator who issued it and the use it
 // took. A grant never covers a high-risk tool, a call outside the rule's
 // arguments or past a daily total — those still reach a human — and it stops
-// applying the moment the rule no longer allows grants.
+// applying the moment the rule no longer allows grants, or its operator is no
+// longer in telegram.security.allowed_users.
 
 import (
 	"crypto/rand"
@@ -30,12 +31,14 @@ const (
 )
 
 // grantVerdict takes one use of a standing grant for this call, if a live one
-// covers it, and returns the allow verdict and the granting operator.
+// covers it, and returns the allow verdict and the granting operator. A grant
+// is the word of the operator who issued it, so only a grant from an operator
+// the channel still allows counts: removing an operator ends their grants.
 func (g *toolGate) grantVerdict(req ToolCallRequest) (toolPolicyVerdict, int64, bool) {
 	if state == nil {
 		return toolPolicyVerdict{}, 0, false
 	}
-	gr, ok, err := state.UseToolGrant(req.Tool, req.Agent, g.now())
+	gr, ok, err := state.UseToolGrant(req.Tool, req.Agent, g.cfg.Telegram.Security.AllowedUsers, g.now())
 	if err != nil {
 		log.Printf("[tool-gate] grant lookup for %s failed, asking a human: %v", req.Tool, err)
 		return toolPolicyVerdict{}, 0, false

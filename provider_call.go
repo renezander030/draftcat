@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/renezander030/draftcat/internal/config"
 )
@@ -97,7 +98,11 @@ func callLLM(ctx context.Context, cfg *config.Config, role, prompt string, track
 				return nil, fmt.Errorf("budget admission canceled: %w", err)
 			}
 			defer b.release()
-			id, err := b.admit(ctx, cfg, maxTokens, model.Model, model.WorstCaseCost(len(prompt), maxTokens))
+			worst := model.WorstCaseCost(len(prompt), maxTokens)
+			if cfg.Provider.CachesPrompt(model) {
+				worst += model.WorstCaseCost(len(prompt), 0) * cacheWritePremium
+			}
+			id, err := b.admit(ctx, cfg, maxTokens, model.Model, worst)
 			if err != nil {
 				return nil, err
 			}
@@ -115,6 +120,37 @@ func callLLM(ctx context.Context, cfg *config.Config, role, prompt string, track
 		return nil, err
 	}
 	return resp, nil
+}
+
+// cacheWritePremium is what a prompt cache write costs on top of the input
+// price: Anthropic bills a five-minute cache write at 1.25x.
+const cacheWritePremium = 0.25
+
+type stablePrefixKey struct{}
+
+// withStablePrefix records the start of the prompt that is the same on every
+// run of the step making the call, for a model with prompt_cache on.
+func withStablePrefix(ctx context.Context, prefix string) context.Context {
+	return context.WithValue(ctx, stablePrefixKey{}, prefix)
+}
+
+// promptContent is the user message's content. For a model that caches
+// prompts it is two text parts: the stable prefix marked with cache_control,
+// so the next call starting with the same instructions reads them from the
+// cache, then the rest of the prompt. Everything else gets the plain string.
+func promptContent(ctx context.Context, cfg *config.Config, model config.ModelConfig, prompt string) interface{} {
+	prefix, _ := ctx.Value(stablePrefixKey{}).(string)
+	if !cfg.Provider.CachesPrompt(model) || strings.TrimSpace(prefix) == "" || !strings.HasPrefix(prompt, prefix) {
+		return prompt
+	}
+	marked := map[string]interface{}{"type": "text", "text": prefix, "cache_control": map[string]string{"type": "ephemeral"}}
+	rest := prompt[len(prefix):]
+	if strings.TrimSpace(rest) == "" {
+		// Anthropic refuses an empty or blank text part.
+		marked["text"] = prompt
+		return []map[string]interface{}{marked}
+	}
+	return []map[string]interface{}{marked, {"type": "text", "text": rest}}
 }
 
 func providerDeclaresUsage(body []byte) bool {

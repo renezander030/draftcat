@@ -13,7 +13,6 @@ import (
 	"math"
 	"math/big"
 	"os"
-	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -302,6 +301,28 @@ type ModelConfig struct {
 	MaxTokens int     `yaml:"max_tokens"`
 	CostIn    float64 `yaml:"cost_per_1k_input"`
 	CostOut   float64 `yaml:"cost_per_1k_output"`
+	// PromptCache marks the part of an AI step's prompt that is the same on
+	// every run (the prompt up to its first {{placeholder}}) for Anthropic
+	// prompt caching. A call that starts with the same instructions within
+	// five minutes reads them at a tenth of the input price; the call that
+	// writes them pays 1.25x. Off by default: a step that runs less often than
+	// that only pays the write. Applies to anthropic/ models on OpenRouter;
+	// any other model or provider is sent the plain prompt as before.
+	PromptCache bool `yaml:"prompt_cache"`
+}
+
+// IsAnthropic reports whether the model id names an Anthropic model on
+// OpenRouter: "anthropic/claude-…", or a "~anthropic/…" latest alias.
+func (m ModelConfig) IsAnthropic() bool {
+	id := strings.ToLower(strings.TrimSpace(m.Model))
+	return strings.HasPrefix(strings.TrimPrefix(id, "~"), "anthropic/")
+}
+
+// CachesPrompt reports whether calls to the model carry a prompt cache
+// marker: prompt_cache is on, the model is Anthropic's and the provider is
+// OpenRouter. Other OpenAI-compatible servers reject unknown request fields.
+func (p ProviderConfig) CachesPrompt(m ModelConfig) bool {
+	return m.PromptCache && m.IsAnthropic() && p.IsOpenRouter()
 }
 
 // Priced reports whether the model carries a per-1k price.
@@ -593,6 +614,12 @@ type StepConfig struct {
 	Mode         string              `yaml:"mode"`
 	Channel      string              `yaml:"channel"`
 	OutputSchema outputschema.Schema `yaml:"output_schema"`
+	// OutputRetries is how many more times an ai step asks the model when a
+	// reply fails its output_schema. Each retry repeats the prompt with the
+	// validation error appended and is a call of its own: model policy and
+	// budget admission apply to it as to the first. Omitted = 1, 0 = fail on
+	// the first invalid reply, at most MaxOutputRetries.
+	OutputRetries *int `yaml:"output_retries"`
 	// Quorum is the number of distinct human operators that must approve this
 	// approval step before the action is released. 0 or 1 = single approver
 	// (default, unchanged behavior). Only the telegram channel implements N>=2.
@@ -625,6 +652,21 @@ type StepConfig struct {
 	// never who may decide, because widening authority on a timer would let a
 	// slow operator silently promote someone the config never approved.
 	EscalateTo []int64 `yaml:"escalate_to"`
+}
+
+// Output retry bounds for an ai step's output_schema.
+const (
+	DefaultOutputRetries = 1
+	MaxOutputRetries     = 3
+)
+
+// OutputRetriesOrDefault returns the step's output retry count, clamped to
+// 0..MaxOutputRetries so a config that skipped validation stays bounded.
+func (s StepConfig) OutputRetriesOrDefault() int {
+	if s.OutputRetries == nil {
+		return DefaultOutputRetries
+	}
+	return min(max(*s.OutputRetries, 0), MaxOutputRetries)
 }
 
 // Risk levels. Declared by the operator in config, never inferred.
@@ -929,6 +971,12 @@ type ToolRule struct {
 	// asking again. Off by default: approving one send does not approve the
 	// next, because the next one has the same side effect.
 	RememberApproval bool `yaml:"remember_approval"`
+	// ApprovalWindow is how long a call of this tool waits for a human, and
+	// how long its permit stays valid, in place of timeouts.operator_approval:
+	// short for a low-risk tool, longer for a deploy ("2m", "8h"). Omitted =
+	// operator_approval. Not part of the policy hash itself: the window it
+	// yields is, like operator_approval.
+	ApprovalWindow string `yaml:"approval_window" json:"-"`
 	// MaxCallsPerDay caps how many calls of this tool the gate allows in one
 	// UTC day. A call counts from the moment it is allowed, consumed or not,
 	// like a max_per_day total; a call past the cap is handled like a mismatch
@@ -1053,7 +1101,7 @@ const CallCountKey = "#calls"
 type ArgConstraint struct {
 	Equals   interface{} `yaml:"equals"`
 	OneOf    []string    `yaml:"one_of"`
-	Glob     string      `yaml:"glob"`  // path.Match syntax: * ? [...]
+	Glob     string      `yaml:"glob"`  // path.Match syntax: * ? [...], plus ** segments (MatchGlob)
 	Regex    string      `yaml:"regex"` // Go RE2, unanchored unless you write ^ $
 	Max      *float64    `yaml:"max"`
 	Min      *float64    `yaml:"min"`
@@ -1108,7 +1156,10 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 		}
 	}
 	if c.Glob != "" {
-		ok, err := path.Match(c.Glob, s)
+		ok, err := MatchGlob(c.Glob, s)
+		if err == nil && !ok && hasDoubleStar(c.Glob) && hasParentSegment(s) {
+			return false, fmt.Sprintf("%q has a .. segment, which a ** glob never matches", clip(s))
+		}
 		if err != nil || !ok {
 			return false, fmt.Sprintf("%q does not match glob %q", clip(s), c.Glob)
 		}
@@ -1331,6 +1382,16 @@ func (t ToolRule) DailyCaps() []string {
 
 func (t ToolRule) argKeys() []string {
 	return slices.Sorted(maps.Keys(t.Args))
+}
+
+// ApprovalWindowOr parses approval_window; empty, unparsable, zero or
+// negative = fallback, the operator_approval window.
+func (t ToolRule) ApprovalWindowOr(fallback time.Duration) time.Duration {
+	d, _ := time.ParseDuration(t.ApprovalWindow)
+	if d <= 0 {
+		return fallback
+	}
+	return d
 }
 
 // DeniesOnMismatch reports whether an argument mismatch is refused outright

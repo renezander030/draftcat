@@ -103,7 +103,7 @@ Constraints, all of which must hold when several are given on one argument:
 |------------|------------|
 | `equals`   | the value, in string form, equals this (numbers compare by value) |
 | `one_of`   | the value is one of the listed strings |
-| `glob`     | the value matches a `path.Match` pattern (`*`, `?`, `[...]`) |
+| `glob`     | the value matches a `path.Match` pattern (`*`, `?`, `[...]`; `*` never crosses a `/`); a `**` segment matches any depth: `src/**` is everything inside `src/`, `src/**/*.go` every `.go` file under it |
 | `regex`    | the value matches a Go regular expression — write `^` and `$` to anchor it |
 | `min`/`max`| the value is a number inside the bound |
 | `max_per_day` | the value is a number of 0 or more, and today's total stays inside the cap (below) |
@@ -114,7 +114,11 @@ human even when the rule would allow the call silently (below).
 
 Values are compared in their string form: strings as-is, numbers without an
 exponent, booleans as `true`/`false`, anything structured as compact JSON.
+A glob with a `**` segment never matches a value with a `..` segment (between
+`/` or `\`), so `src/**` does not let `src/../secrets` through; values are not
+cleaned before matching.
 `draftcat validate` refuses a regex that does not compile, a malformed glob, a
+`**` glob with a `..` segment of its own (it could never match), a
 `min` above its `max`, a `review_above` at or above `max`, a negative
 `max_per_day`, and a constraint with no condition (almost always a typo'd key).
 
@@ -430,8 +434,10 @@ definition changed: inputSchema.properties.cc added; inputSchema.required +cc
 ## Collecting a decision
 
 A decision the rule settles comes back at once. A decision that needs a human
-takes as long as the human takes — up to `timeouts.operator_approval`, 4h by
-default — and an HTTP client that gives up after 30 seconds used to lose it.
+takes as long as the human takes — up to the tool's approval window
+(`timeouts.operator_approval`, 4h by default, or the rule's own
+`approval_window`, below) — and an HTTP client that gives up after 30 seconds
+used to lose it.
 Three ways to hold on:
 
 **Sync (default).** The request is held until the operator decides or the
@@ -456,6 +462,36 @@ GET /gate/tool-call/<approval_id>?wait=30s   # long-poll, capped at 100s
 An unknown id answers `404` with `decision: deny`. Durable action state remains
 queryable after restart. Work that was still pending when the process stopped
 becomes `expired`; it is never resumed from an unprovable in-memory point.
+
+### Approval window per tool
+
+A rule's `approval_window` sets that tool's window in place of
+`timeouts.operator_approval`: short for a call nobody should approve an hour
+later, long for one that waits on a person who is not always at hand.
+
+```yaml
+timeouts:
+  operator_approval: 30m
+tool_gate:
+  tools:
+    - name: restart_worker
+      risk: low
+      require_approval: true
+      approval_window: 2m      # unanswered after 2 minutes: denied
+    - name: deploy
+      risk: high
+      require_approval: true
+      approval_window: 8h      # waits a working day for a human
+    - name: send_email
+      require_approval: true   # no approval_window: operator_approval, 30m
+```
+
+The window bounds the whole call as `operator_approval` does: how long the
+human has to decide, how long a sync request is held, the `expires_at` a
+response and a relay dispatch carry, and how long an allowed permit stays
+consumable. A caller's `expires_at` can narrow it, never extend it. The window
+a call was decided under is part of its `policy_hash`. `draftcat validate`
+refuses a value that is not a positive duration (`2m`, `8h`).
 
 ## Consuming an allowed decision
 
@@ -612,7 +648,9 @@ A grant does not cover:
   `max_calls_per_day` — those still reach a human (`review_above` never
   applies on a rule with `require_approval`, which already asks every time);
 - a high-risk tool — `draftcat validate` refuses `allow_grants` on one;
-- a rule that no longer has `allow_grants` — its grants stop applying.
+- a rule that no longer has `allow_grants` — its grants stop applying;
+- an operator who is no longer in `telegram.security.allowed_users` — the
+  grants they issued stop applying, and their calls reach a human again.
 
 A grant lasts between 1 minute and 24 hours and covers at most 1000 calls
 (1000 when no count is given). Grants live in the state store and survive a
@@ -745,16 +783,22 @@ A request with a caller's token is made as that caller:
 
 - its `agent` is the caller's name, recorded on the action and bound into the
   permit; a request that names a different agent is refused with `403`;
-- a tool outside its `tools` is denied with `rule: caller.tools`;
+- a tool outside its `tools` is denied with `rule: caller.tools`, and so is
+  the consume of a permit for a tool it no longer lists: a restart that takes
+  a tool off its `tools` ends what the caller was approved for before
+  (`409`, the permit stays unspent, the operator gets the denial notice);
 - `GET`, `consume`, `revoke` and `complete` reach only the actions it asked
   for, and any other id answers `404`;
 - a signed request is signed with the caller's own token.
 
-Removing a caller, or unsetting its variable, withdraws that one token. The
-webhook token keeps working on the gate for every listed tool unless
-`require_caller: true`. Caller tokens are redacted from logs and notices like
-every other credential. `draftcat validate` refuses duplicate names and shared
-variables, and `draftcat doctor` warns about a caller whose variable is empty.
+Removing a caller, or unsetting its variable, withdraws that one token at
+the next restart (a reload names `tool_gate` as changed and keeps the running
+callers): its calls still waiting on a human close as `expired`, and its token
+is refused on every request, consume included. The webhook token keeps
+working on the gate for every listed tool unless `require_caller: true`.
+Caller tokens are redacted from logs and notices like every other credential.
+`draftcat validate` refuses duplicate names and shared variables, and
+`draftcat doctor` warns about a caller whose variable is empty.
 
 ## Reading the budget
 
@@ -820,6 +864,24 @@ in the `policy` column. The signed envelope also carries the stable action ID,
 policy digest, exact binding, run ID, and expiry. `draftcat receipts list`,
 `show`, and `export` read the rows directly from SQLite.
 
+An approval that times out writes its `deny` receipt with the reason
+`approval timed out — the gate denies rather than assumes yes`. A request the
+gate refuses outside a decision writes one too, with `decision = deny`,
+operator `0`, `lifecycle = refused` and the reason in `policy`:
+
+- `request refused — ...`: a body that is not valid JSON or has unknown fields
+  (step `-`, payload hash over the raw body), an invalid `action_id`,
+  `precondition`, `mode`, `wait` or `expires_at`, no tool named, an `agent`
+  that is not the caller token's name, or an `action_id` already bound to
+  other data (the receipt carries the binding the request tried to use);
+- `permit not consumed — ...`: a consume refused while the gate or the
+  agent is frozen, with a binding that does not match, a precondition that no
+  longer holds, a malformed body, or a permit that is not `allowed` (already
+  consumed, denied, expired or revoked). The receipt is bound to the action.
+
+A request without an accepted token writes no receipt: who sent it is not
+known, and the receipt history is not writable without a token.
+
 ## Configuration reference
 
 ```yaml
@@ -850,6 +912,7 @@ tool_gate:
       definition_sha256: sha256:<64 hex>  # pin the tool's definition (draftcat gate hash-definition)
       definition_file: <path>.json        # or pin it to the approved definition itself; a change is named field by field
       remember_approval: true|false  # reuse an approval inside repeat_window (never for high risk)
+      approval_window: <duration>    # this tool's approval window; default timeouts.operator_approval
       args:
         <argument>: {equals: …, one_of: […], glob: …, regex: …, min: …, max: …,
                      review_above: …, max_per_day: …, optional: true}

@@ -112,11 +112,11 @@ tool_gate:
       on_mismatch: approve           # any other command: a human decides
     - name: Write
       args:
-        file_path: {glob: "/work/repo/docs/*"}
+        file_path: {glob: "/work/repo/docs/**"}
       on_mismatch: approve
     - name: Edit
       args:
-        file_path: {glob: "/work/repo/docs/*"}
+        file_path: {glob: "/work/repo/docs/**"}
       on_mismatch: approve
     - name: mcp__github__create_issue
       require_approval: true

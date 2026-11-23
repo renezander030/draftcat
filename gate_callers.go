@@ -119,13 +119,17 @@ func (a *gateAuthenticator) middleware(maxBody, maxSkew int64, requireSignature 
 	}
 }
 
-// callerDenial is the verdict for a caller asking about a tool it does not
-// list.
-func callerDenial(c *config.GateCaller, tool string) toolPolicyVerdict {
+// callerDenial is the verdict for a caller asking about, or spending a permit
+// for, a tool it does not list, and whether it applies. The shared token (a
+// nil caller) is not limited by any caller's tools.
+func callerDenial(c *config.GateCaller, tool string) (toolPolicyVerdict, bool) {
+	if c == nil || c.Allows(tool) {
+		return toolPolicyVerdict{}, false
+	}
 	return toolPolicyVerdict{
 		Decision: "deny", DecidedBy: "allowlist", Rule: "caller.tools", Class: "unlisted",
 		Reason: "caller " + c.Name + " may not call " + tool + " — not in its tools",
-	}
+	}, true
 }
 
 // actionAgent returns the agent an action was asked under, and whether the

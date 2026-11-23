@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/renezander030/draftcat/internal/config"
 	"github.com/renezander030/draftcat/internal/outputschema"
 )
 
@@ -41,6 +42,24 @@ func validateOutput(text string, schema map[string]interface{}) (map[string]inte
 		return nil, err
 	}
 	return parsed, nil
+}
+
+// outputRetries is how many more model calls an ai step may make after a reply
+// fails its schema. A schema that does not check is the operator's error, not
+// the model's, so asking again would spend for nothing.
+func outputRetries(step config.StepConfig, schema map[string]interface{}) int {
+	if len(schema) == 0 || len(outputschema.Check(schema)) > 0 {
+		return 0
+	}
+	return step.OutputRetriesOrDefault()
+}
+
+// outputRetryPrompt asks again after a reply failed validation. Only the
+// validation error is added: it names schema fields from the operator's
+// config and never quotes the rejected reply.
+func outputRetryPrompt(prompt string, invalid error) string {
+	return prompt + "\n\nYour previous reply was rejected: " + invalid.Error() +
+		". Reply with only one JSON object that has every required field."
 }
 
 // schemaFieldError names the schema field a value failed, so a caller can

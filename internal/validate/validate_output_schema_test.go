@@ -66,3 +66,27 @@ func TestInputSchemaWarnsOutsideWebhookPipelines(t *testing.T) {
 		t.Errorf("valid webhook input_schema reported findings: %+v", f)
 	}
 }
+
+func TestOutputRetriesAreBoundedBeforeRun(t *testing.T) {
+	step := func(n int, schema bool) *config.Config {
+		st := config.StepConfig{Name: "classify", Type: "ai", Prompt: "classify", OutputRetries: &n}
+		if schema {
+			st.OutputSchema = map[string]interface{}{"score": map[string]interface{}{"type": "int"}}
+		}
+		return &config.Config{Pipelines: []config.PipelineConfig{{Name: "p", Steps: []config.StepConfig{st}}}}
+	}
+	for _, n := range []int{-1, config.MaxOutputRetries + 1} {
+		if errs := findingsAt(runCheckPipelines(step(n, true)), "error", "output_retries"); len(errs) != 1 {
+			t.Fatalf("output_retries %d accepted: %+v", n, errs)
+		}
+	}
+	for _, n := range []int{0, config.MaxOutputRetries} {
+		rep := runCheckPipelines(step(n, true))
+		if found := append(findingsAt(rep, "error", "output_retries"), findingsAt(rep, "warn", "output_retries")...); len(found) != 0 {
+			t.Fatalf("output_retries %d refused: %+v", n, found)
+		}
+	}
+	if warns := findingsAt(runCheckPipelines(step(2, false)), "warn", "output_retries"); len(warns) != 1 {
+		t.Fatalf("output_retries without a schema did not warn: %+v", warns)
+	}
+}

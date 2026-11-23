@@ -220,12 +220,14 @@ type CompletionResponse struct {
 	Text         string
 	InputTokens  int
 	OutputTokens int
-	// CachedTokens and ReasoningTokens are the provider's breakdown when it
-	// reports one (OpenRouter usage accounting); zero otherwise.
-	CachedTokens    int
-	ReasoningTokens int
-	LatencyMs       int64
-	CostUSD         float64
+	// CachedTokens, CacheWriteTokens and ReasoningTokens are the provider's
+	// breakdown when it reports one (OpenRouter usage accounting); zero
+	// otherwise. They are part of InputTokens and OutputTokens, not extra.
+	CachedTokens     int
+	CacheWriteTokens int
+	ReasoningTokens  int
+	LatencyMs        int64
+	CostUSD          float64
 	// CostSource says where CostUSD came from: "provider" when the response
 	// carried the real charge, "rates" when it was computed from the
 	// configured per-1k prices.
@@ -308,8 +310,8 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 
 	reqBody := map[string]interface{}{
 		"model": modelCfg.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": promptContent(ctx, cfg, modelCfg, prompt)},
 		},
 		"max_tokens": maxTokens,
 	}
@@ -391,7 +393,8 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 			CompletionTokens    *int     `json:"completion_tokens"`
 			Cost                *float64 `json:"cost"`
 			PromptTokensDetails struct {
-				CachedTokens int `json:"cached_tokens"`
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
 			} `json:"prompt_tokens_details"`
 			CompletionTokensDetails struct {
 				ReasoningTokens int `json:"reasoning_tokens"`
@@ -407,15 +410,19 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 	}
 	inputTokens, outputTokens := *result.Usage.PromptTokens, *result.Usage.CompletionTokens
 	if inputTokens < 0 || outputTokens < 0 || inputTokens > int(^uint(0)>>1)-outputTokens ||
-		result.Usage.PromptTokensDetails.CachedTokens < 0 || result.Usage.CompletionTokensDetails.ReasoningTokens < 0 ||
+		result.Usage.PromptTokensDetails.CachedTokens < 0 || result.Usage.PromptTokensDetails.CacheWriteTokens < 0 ||
+		result.Usage.CompletionTokensDetails.ReasoningTokens < 0 ||
 		(result.Usage.Cost != nil && !validCost(*result.Usage.Cost)) {
 		return nil, providerError(fmt.Errorf("LLM response contains invalid usage; reconciliation required"), true)
 	}
 
 	// The configured rates are the fallback. When the provider states what it
 	// actually charged, the caps are enforced on that number — rates alone
-	// undercount reasoning tokens and overcount cached ones.
+	// undercount reasoning tokens and overcount cached ones. A cache write is
+	// billed above the input price, so rates add that premium for the tokens
+	// written; cache reads stay at the full input price.
 	cost := float64(inputTokens)/1000*modelCfg.CostIn +
+		float64(result.Usage.PromptTokensDetails.CacheWriteTokens)/1000*modelCfg.CostIn*cacheWritePremium +
 		float64(outputTokens)/1000*modelCfg.CostOut
 	source := "rates"
 	if usageAccounting && result.Usage.Cost != nil {
@@ -427,15 +434,16 @@ func providerCallLLM(ctx context.Context, cfg *config.Config, role string, promp
 		return nil, providerError(fmt.Errorf("LLM response cost is invalid; reconciliation required"), true)
 	}
 	completion := &CompletionResponse{
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		CachedTokens:    result.Usage.PromptTokensDetails.CachedTokens,
-		ReasoningTokens: result.Usage.CompletionTokensDetails.ReasoningTokens,
-		LatencyMs:       latency,
-		CostUSD:         cost,
-		CostSource:      source,
-		Model:           result.Model,
-		Attempts:        attempts,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		CachedTokens:     result.Usage.PromptTokensDetails.CachedTokens,
+		CacheWriteTokens: result.Usage.PromptTokensDetails.CacheWriteTokens,
+		ReasoningTokens:  result.Usage.CompletionTokensDetails.ReasoningTokens,
+		LatencyMs:        latency,
+		CostUSD:          cost,
+		CostSource:       source,
+		Model:            result.Model,
+		Attempts:         attempts,
 	}
 	if len(result.Choices) == 0 {
 		return completion, fmt.Errorf("LLM returned no choices")
@@ -556,7 +564,8 @@ func sortedIDs(m map[int64]bool) []int64 {
 // operator chose "Skip with reason". The skip stands either way.
 var skipReasonWait = 10 * time.Minute
 
-// approvalButtons is the keyboard on every approval message.
+// approvalButtons is the keyboard on every approval message. The update pump
+// reads its callback data to tell an approval tap from a command tap.
 func approvalButtons() [][]map[string]string {
 	return [][]map[string]string{
 		{
@@ -1352,6 +1361,14 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 				prompt = strings.ReplaceAll(prompt, "{{"+k+"}}", v)
 			}
 
+			// Up to its first remaining placeholder the prompt is the same on
+			// every run of this step; that part is what a prompt cache can
+			// serve again. Pipeline data only ever lands at or after it.
+			stable := prompt
+			if i := strings.Index(prompt, "{{"); i >= 0 {
+				stable = prompt[:i]
+			}
+
 			// Inject pipeline data
 			for k, v := range data {
 				prompt = strings.ReplaceAll(prompt, "{{"+k+"}}", fmt.Sprintf("%v", v))
@@ -1362,29 +1379,68 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			if aiTimeout == 0 {
 				aiTimeout = 30 * time.Second
 			}
-			aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
+			// A reply that fails the schema is asked for again, at most
+			// output_retries times, with the validation error appended. Each
+			// attempt is a governed call of its own: model policy, budget
+			// admission and settlement apply to every one, and a refused
+			// attempt ends the step.
+			retries := outputRetries(step, schema)
+			callPrompt := prompt
+			var (
+				resp   *CompletionResponse
+				parsed map[string]interface{}
+				tokens int
+				cost   float64
+			)
+			for attempt := 0; ; attempt++ {
+				aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
+				// a retry keeps the same fixed instructions first, so it reads them from the prompt cache too
+				r, err := callLLM(withStablePrefix(aiCtx, stable), cfg, role, callPrompt, budget)
+				aiCancel()
+				if err != nil {
+					if attempt > 0 {
+						return fmt.Errorf("[step:%s] LLM call failed on output retry %d/%d: %w", step.Name, attempt, retries, err)
+					}
+					return fmt.Errorf("[step:%s] LLM call failed: %w", step.Name, err)
+				}
+				resp = r
 
-			resp, err := callLLM(aiCtx, cfg, role, prompt, budget)
-			aiCancel()
-			if err != nil {
-				return fmt.Errorf("[step:%s] LLM call failed: %w", step.Name, err)
+				// Record token usage
+				log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
+					pipeline.Name, step.Name, resp.Model,
+					resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
+				if resp.CachedTokens > 0 || resp.CacheWriteTokens > 0 {
+					log.Printf("[pipeline:%s][step:%s] prompt cache: %d input token(s) read, %d written",
+						pipeline.Name, step.Name, resp.CachedTokens, resp.CacheWriteTokens)
+				}
+				tokens += resp.InputTokens + resp.OutputTokens
+				cost += resp.CostUSD
+
+				if len(schema) == 0 {
+					break
+				}
+				p, verr := validateOutput(resp.Text, schema)
+				if verr == nil {
+					parsed = p
+					break
+				}
+				if attempt >= retries {
+					log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s", pipeline.Name, step.Name, verr)
+					if attempt > 0 {
+						return fmt.Errorf("[step:%s] output validation failed after %d attempts: %w", step.Name, attempt+1, verr)
+					}
+					return fmt.Errorf("[step:%s] output validation failed: %w", step.Name, verr)
+				}
+				log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s; output retry %d/%d with the validation error",
+					pipeline.Name, step.Name, verr, attempt+1, retries)
+				callPrompt = outputRetryPrompt(prompt, verr)
 			}
-
-			// Record token usage
-			log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
-				pipeline.Name, step.Name, resp.Model,
-				resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
 			stepFields["model"] = resp.Model
-			stepFields["tokens"] = resp.InputTokens + resp.OutputTokens
-			stepFields["cost_usd"] = resp.CostUSD
+			stepFields["tokens"] = tokens
+			stepFields["cost_usd"] = cost
 
 			// Validate output
 			if len(schema) > 0 {
-				parsed, err := validateOutput(resp.Text, schema)
-				if err != nil {
-					log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s", pipeline.Name, step.Name, err)
-					return fmt.Errorf("[step:%s] output validation failed: %w", step.Name, err)
-				}
 				data["ai_output"] = parsed
 				log.Printf("[pipeline:%s][step:%s] output validated (%d fields)", pipeline.Name, step.Name, len(parsed))
 			} else {
@@ -2183,6 +2239,81 @@ func handleAuthCode(args string, bot *TGBot) {
 		return
 	}
 	bot.Send("[authcode] Success. Gmail now has send/compose permissions.")
+}
+
+// tgCallbackDataMax is Telegram's limit on a button's callback_data. A tap that
+// carries more did not come from a button this engine sent.
+const tgCallbackDataMax = 64
+
+// parseCronCallback reads the data of a /cron keyboard button,
+// "cron:<pause|resume|run>:<pipeline>". Any other shape (another prefix, an
+// action no button has, an empty name, more than Telegram allows) is not one
+// of those buttons.
+func parseCronCallback(data string) (action, name string, ok bool) {
+	if len(data) > tgCallbackDataMax {
+		return "", "", false
+	}
+	rest, found := strings.CutPrefix(data, "cron:")
+	if !found {
+		return "", "", false
+	}
+	action, name, found = strings.Cut(rest, ":")
+	if !found || name == "" {
+		return "", "", false
+	}
+	switch action {
+	case "pause", "resume", "run":
+		return action, name, true
+	}
+	return "", "", false
+}
+
+// handleCallback acts on a button tap the update pump did not route to an
+// approval waiter: the /cron keyboard's pause, resume and run buttons. Every
+// tap is answered, so the client stops waiting, and a pipeline that is not
+// configured is never confirmed as paused, resumed or started.
+func handleCallback(cb *TGCallback, bot *TGBot, sched *Scheduler, cfg *config.Config, budget *BudgetTracker, skills *skillsapi.SkillRegistry) {
+	if !bot.isAllowedUser(cb.From.ID) {
+		bot.answerCallback(cb.ID, "") // silent drop
+		return
+	}
+	// The data is whatever the client sent: quoted, so a newline in it cannot
+	// start a log line of its own, and cut at Telegram's limit.
+	data := cb.Data
+	if len(data) > tgCallbackDataMax {
+		data = data[:tgCallbackDataMax] + "..."
+	}
+	log.Printf("[callback] %q (user: %d)", data, cb.From.ID)
+
+	action, name, ok := parseCronCallback(cb.Data)
+	if !ok {
+		// A tap on a prompt that is already decided, or data no button carries.
+		bot.answerCallback(cb.ID, "")
+		return
+	}
+	switch action {
+	case "pause":
+		if !sched.Pause(name) {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Paused: "+name)
+		_ = bot.Send(fmt.Sprintf("[cron] Paused: %s", name))
+	case "resume":
+		if !sched.Resume(name) {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Resumed: "+name)
+		_ = bot.Send(fmt.Sprintf("[cron] Resumed: %s", name))
+	case "run":
+		if _, known := cfg.Pipeline(name); !known {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Starting: "+name)
+		handleRun(name, bot, sched, cfg, budget, skills)
+	}
 }
 
 func handleCron(args string, bot *TGBot, sched *Scheduler) {
@@ -3034,30 +3165,7 @@ Conversation so far:
 
 				// Handle callback queries (button clicks) — separate from messages
 				if u.CallbackQuery != nil {
-					cb := u.CallbackQuery
-					if !bot.isAllowedUser(cb.From.ID) {
-						bot.answerCallback(cb.ID, "") // silent drop
-						continue
-					}
-					log.Printf("[callback] %s (user: %d)", cb.Data, cb.From.ID)
-					if strings.HasPrefix(cb.Data, "cron:") {
-						parts := strings.SplitN(cb.Data, ":", 3)
-						if len(parts) == 3 {
-							switch parts[1] {
-							case "pause":
-								sched.Pause(parts[2])
-								bot.answerCallback(cb.ID, "Paused: "+parts[2])
-								bot.Send(fmt.Sprintf("[cron] Paused: %s", parts[2]))
-							case "resume":
-								sched.Resume(parts[2])
-								bot.answerCallback(cb.ID, "Resumed: "+parts[2])
-								bot.Send(fmt.Sprintf("[cron] Resumed: %s", parts[2]))
-							case "run":
-								bot.answerCallback(cb.ID, "Starting: "+parts[2])
-								handleRun(parts[2], bot, sched, currentConfig(&cfg), budget, currentSkills(skillReg))
-							}
-						}
-					}
+					handleCallback(u.CallbackQuery, bot, sched, currentConfig(&cfg), budget, currentSkills(skillReg))
 				}
 			}
 

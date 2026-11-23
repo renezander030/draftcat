@@ -63,6 +63,42 @@ func TestToolGate_BadRegexAndGlobAreErrors(t *testing.T) {
 	}
 }
 
+func TestToolGate_DoubleStarGlobs(t *testing.T) {
+	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "t", Args: map[string]config.ArgConstraint{
+			"ok":     {Glob: "/work/repo/src/**/*.go"},
+			"bad":    {Glob: "/work/repo/[src/**"},
+			"parent": {Glob: "/work/repo/../shared/**"},
+		},
+	}}})
+	if anyHas(errs, "args.ok") || !anyHas(errs, "tool_gate.tools[0].args.bad.glob") || !anyHas(errs, "tool_gate.tools[0].args.parent.glob") {
+		t.Fatalf("** globs: want errors for args.bad and args.parent only, got %v", errs)
+	}
+}
+
+// The glob findings, word for word: a malformed pattern with or without a **
+// segment, and a ** pattern with a .. segment of its own. A .. segment in a
+// pattern without ** is matched by path.Match as written, so it is no finding.
+func TestToolGate_GlobFindingLines(t *testing.T) {
+	errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "t", Args: map[string]config.ArgConstraint{
+			"a_bad":         {Glob: "[unclosed"},
+			"b_bad_tree":    {Glob: "/work/repo/[src/**"},
+			"c_parent_tree": {Glob: "/work/repo/../shared/**"},
+			"d_parent_star": {Glob: "/work/repo/../shared/*"},
+			"e_tree":        {Glob: "**/*.md"},
+		},
+	}}})
+	want := []string{
+		`tool_gate.tools[0].args.a_bad.glob: bad pattern "[unclosed"`,
+		`tool_gate.tools[0].args.b_bad_tree.glob: bad pattern "/work/repo/[src/**"`,
+		`tool_gate.tools[0].args.c_parent_tree.glob: pattern "/work/repo/../shared/**" has a .. segment, and a ** glob never matches a path with one`,
+	}
+	if strings.Join(errs, "\n") != strings.Join(want, "\n") || len(warns) != 0 {
+		t.Fatalf("glob findings:\n got errors %q warnings %q\nwant errors %q", errs, warns, want)
+	}
+}
+
 func TestToolGate_EmptyConstraintIsAnError(t *testing.T) {
 	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
 		Name: "t", Args: map[string]config.ArgConstraint{"to": {}},
@@ -149,6 +185,21 @@ func TestToolGate_NotifyOutcomesValues(t *testing.T) {
 	}
 	if errs, _ := gateFindings(t, config.ToolGateConfig{NotifyOutcomes: "errors", Tools: []config.ToolRule{{Name: "t"}}}); !anyHas(errs, "tool_gate.notify_outcomes") {
 		t.Fatalf("unknown mode accepted: %v", errs)
+	}
+}
+
+func TestToolGate_ApprovalWindow(t *testing.T) {
+	for _, ok := range []string{"", "90s", "2m", "8h"} {
+		errs, warns := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "deploy", RequireApproval: true, ApprovalWindow: ok}}})
+		if len(errs) != 0 || len(warns) != 0 {
+			t.Fatalf("approval_window %q produced findings: errors=%v warnings=%v", ok, errs, warns)
+		}
+	}
+	for _, bad := range []string{"0", "0s", "-5m", "soon", "10"} {
+		errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{Name: "deploy", RequireApproval: true, ApprovalWindow: bad}}})
+		if !anyHas(errs, "tools[0].approval_window") {
+			t.Fatalf("approval_window %q accepted: %v", bad, errs)
+		}
 	}
 }
 

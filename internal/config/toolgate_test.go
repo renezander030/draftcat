@@ -59,6 +59,52 @@ func TestArgConstraint_MissingArgument(t *testing.T) {
 	}
 }
 
+// A ** path segment matches any depth, so one rule can allow a whole tree; *
+// keeps path.Match's meaning and never crosses a /, and no ** glob lets a ..
+// segment climb out of the directory it names.
+func TestArgConstraint_DoubleStarGlob(t *testing.T) {
+	cases := []struct {
+		glob, v string
+		ok      bool
+	}{
+		{"/work/repo/src/**", "/work/repo/src/main.go", true},
+		{"/work/repo/src/**", "/work/repo/src/pkg/sub/main.go", true},
+		{"/work/repo/src/**", "/work/repo/src/", true},
+		{"/work/repo/src/**", "/work/repo/src", false},
+		{"/work/repo/src/**", "/work/repo/srcx/main.go", false},
+		{"/work/repo/src/**", "/work/repo/src/../secrets/key", false},
+		{"/work/repo/src/**", "/work/repo/src/pkg/../../secrets/key", false},
+		{"/work/repo/src/**", `/work/repo/src/pkg\..\..\secrets\key`, false},
+		{"/work/repo/src/*", "/work/repo/src/main.go", true},
+		{"/work/repo/src/*", "/work/repo/src/pkg/main.go", false},
+		{"src/**/*.go", "src/main.go", true},
+		{"src/**/*.go", "src/a/b/main.go", true},
+		{"src/**/*.go", "src/a/b/main.md", false},
+		{"src/**/test/*", "src/test/x", true},
+		{"src/**/test/*", "src/a/b/test/x", true},
+		{"src/**/test/*", "src/a/test/b/x", false},
+		{"**/*.md", "README.md", true},
+		{"**/*.md", "docs/guide/a.md", true},
+		{"**/*.md", "../outside/a.md", false},
+		{"**", "any/depth/at/all", true},
+		{"**", "../up", false},
+		{"/work/**/docs/**", "/work/a/docs/b/c.md", true},
+		{"/work/**/docs/**", "/work/docs/c.md", true},
+		{"/work/**/docs/**", "/work/a/b/c.md", false},
+		{"report**.csv", "report-2026.csv", true},
+		{"report**.csv", "report/2026.csv", false},
+	}
+	for _, tc := range cases {
+		ok, why := (ArgConstraint{Glob: tc.glob}).Check(tc.v, true)
+		if ok != tc.ok {
+			t.Errorf("glob %q on %q = (%v, %q), want %v", tc.glob, tc.v, ok, why, tc.ok)
+		}
+	}
+	if ok, why := (ArgConstraint{Glob: "/work/repo/src/**"}).Check("/work/repo/src/../secrets", true); ok || !strings.Contains(why, "..") {
+		t.Errorf("a .. segment under a ** glob = (%v, %q), want a refusal that names the .. segment", ok, why)
+	}
+}
+
 func TestToolRule_MatchArgsNamesTheFirstFailureInKeyOrder(t *testing.T) {
 	r := ToolRule{Args: map[string]ArgConstraint{
 		"to":      {Glob: "*@example.com"},
