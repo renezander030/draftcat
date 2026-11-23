@@ -63,6 +63,19 @@ func TestToolGate_BadRegexAndGlobAreErrors(t *testing.T) {
 	}
 }
 
+func TestToolGate_DoubleStarGlobs(t *testing.T) {
+	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
+		Name: "t", Args: map[string]config.ArgConstraint{
+			"ok":     {Glob: "/work/repo/src/**/*.go"},
+			"bad":    {Glob: "/work/repo/[src/**"},
+			"parent": {Glob: "/work/repo/../shared/**"},
+		},
+	}}})
+	if anyHas(errs, "args.ok") || !anyHas(errs, "tool_gate.tools[0].args.bad.glob") || !anyHas(errs, "tool_gate.tools[0].args.parent.glob") {
+		t.Fatalf("** globs: want errors for args.bad and args.parent only, got %v", errs)
+	}
+}
+
 func TestToolGate_EmptyConstraintIsAnError(t *testing.T) {
 	errs, _ := gateFindings(t, config.ToolGateConfig{Tools: []config.ToolRule{{
 		Name: "t", Args: map[string]config.ArgConstraint{"to": {}},

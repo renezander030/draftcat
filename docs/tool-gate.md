@@ -103,7 +103,7 @@ Constraints, all of which must hold when several are given on one argument:
 |------------|------------|
 | `equals`   | the value, in string form, equals this (numbers compare by value) |
 | `one_of`   | the value is one of the listed strings |
-| `glob`     | the value matches a `path.Match` pattern (`*`, `?`, `[...]`) |
+| `glob`     | the value matches a `path.Match` pattern (`*`, `?`, `[...]`; `*` never crosses a `/`); a `**` segment matches any depth: `src/**` is everything inside `src/`, `src/**/*.go` every `.go` file under it |
 | `regex`    | the value matches a Go regular expression — write `^` and `$` to anchor it |
 | `min`/`max`| the value is a number inside the bound |
 | `max_per_day` | the value is a number of 0 or more, and today's total stays inside the cap (below) |
@@ -114,7 +114,11 @@ human even when the rule would allow the call silently (below).
 
 Values are compared in their string form: strings as-is, numbers without an
 exponent, booleans as `true`/`false`, anything structured as compact JSON.
+A glob with a `**` segment never matches a value with a `..` segment (between
+`/` or `\`), so `src/**` does not let `src/../secrets` through; values are not
+cleaned before matching.
 `draftcat validate` refuses a regex that does not compile, a malformed glob, a
+`**` glob with a `..` segment of its own (it could never match), a
 `min` above its `max`, a `review_above` at or above `max`, a negative
 `max_per_day`, and a constraint with no condition (almost always a typo'd key).
 

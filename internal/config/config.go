@@ -13,7 +13,6 @@ import (
 	"math"
 	"math/big"
 	"os"
-	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -1080,7 +1079,7 @@ const CallCountKey = "#calls"
 type ArgConstraint struct {
 	Equals   interface{} `yaml:"equals"`
 	OneOf    []string    `yaml:"one_of"`
-	Glob     string      `yaml:"glob"`  // path.Match syntax: * ? [...]
+	Glob     string      `yaml:"glob"`  // path.Match syntax: * ? [...], plus ** segments (MatchGlob)
 	Regex    string      `yaml:"regex"` // Go RE2, unanchored unless you write ^ $
 	Max      *float64    `yaml:"max"`
 	Min      *float64    `yaml:"min"`
@@ -1135,7 +1134,10 @@ func (c ArgConstraint) Check(v interface{}, present bool) (bool, string) {
 		}
 	}
 	if c.Glob != "" {
-		ok, err := path.Match(c.Glob, s)
+		ok, err := MatchGlob(c.Glob, s)
+		if err == nil && !ok && HasDoubleStar(c.Glob) && HasParentSegment(s) {
+			return false, fmt.Sprintf("%q has a .. segment, which a ** glob never matches", clip(s))
+		}
 		if err != nil || !ok {
 			return false, fmt.Sprintf("%q does not match glob %q", clip(s), c.Glob)
 		}

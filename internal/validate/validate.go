@@ -6,7 +6,6 @@ import (
 	"maps"
 	"math"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -1009,8 +1008,10 @@ func checkArgConstraints(t config.ToolRule, p string, rep *validateReport) {
 			}
 		}
 		if c.Glob != "" {
-			if _, err := path.Match(c.Glob, ""); err != nil {
+			if _, err := config.MatchGlob(c.Glob, ""); err != nil {
 				rep.errf(ap+".glob", "bad pattern %q", c.Glob)
+			} else if config.HasDoubleStar(c.Glob) && config.HasParentSegment(c.Glob) {
+				rep.errf(ap+".glob", "pattern %q has a .. segment, and a ** glob never matches a path with one", c.Glob)
 			}
 		}
 		if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
