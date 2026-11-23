@@ -556,6 +556,7 @@ func checkPipelines(cfg *config.Config, skills map[string]*skillsapi.SkillDef, s
 			case "ai":
 				aiSteps++
 				checkOutputSchema(st.OutputSchema, spath, rep)
+				checkOutputRetries(st, skills, spath, rep)
 				if st.Skill == "" && st.Prompt == "" {
 					rep.errf(spath, "ai step needs either 'skill' or inline 'prompt'")
 				}
@@ -1282,5 +1283,24 @@ func min3(a, b, c int) int {
 func checkOutputSchema(schema map[string]interface{}, path string, rep *validateReport) {
 	for _, finding := range outputschema.Check(schema) {
 		rep.errf(path+".output_schema."+finding.Field, "%s", finding.Message)
+	}
+}
+
+// checkOutputRetries bounds an ai step's output_retries. Each retry is a paid
+// call, so the count is capped rather than left to the config.
+func checkOutputRetries(st config.StepConfig, skills map[string]*skillsapi.SkillDef, path string, rep *validateReport) {
+	if st.OutputRetries == nil {
+		return
+	}
+	if n := *st.OutputRetries; n < 0 || n > config.MaxOutputRetries {
+		rep.errf(path+".output_retries", "must be 0 to %d (got %d)", config.MaxOutputRetries, n)
+		return
+	}
+	hasSchema := len(st.OutputSchema) > 0
+	if sk, ok := skills[st.Skill]; ok && len(sk.OutputSchema) > 0 {
+		hasSchema = true
+	}
+	if !hasSchema && *st.OutputRetries > 0 {
+		rep.warnf(path+".output_retries", "has no effect: the step has no output_schema to validate against")
 	}
 }

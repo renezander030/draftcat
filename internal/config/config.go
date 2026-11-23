@@ -593,6 +593,12 @@ type StepConfig struct {
 	Mode         string              `yaml:"mode"`
 	Channel      string              `yaml:"channel"`
 	OutputSchema outputschema.Schema `yaml:"output_schema"`
+	// OutputRetries is how many more times an ai step asks the model when a
+	// reply fails its output_schema. Each retry repeats the prompt with the
+	// validation error appended and is a call of its own: model policy and
+	// budget admission apply to it as to the first. Omitted = 1, 0 = fail on
+	// the first invalid reply, at most MaxOutputRetries.
+	OutputRetries *int `yaml:"output_retries"`
 	// Quorum is the number of distinct human operators that must approve this
 	// approval step before the action is released. 0 or 1 = single approver
 	// (default, unchanged behavior). Only the telegram channel implements N>=2.
@@ -625,6 +631,21 @@ type StepConfig struct {
 	// never who may decide, because widening authority on a timer would let a
 	// slow operator silently promote someone the config never approved.
 	EscalateTo []int64 `yaml:"escalate_to"`
+}
+
+// Output retry bounds for an ai step's output_schema.
+const (
+	DefaultOutputRetries = 1
+	MaxOutputRetries     = 3
+)
+
+// OutputRetriesOrDefault returns the step's output retry count, clamped to
+// 0..MaxOutputRetries so a config that skipped validation stays bounded.
+func (s StepConfig) OutputRetriesOrDefault() int {
+	if s.OutputRetries == nil {
+		return DefaultOutputRetries
+	}
+	return min(max(*s.OutputRetries, 0), MaxOutputRetries)
 }
 
 // Risk levels. Declared by the operator in config, never inferred.

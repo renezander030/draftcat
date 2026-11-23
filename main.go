@@ -1362,29 +1362,63 @@ Description: We need an experienced LLM engineer to build a retrieval-augmented 
 			if aiTimeout == 0 {
 				aiTimeout = 30 * time.Second
 			}
-			aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
+			// A reply that fails the schema is asked for again, at most
+			// output_retries times, with the validation error appended. Each
+			// attempt is a governed call of its own: model policy, budget
+			// admission and settlement apply to every one, and a refused
+			// attempt ends the step.
+			retries := outputRetries(step, schema)
+			callPrompt := prompt
+			var (
+				resp   *CompletionResponse
+				parsed map[string]interface{}
+				tokens int
+				cost   float64
+			)
+			for attempt := 0; ; attempt++ {
+				aiCtx, aiCancel := context.WithTimeout(ctx, aiTimeout)
+				r, err := callLLM(aiCtx, cfg, role, callPrompt, budget)
+				aiCancel()
+				if err != nil {
+					if attempt > 0 {
+						return fmt.Errorf("[step:%s] LLM call failed on output retry %d/%d: %w", step.Name, attempt, retries, err)
+					}
+					return fmt.Errorf("[step:%s] LLM call failed: %w", step.Name, err)
+				}
+				resp = r
 
-			resp, err := callLLM(aiCtx, cfg, role, prompt, budget)
-			aiCancel()
-			if err != nil {
-				return fmt.Errorf("[step:%s] LLM call failed: %w", step.Name, err)
+				// Record token usage
+				log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
+					pipeline.Name, step.Name, resp.Model,
+					resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
+				tokens += resp.InputTokens + resp.OutputTokens
+				cost += resp.CostUSD
+
+				if len(schema) == 0 {
+					break
+				}
+				p, verr := validateOutput(resp.Text, schema)
+				if verr == nil {
+					parsed = p
+					break
+				}
+				if attempt >= retries {
+					log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s", pipeline.Name, step.Name, verr)
+					if attempt > 0 {
+						return fmt.Errorf("[step:%s] output validation failed after %d attempts: %w", step.Name, attempt+1, verr)
+					}
+					return fmt.Errorf("[step:%s] output validation failed: %w", step.Name, verr)
+				}
+				log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s; output retry %d/%d with the validation error",
+					pipeline.Name, step.Name, verr, attempt+1, retries)
+				callPrompt = outputRetryPrompt(prompt, verr)
 			}
-
-			// Record token usage
-			log.Printf("[pipeline:%s][step:%s] model=%s tokens=%d+%d cost=$%.4f latency=%dms",
-				pipeline.Name, step.Name, resp.Model,
-				resp.InputTokens, resp.OutputTokens, resp.CostUSD, resp.LatencyMs)
 			stepFields["model"] = resp.Model
-			stepFields["tokens"] = resp.InputTokens + resp.OutputTokens
-			stepFields["cost_usd"] = resp.CostUSD
+			stepFields["tokens"] = tokens
+			stepFields["cost_usd"] = cost
 
 			// Validate output
 			if len(schema) > 0 {
-				parsed, err := validateOutput(resp.Text, schema)
-				if err != nil {
-					log.Printf("[pipeline:%s][step:%s] OUTPUT_INVALID: %s", pipeline.Name, step.Name, err)
-					return fmt.Errorf("[step:%s] output validation failed: %w", step.Name, err)
-				}
 				data["ai_output"] = parsed
 				log.Printf("[pipeline:%s][step:%s] output validated (%d fields)", pipeline.Name, step.Name, len(parsed))
 			} else {
