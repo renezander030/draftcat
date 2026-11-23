@@ -820,6 +820,24 @@ in the `policy` column. The signed envelope also carries the stable action ID,
 policy digest, exact binding, run ID, and expiry. `draftcat receipts list`,
 `show`, and `export` read the rows directly from SQLite.
 
+An approval that times out writes its `deny` receipt with the reason
+`approval timed out — the gate denies rather than assumes yes`. A request the
+gate refuses outside a decision writes one too, with `decision = deny`,
+operator `0`, `lifecycle = refused` and the reason in `policy`:
+
+- `request refused — ...`: a body that is not valid JSON or has unknown fields
+  (step `-`, payload hash over the raw body), an invalid `action_id`,
+  `precondition`, `mode`, `wait` or `expires_at`, no tool named, an `agent`
+  that is not the caller token's name, or an `action_id` already bound to
+  other data (the receipt carries the binding the request tried to use);
+- `permit not consumed — ...`: a consume refused while the gate or the
+  agent is frozen, with a binding that does not match, a precondition that no
+  longer holds, a malformed body, or a permit that is not `allowed` (already
+  consumed, denied, expired or revoked). The receipt is bound to the action.
+
+A request without an accepted token writes no receipt: who sent it is not
+known, and the receipt history is not writable without a token.
+
 ## Configuration reference
 
 ```yaml

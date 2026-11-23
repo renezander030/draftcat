@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+- An approval that timed out now writes its deny receipt (reason `approval timed out`), and a request the tool gate refuses without deciding writes a signed v2 receipt too (`decision: deny`, operator 0, `lifecycle: refused`, the reason in `policy`): malformed or unknown-field JSON, an invalid `action_id`, `mode`, `wait`, `precondition` or `expires_at`, no tool named, an `agent` that is not the caller token's name, an `action_id` bound to other data, and a consume refused while frozen, with another binding, a failed precondition or a permit already used. Responses are unchanged; a request without an accepted token writes none.
+
 ## 0.15.1
 
 - Telegram approvals retain button responses that arrive before the prompt request finishes, including quorum votes. Concurrent prompts keep their own decisions, while command buttons continue to work.

@@ -34,6 +34,9 @@ package main
 //   - Silent refusals are not silent to the operator. A denial the gate made
 //     on its own (unlisted tool, argument mismatch, repeat guard) is reported
 //     to the operator channel, deduplicated so a looping agent does not spam.
+//   - Refused attempts stay in the audit trail. Every decision has a signed
+//     receipt, and so does a request the gate refused without deciding (one
+//     it could not read or would not accept, a consume it would not grant).
 
 import (
 	"context"
@@ -264,11 +267,26 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	var req ToolCallRequest
-	if !readStrictJSON(w, r, 1<<20, &req) {
+	body, ok := readRequestBody(w, r, 1<<20)
+	if !ok {
 		return
 	}
+	// A request the gate refuses before deciding is recorded like a denial:
+	// its receipt keeps the attempt.
+	var req ToolCallRequest
+	if err := decodeStrictJSON(body, &req); err != nil {
+		sum := sha256.Sum256(body)
+		g.recordRequestRefusal(r, ToolCallRequest{}, "", "sha256:"+hex.EncodeToString(sum[:]), "malformed json")
+		http.Error(w, "malformed json", http.StatusBadRequest)
+		return
+	}
+	argsHash, askedID := hashToolArgs(req.Args), req.ActionID
+	refuse := func(code int, msg string) {
+		g.recordRequestRefusal(r, req, askedID, argsHash, msg)
+		http.Error(w, msg, code)
+	}
 	if req.Tool == "" {
+		g.recordRequestRefusal(r, req, askedID, argsHash, "no tool named")
 		writeToolDecision(w, http.StatusOK, ToolCallResponse{
 			Decision: "deny", Reason: "no tool named",
 		})
@@ -277,6 +295,8 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	caller := gateCallerFrom(r.Context())
 	if caller != nil {
 		if req.Agent != "" && req.Agent != caller.Name {
+			g.recordRequestRefusal(r, req, askedID, argsHash,
+				fmt.Sprintf("agent %q does not match the caller token (caller %s)", clipReason(req.Agent), caller.Name))
 			http.Error(w, "agent does not match the caller token", http.StatusForbidden)
 			return
 		}
@@ -289,16 +309,16 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 		req.ActionID = newToolTicketID()
 	}
 	if !validActionID(req.ActionID) {
-		http.Error(w, "action_id must be 1-128 URL-safe characters", http.StatusBadRequest)
+		refuse(http.StatusBadRequest, "action_id must be 1-128 URL-safe characters")
 		return
 	}
 	if !validPrecondition(req.Precondition) {
-		http.Error(w, "precondition must be at most 512 printable characters", http.StatusBadRequest)
+		refuse(http.StatusBadRequest, "precondition must be at most 512 printable characters")
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(req.Mode))
 	if mode != "" && mode != "sync" && mode != "async" {
-		http.Error(w, `mode must be "sync" or "async"`, http.StatusBadRequest)
+		refuse(http.StatusBadRequest, `mode must be "sync" or "async"`)
 		return
 	}
 	async := mode == "async"
@@ -306,13 +326,12 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	if !async && strings.TrimSpace(req.Wait) != "" {
 		d, perr := time.ParseDuration(strings.TrimSpace(req.Wait))
 		if perr != nil || d < 0 {
-			http.Error(w, `wait must be a duration like "30s"`, http.StatusBadRequest)
+			refuse(http.StatusBadRequest, `wait must be a duration like "30s"`)
 			return
 		}
 		wait = d
 	}
 
-	argsHash := hashToolArgs(req.Args)
 	rule, listed := g.cfg.ToolGate.Lookup(req.Tool)
 	policyHash := g.policyHash(req.Tool, rule, listed)
 	expires := g.now().Add(g.approvalWindow())
@@ -322,7 +341,7 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.ExpiresAt) != "" {
 		requested, err := time.Parse(time.RFC3339, req.ExpiresAt)
 		if err != nil || !requested.After(g.now()) {
-			http.Error(w, "expires_at must be a future RFC3339 timestamp", http.StatusBadRequest)
+			refuse(http.StatusBadRequest, "expires_at must be a future RFC3339 timestamp")
 			return
 		}
 		if requested.Before(expires) {
@@ -344,6 +363,11 @@ func (g *toolGate) HandleCall(w http.ResponseWriter, r *http.Request) {
 	req.bindingHash = hashToolBinding(req, argsHash, policyHash, expires)
 	replay, code, handled := g.reserveAction(req)
 	if handled {
+		if code == http.StatusConflict {
+			// The action_id is bound to other data: the receipt keeps the
+			// binding this request tried to put under it.
+			g.recordRequestRefusal(r, req, req.ActionID, argsHash, replay.Reason)
+		}
 		writeToolDecision(w, code, replay)
 		return
 	}
@@ -587,7 +611,13 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		BindingHash  string `json:"binding_hash"`
 		Precondition string `json:"precondition"`
 	}
-	if !readStrictJSON(w, r, 4096, &body) {
+	raw, ok := readRequestBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := decodeStrictJSON(raw, &body); err != nil {
+		g.refuseConsume(id, "malformed json")
+		http.Error(w, "malformed json", http.StatusBadRequest)
 		return
 	}
 	if state == nil {
@@ -600,6 +630,11 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	if body.BindingHash == "" || body.BindingHash != resp.BindingHash || resp.State != "allowed" {
+		why := "permit is " + resp.State
+		if body.BindingHash == "" || body.BindingHash != resp.BindingHash {
+			why = "binding_hash does not match this action"
+		}
+		g.refuseConsume(id, why)
 		resp.Permit = ""
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
@@ -607,6 +642,7 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	// A frozen gate refuses the permit like a denied one. The permit itself is
 	// untouched, so it can be consumed again once the freeze is lifted.
 	if deny, frozen := g.frozen(); frozen {
+		g.refuseConsume(id, deny.Reason)
 		resp.Permit, resp.Consume = "", ""
 		resp.Decision, resp.Rule, resp.Reason = deny.Decision, deny.Rule, deny.Reason
 		writeToolDecision(w, http.StatusConflict, resp)
@@ -619,12 +655,14 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	}
 	// So does a frozen agent's, for the permits it holds.
 	if deny, frozen := g.agentFrozen(a.Agent); frozen {
+		g.refuseConsume(id, deny.Reason)
 		resp.Permit, resp.Consume = "", ""
 		resp.Decision, resp.Rule, resp.Reason = deny.Decision, deny.Rule, deny.Reason
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
 	if ok, why := preconditionHolds(a, body.Precondition); !ok {
+		g.refuseConsume(id, why)
 		resp.Permit, resp.Rule, resp.Reason = "", "precondition_failed", why
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
@@ -643,6 +681,12 @@ func (g *toolGate) handleConsume(w http.ResponseWriter, r *http.Request, id stri
 	resp = responseFromToolAction(a)
 	g.updateTicket(id, resp)
 	if !consumed {
+		why := "permit is " + a.Status
+		if a.Status == "allowed" {
+			// Still allowed with the binding matched: only the expiry stood in the way.
+			why = "permit expired before consumption"
+		}
+		g.refuseConsume(id, why)
 		writeToolDecision(w, http.StatusConflict, resp)
 		return
 	}
@@ -1063,8 +1107,13 @@ func (g *toolGate) finishAction(req ToolCallRequest, resp ToolCallResponse) Tool
 		}
 	}
 	if !now.Before(expires) {
+		// A decision past the window releases nothing. An approval is
+		// recorded as the expired permit it became; a denial keeps its own
+		// reason, so an approval that timed out says so on its receipt.
+		if resp.Decision == "allow" {
+			resp.Reason = "permit expired before consumption"
+		}
 		resp.Decision, resp.State, resp.Consume = "deny", "expired", ""
-		resp.Reason = "permit expired before consumption"
 		decision = "deny"
 	}
 	if state != nil {
@@ -1119,6 +1168,74 @@ func toolDecisionReceipt(req ToolCallRequest, decision, reason string, decidedAt
 		BindingHash: req.bindingHash, ExpiresAt: expires, Lifecycle: "decided",
 	}
 	return envelope, sealApprovalEnvelope(&envelope)
+}
+
+// toolRefusalReceipt seals the receipt of a request the gate refused outside a
+// decision on a bound call: one it could not read or would not accept, or a
+// consume it would not grant. No operator decided it and nothing was released
+// (operator 0, quorum 0 of 1). The policy is the reason, and lifecycle
+// "refused" sets it apart from the decision and consumption receipts.
+func toolRefusalReceipt(e statestore.ApprovalEnvelope, reason string, at time.Time) (statestore.ApprovalEnvelope, error) {
+	e.ReceiptID, e.Pipeline, e.DecidedAt, e.Decision = newReceiptID(), "tool-gate", at, "deny"
+	e.OperatorID, e.QuorumN, e.QuorumGot, e.Policy, e.Lifecycle = 0, 1, 0, reason, "refused"
+	if e.Step == "" {
+		e.Step = "-"
+	}
+	if e.ExpiresAt.IsZero() {
+		e.ExpiresAt = at
+	}
+	return e, sealApprovalEnvelope(&e)
+}
+
+// recordRefusal logs a refusal the gate made without a human and appends its
+// receipt. The request is refused either way: a receipt that cannot be
+// written is logged, never a reason to answer differently.
+func (g *toolGate) recordRefusal(agent string, e statestore.ApprovalEnvelope, reason string) {
+	log.Printf("[tool-gate] DENY %s (%s) agent=%q", orDash(e.Step), reason, agent)
+	if state == nil {
+		return
+	}
+	e, err := toolRefusalReceipt(e, reason, g.now())
+	if err == nil {
+		err = state.RecordApprovalV2(e)
+	}
+	if err != nil {
+		log.Printf("[tool-gate] refusal receipt not written: %v", err)
+	}
+}
+
+// recordRequestRefusal records a tool call the gate would not decide.
+// actionID is the one the caller sent, kept only when it is valid; the agent
+// is the caller token's name when a caller token was used.
+func (g *toolGate) recordRequestRefusal(r *http.Request, req ToolCallRequest, actionID, payloadHash, msg string) {
+	agent := req.Agent
+	if c := gateCallerFrom(r.Context()); c != nil {
+		agent = c.Name
+	}
+	if !validActionID(actionID) {
+		actionID = ""
+	}
+	g.recordRefusal(agent, statestore.ApprovalEnvelope{
+		ActionID: actionID, RunID: req.RunID, Step: req.Tool, PayloadHash: payloadHash,
+		PolicyHash: req.policyHash, BindingHash: req.bindingHash, ExpiresAt: req.expires,
+	}, "request refused — "+msg)
+}
+
+// refuseConsume records a consume the gate would not grant, bound to the
+// action it named. A consume that names no stored action has nothing to bind
+// and is only answered.
+func (g *toolGate) refuseConsume(id, why string) {
+	if state == nil {
+		return
+	}
+	a, err := state.ToolAction(id)
+	if err != nil {
+		return
+	}
+	g.recordRefusal(a.Agent, statestore.ApprovalEnvelope{
+		ActionID: a.ActionID, RunID: a.RunID, Step: a.Tool, PayloadHash: a.ArgsHash,
+		PolicyHash: a.PolicyHash, BindingHash: a.BindingHash, ExpiresAt: a.ExpiresAt,
+	}, "permit not consumed — "+why)
 }
 
 func toolConsumptionReceipt(a statestore.ToolAction, at time.Time) (statestore.ApprovalEnvelope, error) {

@@ -51,7 +51,19 @@ func (s *StateStore) DecideToolActionWithReceipt(id, status, decision, reason, b
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Persisted expiries have second precision. Exactly at expiration is invalid.
-	if _, err := tx.ExecContext(context.Background(), `UPDATE tool_actions SET status='expired', decision='deny', reason='permit expired before consumption', updated_at=? WHERE action_id=? AND status='pending' AND expires_at<=?`, at.Unix(), id, at.Unix()); err != nil {
+	// A pending action past its expiry closes as expired, not as decided. When
+	// the decision that finds it there is a denial (an approval that timed
+	// out), the action keeps that reason and the denial its receipt.
+	expiredReason := "permit expired before consumption"
+	if decision == "deny" {
+		expiredReason = reason
+	}
+	ex, err := tx.ExecContext(context.Background(), `UPDATE tool_actions SET status='expired', decision='deny', reason=?, updated_at=? WHERE action_id=? AND status='pending' AND expires_at<=?`, expiredReason, at.Unix(), id, at.Unix())
+	if err != nil {
+		return ToolAction{}, err
+	}
+	expired, err := ex.RowsAffected()
+	if err != nil {
 		return ToolAction{}, err
 	}
 	res, err := tx.ExecContext(context.Background(), `UPDATE tool_actions SET status=?,decision=?,reason=?,decided_by=?,updated_at=? WHERE action_id=? AND status='pending'`, status, decision, reason, by, at.Unix(), id)
@@ -62,7 +74,7 @@ func (s *StateStore) DecideToolActionWithReceipt(id, status, decision, reason, b
 	if err != nil {
 		return ToolAction{}, err
 	}
-	if n == 1 {
+	if n == 1 || (expired == 1 && decision == "deny") {
 		if err := appendToolReceipt(tx, e); err != nil {
 			return ToolAction{}, err
 		}
