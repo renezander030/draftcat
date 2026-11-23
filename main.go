@@ -2185,6 +2185,81 @@ func handleAuthCode(args string, bot *TGBot) {
 	bot.Send("[authcode] Success. Gmail now has send/compose permissions.")
 }
 
+// tgCallbackDataMax is Telegram's limit on a button's callback_data. A tap that
+// carries more did not come from a button this engine sent.
+const tgCallbackDataMax = 64
+
+// parseCronCallback reads the data of a /cron keyboard button,
+// "cron:<pause|resume|run>:<pipeline>". Any other shape (another prefix, an
+// action no button has, an empty name, more than Telegram allows) is not one
+// of those buttons.
+func parseCronCallback(data string) (action, name string, ok bool) {
+	if len(data) > tgCallbackDataMax {
+		return "", "", false
+	}
+	rest, found := strings.CutPrefix(data, "cron:")
+	if !found {
+		return "", "", false
+	}
+	action, name, found = strings.Cut(rest, ":")
+	if !found || name == "" {
+		return "", "", false
+	}
+	switch action {
+	case "pause", "resume", "run":
+		return action, name, true
+	}
+	return "", "", false
+}
+
+// handleCallback acts on a button tap the update pump did not route to an
+// approval waiter: the /cron keyboard's pause, resume and run buttons. Every
+// tap is answered, so the client stops waiting, and a pipeline that is not
+// configured is never confirmed as paused, resumed or started.
+func handleCallback(cb *TGCallback, bot *TGBot, sched *Scheduler, cfg *config.Config, budget *BudgetTracker, skills *skillsapi.SkillRegistry) {
+	if !bot.isAllowedUser(cb.From.ID) {
+		bot.answerCallback(cb.ID, "") // silent drop
+		return
+	}
+	// The data is whatever the client sent: quoted, so a newline in it cannot
+	// start a log line of its own, and cut at Telegram's limit.
+	data := cb.Data
+	if len(data) > tgCallbackDataMax {
+		data = data[:tgCallbackDataMax] + "..."
+	}
+	log.Printf("[callback] %q (user: %d)", data, cb.From.ID)
+
+	action, name, ok := parseCronCallback(cb.Data)
+	if !ok {
+		// A tap on a prompt that is already decided, or data no button carries.
+		bot.answerCallback(cb.ID, "")
+		return
+	}
+	switch action {
+	case "pause":
+		if !sched.Pause(name) {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Paused: "+name)
+		_ = bot.Send(fmt.Sprintf("[cron] Paused: %s", name))
+	case "resume":
+		if !sched.Resume(name) {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Resumed: "+name)
+		_ = bot.Send(fmt.Sprintf("[cron] Resumed: %s", name))
+	case "run":
+		if _, known := cfg.Pipeline(name); !known {
+			bot.answerCallback(cb.ID, "Unknown pipeline")
+			return
+		}
+		bot.answerCallback(cb.ID, "Starting: "+name)
+		handleRun(name, bot, sched, cfg, budget, skills)
+	}
+}
+
 func handleCron(args string, bot *TGBot, sched *Scheduler) {
 	parts := strings.Fields(args)
 
@@ -3034,30 +3109,7 @@ Conversation so far:
 
 				// Handle callback queries (button clicks) — separate from messages
 				if u.CallbackQuery != nil {
-					cb := u.CallbackQuery
-					if !bot.isAllowedUser(cb.From.ID) {
-						bot.answerCallback(cb.ID, "") // silent drop
-						continue
-					}
-					log.Printf("[callback] %s (user: %d)", cb.Data, cb.From.ID)
-					if strings.HasPrefix(cb.Data, "cron:") {
-						parts := strings.SplitN(cb.Data, ":", 3)
-						if len(parts) == 3 {
-							switch parts[1] {
-							case "pause":
-								sched.Pause(parts[2])
-								bot.answerCallback(cb.ID, "Paused: "+parts[2])
-								bot.Send(fmt.Sprintf("[cron] Paused: %s", parts[2]))
-							case "resume":
-								sched.Resume(parts[2])
-								bot.answerCallback(cb.ID, "Resumed: "+parts[2])
-								bot.Send(fmt.Sprintf("[cron] Resumed: %s", parts[2]))
-							case "run":
-								bot.answerCallback(cb.ID, "Starting: "+parts[2])
-								handleRun(parts[2], bot, sched, currentConfig(&cfg), budget, currentSkills(skillReg))
-							}
-						}
-					}
+					handleCallback(u.CallbackQuery, bot, sched, currentConfig(&cfg), budget, currentSkills(skillReg))
 				}
 			}
 
